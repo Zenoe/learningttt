@@ -4,11 +4,9 @@
 //
 // Usage:
 //   wfpredir_ctrl set <PID> <dest_ip>
-//       Start redirecting <PID> to <dest_ip>.
-//       The real default-route IP (lowest-metric route) is resolved
-//       automatically from the IP routing table and sent to the driver
-//       as the "defaultIp" so the kernel can safely re-bind any
-//       non-matching PID that accidentally grabs <dest_ip>.
+//       Force <PID> sockets that bind to INADDR_ANY to bind to <dest_ip>.
+//       Non-target PIDs that explicitly bind to <dest_ip> are reset to
+//       INADDR_ANY by the driver.
 //
 //   wfpredir_ctrl clear
 //       Disable all redirection.
@@ -27,18 +25,12 @@
 #include <winioctl.h>   // ← 新增：提供 FILE_DEVICE_UNKNOWN、CTL_CODE 等
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <iphlpapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 
-#ifndef MAXULONG
-#define MAXULONG  ((ULONG)(~0UL))   // 0xFFFFFFFF
-#endif
+// Link with Winsock
 
-// Link with Ip Helper and Winsock
-
-#pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
 
 // ---------------------------------------------------------------
@@ -50,20 +42,11 @@
 #define IOCTL_WFPREDIR_SET_PID \
     CTL_CODE(FILE_DEVICE_UNKNOWN, WFPREDIR_IOCTL_BASE + 1, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
-#define IOCTL_WFPREDIR_IP_PAIR \
+#define IOCTL_WFPREDIR_SET_DEST_IP \
     CTL_CODE(FILE_DEVICE_UNKNOWN, WFPREDIR_IOCTL_BASE + 2, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #define IOCTL_WFPREDIR_CLEAR \
     CTL_CODE(FILE_DEVICE_UNKNOWN, WFPREDIR_IOCTL_BASE + 3, METHOD_BUFFERED, FILE_ANY_ACCESS)
-
-// Must match kernel-side definition exactly (pragma pack(push,1))
-#pragma pack(push, 1)
-typedef struct _WFPREDIR_IP_PAIR_INPUT
-{
-    ULONG DestIp;      // VPN / tunnel IP    (host byte order)
-    ULONG DefaultIp;   // Real default NIC IP (host byte order)
-} WFPREDIR_IP_PAIR_INPUT;
-#pragma pack(pop)
 
 // ---------------------------------------------------------------
 // Parse "a.b.c.d" → ULONG host byte order
@@ -94,144 +77,6 @@ FmtIp(ULONG hostOrder)
         (hostOrder >> 8) & 0xFF,
         hostOrder & 0xFF);
     return buf;
-}
-
-// ---------------------------------------------------------------
-// GetDefaultRouteNextHopIp
-//
-// Enumerates all IPv4 unicast routes and returns the next-hop
-// (gateway) IP of the route with:
-//   - destination prefix 0.0.0.0/0  (default route)
-//   - lowest metric
-//
-// Falls back to the interface address itself if the gateway is
-// 0.0.0.0 (on-link route).
-//
-// Returns TRUE and sets *outHostOrder on success.
-// Returns FALSE on failure and prints the Win32 error.
-// ---------------------------------------------------------------
-static BOOL
-GetDefaultRouteNextHopIp(ULONG* outHostOrder)
-{
-    // We call GetIpForwardTable2 which requires Vista+.
-    // Dynamically load so the binary doesn't hard-fail on XP (rare concern
-    // for a driver tool, but keeps linking clean).
-    typedef DWORD(WINAPI* PFN_GetIpForwardTable2)(ADDRESS_FAMILY, PMIB_IPFORWARD_TABLE2*);
-    typedef VOID(WINAPI* PFN_FreeMibTable)(PVOID);
-
-    HMODULE hIphlp = GetModuleHandleA("iphlpapi.dll");
-    if (!hIphlp) hIphlp = LoadLibraryA("iphlpapi.dll");
-    if (!hIphlp)
-    {
-        fprintf(stderr, "[!] Cannot load iphlpapi.dll\n");
-        return FALSE;
-    }
-
-    PFN_GetIpForwardTable2 pfnGet =
-        (PFN_GetIpForwardTable2)GetProcAddress(hIphlp, "GetIpForwardTable2");
-    PFN_FreeMibTable       pfnFree =
-        (PFN_FreeMibTable)GetProcAddress(hIphlp, "FreeMibTable");
-
-    if (!pfnGet || !pfnFree)
-    {
-        fprintf(stderr, "[!] GetIpForwardTable2 not available (Vista+ required)\n");
-        return FALSE;
-    }
-
-    PMIB_IPFORWARD_TABLE2 table = NULL;
-    DWORD err = pfnGet(AF_INET, &table);
-    if (err != NO_ERROR)
-    {
-        fprintf(stderr, "[!] GetIpForwardTable2 failed: %lu\n", err);
-        return FALSE;
-    }
-
-    ULONG  bestMetric = MAXULONG;
-    ULONG  bestNextHop = 0;
-    BOOL   found = FALSE;
-
-    for (ULONG i = 0; i < table->NumEntries; i++)
-    {
-        MIB_IPFORWARD_ROW2* row = &table->Table[i];
-
-        // We want only 0.0.0.0/0 (default route)
-        if (row->DestinationPrefix.PrefixLength != 0)
-            continue;
-        if (row->DestinationPrefix.Prefix.si_family != AF_INET)
-            continue;
-        if (row->DestinationPrefix.Prefix.Ipv4.sin_addr.s_addr != 0)
-            continue;
-
-        ULONG metric = row->Metric;
-
-        if (!found || metric < bestMetric)
-        {
-            bestMetric = metric;
-            // NextHop 0.0.0.0 means "on-link"; use interface address instead
-            ULONG nhNet = row->NextHop.Ipv4.sin_addr.s_addr; // network byte order
-            if (nhNet != 0)
-            {
-                bestNextHop = ntohl(nhNet); // convert to host byte order
-            }
-            else
-            {
-                // Resolve the on-link interface address
-                MIB_IFROW ifRow = { 0 };
-                ifRow.dwIndex = row->InterfaceIndex;
-                if (GetIfEntry(&ifRow) == NO_ERROR)
-                {
-                    // GetIfEntry doesn't give us the IP; use GetAdaptersAddresses
-                    IP_ADAPTER_ADDRESSES  hint = { 0 };
-                    ULONG                 bufSz = 0;
-                    GetAdaptersAddresses(AF_INET,
-                        GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
-                        GAA_FLAG_SKIP_DNS_SERVER,
-                        NULL, &hint, &bufSz);
-
-                    PIP_ADAPTER_ADDRESSES pAdapters = (PIP_ADAPTER_ADDRESSES)malloc(bufSz);
-                    if (pAdapters)
-                    {
-                        if (GetAdaptersAddresses(AF_INET,
-                            GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
-                            GAA_FLAG_SKIP_DNS_SERVER,
-                            NULL, pAdapters, &bufSz) == NO_ERROR)
-                        {
-                            for (PIP_ADAPTER_ADDRESSES a = pAdapters; a; a = a->Next)
-                            {
-                                if (a->IfIndex != row->InterfaceIndex)
-                                    continue;
-                                for (PIP_ADAPTER_UNICAST_ADDRESS u = a->FirstUnicastAddress;
-                                    u; u = u->Next)
-                                {
-                                    SOCKADDR_IN* sa =
-                                        (SOCKADDR_IN*)u->Address.lpSockaddr;
-                                    if (sa->sin_family == AF_INET)
-                                    {
-                                        bestNextHop = ntohl(sa->sin_addr.s_addr);
-                                        break;
-                                    }
-                                }
-                                break;
-                            }
-                        }
-                        free(pAdapters);
-                    }
-                }
-            }
-            found = TRUE;
-        }
-    }
-
-    pfnFree(table);
-
-    if (!found || bestNextHop == 0)
-    {
-        fprintf(stderr, "[!] No usable default route found in the routing table.\n");
-        return FALSE;
-    }
-
-    *outHostOrder = bestNextHop;
-    return TRUE;
 }
 
 // ---------------------------------------------------------------
@@ -310,43 +155,15 @@ int main(int argc, char* argv[])
             goto Cleanup;
         }
 
-        // Resolve the real default-route IP automatically
-        ULONG defaultIp = 0;
-        if (!GetDefaultRouteNextHopIp(&defaultIp))
+        // ---- Send IOCTL_WFPREDIR_SET_DEST_IP ----
+        if (!SendIoctl(hDevice, IOCTL_WFPREDIR_SET_DEST_IP, &destIp, sizeof(destIp)))
         {
-            fprintf(stderr,
-                "[!] Could not determine default-route IP.\n"
-                "    Redirection would leave non-target PIDs unable to\n"
-                "    bind to %s.  Aborting.\n", argv[3]);
-            exitCode = 1;
-            goto Cleanup;
-        }
-
-        printf("[*] Default-route IP resolved to: %s\n", FmtIp(defaultIp));
-
-        // Safety: if both IPs are the same the redirect is a no-op
-        if (destIp == defaultIp)
-        {
-            fprintf(stderr,
-                "[!] dest_ip (%s) and default-route IP (%s) are identical.\n"
-                "    Nothing to redirect.\n",
-                FmtIp(destIp), FmtIp(defaultIp));
-            exitCode = 1;
-            goto Cleanup;
-        }
-
-        // ---- Send IOCTL_WFPREDIR_IP_PAIR (both IPs in one shot) ----
-        WFPREDIR_IP_PAIR_INPUT pair = { destIp, defaultIp };
-
-        if (!SendIoctl(hDevice, IOCTL_WFPREDIR_IP_PAIR, &pair, sizeof(pair)))
-        {
-            fprintf(stderr, "[!] IOCTL_WFPREDIR_IP_PAIR failed: %lu\n",
+            fprintf(stderr, "[!] IOCTL_WFPREDIR_SET_DEST_IP failed: %lu\n",
                 GetLastError());
             exitCode = 1;
             goto Cleanup;
         }
-        printf("[+] IP pair set:  dest=%s  default=%s\n",
-            FmtIp(destIp), FmtIp(defaultIp));
+        printf("[+] Source-IP forcing address set: %s\n", FmtIp(destIp));
 
         // ---- Activate by setting the target PID ----
         if (!SendIoctl(hDevice, IOCTL_WFPREDIR_SET_PID, &pid, sizeof(pid)))
@@ -356,10 +173,10 @@ int main(int argc, char* argv[])
             exitCode = 1;
             goto Cleanup;
         }
-        printf("[+] Redirecting PID %lu  -->  %s\n"
-            "    Non-target PIDs binding to %s will be re-bound to %s\n"
+        printf("[+] Forcing PID %lu source IP to %s\n"
+            "    Non-target PIDs binding to %s will be reset to 0.0.0.0\n"
             "    Watch DebugView for per-connection logs.\n",
-            pid, argv[3], argv[3], FmtIp(defaultIp));
+            pid, argv[3], argv[3]);
     }
     else if (_stricmp(argv[1], "clear") == 0)
     {

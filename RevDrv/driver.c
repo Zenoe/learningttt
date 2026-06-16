@@ -1,11 +1,11 @@
 ﻿///////////////////////////////////////////////////////////////////////////////
 //
-// driver.c  —  DriverEntry, IRP dispatch, unload
+// driver.c  -  DriverEntry, IRP dispatch, unload
 //
 // Handles device creation and the three IOCTLs:
-//   IOCTL_WFPREDIR_SET_PID    – set target PID
-//   IOCTL_WFPREDIR_IP_PAIR    – set (destIp, defaultIp) atomically
-//   IOCTL_WFPREDIR_CLEAR      – disable all redirection
+//   IOCTL_WFPREDIR_SET_PID     - set target PID
+//   IOCTL_WFPREDIR_SET_DEST_IP - set local vNIC/tunnel IP
+//   IOCTL_WFPREDIR_CLEAR       - disable all redirection
 //
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -52,7 +52,7 @@ DispatchIoControl(
     switch (ioctl)
     {
     // ----------------------------------------------------------------
-    // IOCTL_WFPREDIR_SET_PID  –  input: ULONG pid
+    // IOCTL_WFPREDIR_SET_PID  -  input: ULONG pid
     // ----------------------------------------------------------------
     case IOCTL_WFPREDIR_SET_PID:
     {
@@ -69,42 +69,34 @@ DispatchIoControl(
     }
 
     // ----------------------------------------------------------------
-    // IOCTL_WFPREDIR_IP_PAIR  –  input: WFPREDIR_IP_PAIR_INPUT
+    // IOCTL_WFPREDIR_SET_DEST_IP  -  input: ULONG destIp
     //
-    //  DestIp    = the VPN / tunnel IP to redirect the target PID to
-    //  DefaultIp = the real default-route IP used to re-bind any
-    //              non-matching PID that tries to bind to DestIp
+    //  DestIp = the local VPN / tunnel IP to bind target sockets to.
     // ----------------------------------------------------------------
-    case IOCTL_WFPREDIR_IP_PAIR:
+    case IOCTL_WFPREDIR_SET_DEST_IP:
     {
-        if (inputLen < sizeof(WFPREDIR_IP_PAIR_INPUT) || buffer == NULL)
+        if (inputLen < sizeof(ULONG) || buffer == NULL)
         {
             status = STATUS_INVALID_PARAMETER;
             break;
         }
-        WFPREDIR_IP_PAIR_INPUT pair = *(WFPREDIR_IP_PAIR_INPUT*)buffer;
+        ULONG destIp = *(ULONG*)buffer;
 
-        InterlockedExchange((volatile LONG*)&g_DestIp,    (LONG)pair.DestIp);
-        InterlockedExchange((volatile LONG*)&g_DefaultIp, (LONG)pair.DefaultIp);
+        InterlockedExchange((volatile LONG*)&g_DestIp, (LONG)destIp);
 
         DbgPrintEx(DPFLTR_IHVNETWORK_ID, DPFLTR_INFO_LEVEL,
             "[WfpRedir] DestIp    = %d.%d.%d.%d\n",
-            (pair.DestIp    >> 24) & 0xFF, (pair.DestIp    >> 16) & 0xFF,
-            (pair.DestIp    >>  8) & 0xFF,  pair.DestIp           & 0xFF);
-        DbgPrintEx(DPFLTR_IHVNETWORK_ID, DPFLTR_INFO_LEVEL,
-            "[WfpRedir] DefaultIp = %d.%d.%d.%d\n",
-            (pair.DefaultIp >> 24) & 0xFF, (pair.DefaultIp >> 16) & 0xFF,
-            (pair.DefaultIp >>  8) & 0xFF,  pair.DefaultIp         & 0xFF);
+            (destIp >> 24) & 0xFF, (destIp >> 16) & 0xFF,
+            (destIp >>  8) & 0xFF,  destIp        & 0xFF);
         break;
     }
 
     // ----------------------------------------------------------------
-    // IOCTL_WFPREDIR_CLEAR  –  disable everything
+    // IOCTL_WFPREDIR_CLEAR  -  disable everything
     // ----------------------------------------------------------------
     case IOCTL_WFPREDIR_CLEAR:
         InterlockedExchange(&g_TargetPid,              0);
         InterlockedExchange((volatile LONG*)&g_DestIp,    0);
-        InterlockedExchange((volatile LONG*)&g_DefaultIp, 0);
         DbgPrintEx(DPFLTR_IHVNETWORK_ID, DPFLTR_INFO_LEVEL,
             "[WfpRedir] Redirection disabled.\n");
         break;

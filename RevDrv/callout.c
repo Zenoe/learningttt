@@ -1,16 +1,11 @@
 ﻿///////////////////////////////////////////////////////////////////////////////
 //
-// callout.c  —  Connect-redirect and Bind-redirect callout functions
+// callout.c  -  Bind-redirect source-IP forcing callout
 //
-// Fix 1 (Connect):
-//   Target-PID traffic is redirected to g_DestIp (the VPN/tunnel IP).
-//
-// Fix 2 (Bind):
-//   • Target-PID sockets that bind to INADDR_ANY (0.0.0.0) are re-bound
-//     to g_DestIp so the OS routes their packets through the VPN NIC.
-//   • Non-matching PIDs that explicitly bind to g_DestIp are re-bound
-//     to g_DefaultIp (the real default-route NIC IP) so they are never
-//     blocked and never accidentally tunnel through the VPN.
+//   - Target-PID sockets that bind to INADDR_ANY (0.0.0.0) are re-bound
+//     to g_DestIp so the OS routes their packets through the vNIC.
+//   - Non-target PIDs that explicitly bind to g_DestIp are re-bound to
+//     INADDR_ANY so normal route/interface selection is restored.
 //
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -50,8 +45,6 @@ C_ASSERT(sizeof(void*) == sizeof(const void*));  // always true; guards future A
 // ---------------------------------------------------------------
 volatile LONG   g_TargetPid = 0;   // 0  = disabled
 volatile ULONG  g_DestIp = 0;   // VPN / tunnel IP   (host byte order)
-volatile ULONG  g_DefaultIp = 0;   // Real default-route IP (host byte order)
-volatile USHORT g_DestPort = 0;   // 0  = keep original port
 
 // ---------------------------------------------------------------
 // Byte-swap helpers (avoid pulling in <winsock2.h> in kernel mode)
@@ -62,153 +55,10 @@ HostToNetLong(ULONG x)
     return RtlUlongByteSwap(x);
 }
 
-static FORCEINLINE USHORT
-HostToNetShort(USHORT x)
-{
-    return RtlUshortByteSwap(x);
-}
-
 static FORCEINLINE ULONG
 NetToHostLong(ULONG x)
 {
     return RtlUlongByteSwap(x);
-}
-
-///////////////////////////////////////////////////////////////////////////////
-//
-// ConnectRedirectClassify
-//
-// Layer: FWPM_LAYER_ALE_CONNECT_REDIRECT_V4
-//
-// For every outbound TCP/UDP connect attempt: if the initiating PID matches
-// g_TargetPid, rewrite the remote (destination) address to g_DestIp and,
-// if g_DestPort != 0, rewrite the destination port too.
-//
-// The function follows the four-step WFP redirect protocol:
-//   1. FwpsAcquireClassifyHandle0
-//   2. FwpsAcquireWritableLayerDataPointer0  (writes classifyOut internally)
-//   3. mutate writableRequest
-//   4. FwpsApplyModifiedLayerData0 + FwpsReleaseClassifyHandle0
-//
-///////////////////////////////////////////////////////////////////////////////
-VOID
-ConnectRedirectClassify(
-    _In_        const FWPS_INCOMING_VALUES0* inFixedValues,
-    _In_        const FWPS_INCOMING_METADATA_VALUES0* inMetaValues,
-    _Inout_opt_ VOID* layerData,
-    _In_opt_    const VOID* classifyContext,
-    _In_        const FWPS_FILTER1* filter,
-    _In_        UINT64                                flowContext,
-    _Inout_     FWPS_CLASSIFY_OUT0* classifyOut
-)
-{
-    UNREFERENCED_PARAMETER(inFixedValues);
-    UNREFERENCED_PARAMETER(flowContext);
-
-    // Snapshot globals once to keep decisions consistent within this call
-    ULONG  targetPid = (ULONG)InterlockedCompareExchange(&g_TargetPid, 0, 0);
-    ULONG  destIp = (ULONG)InterlockedCompareExchange((volatile LONG*)&g_DestIp, 0, 0);
-    USHORT destPort = g_DestPort;   // USHORT reads are naturally atomic on x86/x64
-
-    // ---- Guard: must have write rights and a classify context ----
-    if (!(classifyOut->rights & FWPS_RIGHT_ACTION_WRITE))
-        return;
-
-    if (classifyContext == NULL || layerData == NULL)
-    {
-        classifyOut->actionType = FWP_ACTION_PERMIT;
-        return;
-    }
-
-    // Default: permit unconditionally
-    classifyOut->actionType = FWP_ACTION_PERMIT;
-
-    // ---- Quick bail-out when redirection is disabled ----
-    if (targetPid == 0 || destIp == 0)
-        return;
-
-    // ---- PID metadata must be present ----
-    if (!(inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID))
-        return;
-
-    // ---- PID filter ----
-    if (inMetaValues->processId != (UINT64)targetPid)
-        return;
-
-    // ---- Detect re-authorisation of an already-redirected flow ----
-    // layerData is _Inout_opt_ VOID*; we only read localRedirectHandle here.
-    {
-        const FWPS_CONNECT_REQUEST0* initial = (const FWPS_CONNECT_REQUEST0*)layerData;
-        if (initial->localRedirectHandle != NULL)
-        {
-            // Already redirected by us; permit without mutation
-            classifyOut->actionType = FWP_ACTION_PERMIT;
-            return;
-        }
-    }
-
-    // ---- Acquire a classify handle ----
-    UINT64 classifyHandle = 0;
-    NTSTATUS status = FwpsAcquireClassifyHandle0(
-        CLASSIFY_CONTEXT_TO_HANDLE(classifyContext), 0, &classifyHandle);
-    if (!NT_SUCCESS(status))
-    {
-        DbgPrintEx(DPFLTR_IHVNETWORK_ID, DPFLTR_ERROR_LEVEL,
-            "[WfpRedir][Connect] FwpsAcquireClassifyHandle0 failed: 0x%08X\n", status);
-        classifyOut->actionType = FWP_ACTION_PERMIT;
-        return;
-    }
-
-    // ---- Acquire the writable connect-request ----
-    FWPS_CONNECT_REQUEST0* req = NULL;
-    status = FwpsAcquireWritableLayerDataPointer0(
-        classifyHandle,
-        filter->filterId,
-        0,
-        (PVOID*)&req,
-        classifyOut);
-
-    if (!NT_SUCCESS(status) || req == NULL)
-    {
-        DbgPrintEx(DPFLTR_IHVNETWORK_ID, DPFLTR_ERROR_LEVEL,
-            "[WfpRedir][Connect] FwpsAcquireWritableLayerDataPointer0 "
-            "failed: 0x%08X\n", status);
-        classifyOut->actionType = FWP_ACTION_PERMIT;
-        FwpsReleaseClassifyHandle0(classifyHandle);
-        return;
-    }
-
-    SOCKADDR_IN* remote = (SOCKADDR_IN*)&req->remoteAddressAndPort;
-
-    // Log the original destination before we overwrite it
-    ULONG  origIp = NetToHostLong(remote->sin_addr.s_addr);
-    USHORT origPort = RtlUshortByteSwap(remote->sin_port);
-
-    // ---- Rewrite remote IP ----
-    remote->sin_addr.s_addr = HostToNetLong(destIp);
-
-    // ---- Rewrite remote port (only if configured) ----
-    if (destPort != 0)
-        remote->sin_port = HostToNetShort(destPort);
-
-    DbgPrintEx(DPFLTR_IHVNETWORK_ID, DPFLTR_INFO_LEVEL,
-        "[WfpRedir][Connect] PID %lu: %u.%u.%u.%u:%u  -->  %u.%u.%u.%u:%u\n",
-        targetPid,
-        (origIp >> 24) & 0xFF, (origIp >> 16) & 0xFF,
-        (origIp >> 8) & 0xFF, origIp & 0xFF,
-        origPort,
-        (destIp >> 24) & 0xFF, (destIp >> 16) & 0xFF,
-        (destIp >> 8) & 0xFF, destIp & 0xFF,
-        (destPort != 0) ? destPort : origPort);
-
-    // ---- Commit the mutation ----
-    FwpsApplyModifiedLayerData0(classifyHandle, (PVOID)req, 0);
-
-    classifyOut->actionType = FWP_ACTION_PERMIT;
-    // Clear write-right so lower-weight filters cannot undo our change
-    classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
-
-    FwpsReleaseClassifyHandle0(classifyHandle);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -225,11 +75,10 @@ ConnectRedirectClassify(
 //     outbound packets egress through the tunnel.
 //
 //  B) Non-matching PID:
-//     The socket is explicitly binding to g_DestIp (our VPN IP).  This
+//     The socket is explicitly binding to g_DestIp (our vNIC IP).  This
 //     is either a race condition, an accident, or a malicious attempt to
-//     grab the tunnel address.  Re-bind to g_DefaultIp (the real default-
-//     route NIC IP) so the socket works correctly without going through
-//     the tunnel and without being dropped.
+//     grab the tunnel address. Re-bind to INADDR_ANY so the normal route and
+//     source address selection rules apply.
 //
 ///////////////////////////////////////////////////////////////////////////////
 VOID
@@ -249,7 +98,6 @@ BindRedirectClassify(
     // Snapshot globals
     ULONG targetPid = (ULONG)InterlockedCompareExchange(&g_TargetPid, 0, 0);
     ULONG destIp = (ULONG)InterlockedCompareExchange((volatile LONG*)&g_DestIp, 0, 0);
-    ULONG defaultIp = (ULONG)InterlockedCompareExchange((volatile LONG*)&g_DefaultIp, 0, 0);
 
     // ---- Guard: must have write rights and a classify context ----
     if (!(classifyOut->rights & FWPS_RIGHT_ACTION_WRITE))
@@ -279,7 +127,7 @@ BindRedirectClassify(
     ULONG               bindIpHst = NetToHostLong(bindIpNet);           // HBO
 
     // ---------------------------------------------------------------
-    // Path A – matching PID: force bind to g_DestIp (VPN IP)
+    // Path A - matching PID: force bind to g_DestIp (VPN IP)
     // Only act when the socket is binding to INADDR_ANY (0.0.0.0);
     // if it already has a specific address, leave it alone.
     // ---------------------------------------------------------------
@@ -344,22 +192,18 @@ BindRedirectClassify(
     }
 
     // ---------------------------------------------------------------
-    // Path B – non-matching PID that is trying to bind to g_DestIp:
-    // redirect to g_DefaultIp so it uses the real default NIC.
+    // Path B - non-target PID that is trying to bind to g_DestIp:
+    // reset to INADDR_ANY so normal routing/source selection applies.
     // ---------------------------------------------------------------
     if (destIp != 0 &&
-        defaultIp != 0 &&
         bindIpHst == destIp)    // caller is targeting our VPN IP
     {
         DbgPrintEx(DPFLTR_IHVNETWORK_ID, DPFLTR_INFO_LEVEL,
             "[WfpRedir][Bind] PID %lu (non-target): tried to bind "
-            "%u.%u.%u.%u (VPN IP)  -->  redirecting to "
-            "%u.%u.%u.%u (default)\n",
+            "%u.%u.%u.%u (vNIC IP)  -->  resetting to 0.0.0.0\n",
             callerPid,
             (destIp >> 24) & 0xFF, (destIp >> 16) & 0xFF,
-            (destIp >> 8) & 0xFF, destIp & 0xFF,
-            (defaultIp >> 24) & 0xFF, (defaultIp >> 16) & 0xFF,
-            (defaultIp >> 8) & 0xFF, defaultIp & 0xFF);
+            (destIp >> 8) & 0xFF, destIp & 0xFF);
 
         UINT64 classifyHandle = 0;
         NTSTATUS status = FwpsAcquireClassifyHandle0(
@@ -392,7 +236,7 @@ BindRedirectClassify(
         }
 
         SOCKADDR_IN* local = (SOCKADDR_IN*)&req->localAddressAndPort;
-        local->sin_addr.s_addr = HostToNetLong(defaultIp);
+        local->sin_addr.s_addr = 0; // INADDR_ANY
 
         FwpsApplyModifiedLayerData0(classifyHandle, (PVOID)req, 0);
         classifyOut->actionType = FWP_ACTION_PERMIT;
@@ -405,7 +249,7 @@ BindRedirectClassify(
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// CommonNotify  – required stub for FWPS_CALLOUT1
+// CommonNotify  - required stub for FWPS_CALLOUT1
 ///////////////////////////////////////////////////////////////////////////////
 NTSTATUS
 CommonNotify(

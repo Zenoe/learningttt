@@ -1,14 +1,12 @@
-﻿///////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////
 //
-// register.c  —  Register / unregister WFP callouts, sublayer, filters
+// register.c  -  Register / unregister WFP callouts, sublayer, filters
 //
-// We register at two layers:
-//   FWPM_LAYER_ALE_CONNECT_REDIRECT_V4  – rewrite the remote address
-//   FWPM_LAYER_ALE_BIND_REDIRECT_V4     – rewrite the local bind address
+// We register one bind-redirect layer:
+//   FWPM_LAYER_ALE_BIND_REDIRECT_V4     - rewrite the local bind address
 //
-// Both callouts share a single sublayer.  The unregister path is
-// idempotent: each object is deleted independently so a partial
-// initialisation failure does not leave the system in an inconsistent state.
+// The unregister path is idempotent: each object is deleted independently so a
+// partial initialisation failure does not leave the system inconsistent.
 //
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -16,18 +14,14 @@
 #include "RevDrv.h"
 
 static HANDLE  g_EngineHandle       = NULL;
-static UINT32  g_ConnectCalloutId   = 0;
 static UINT32  g_BindCalloutId      = 0;
-static BOOLEAN g_ConnectCalloutReg  = FALSE;
 static BOOLEAN g_BindCalloutReg     = FALSE;
 static BOOLEAN g_SubLayerAdded      = FALSE;
-static BOOLEAN g_ConnectMgmtAdded   = FALSE;
 static BOOLEAN g_BindMgmtAdded      = FALSE;
-static BOOLEAN g_ConnectFilterAdded = FALSE;
 static BOOLEAN g_BindFilterAdded    = FALSE;
 
 // ---------------------------------------------------------------
-// Helper – register one FWPS kernel callout
+// Helper - register one FWPS kernel callout
 // ---------------------------------------------------------------
 static NTSTATUS
 RegisterKernelCallout(
@@ -47,7 +41,7 @@ RegisterKernelCallout(
 }
 
 // ---------------------------------------------------------------
-// Helper – add one FWPM management callout (inside a transaction)
+// Helper - add one FWPM management callout (inside a transaction)
 // ---------------------------------------------------------------
 static NTSTATUS
 AddManagementCallout(
@@ -69,7 +63,7 @@ AddManagementCallout(
 }
 
 // ---------------------------------------------------------------
-// Helper – add one FWPM filter (inside a transaction)
+// Helper - add one FWPM filter (inside a transaction)
 // ---------------------------------------------------------------
 static NTSTATUS
 AddFilter(
@@ -116,22 +110,8 @@ WfpRedirRegister(_In_ PDEVICE_OBJECT DeviceObject)
     }
 
     // ------------------------------------------------------------------
-    // 2. Register FWPS (kernel) callouts – must happen outside any txn
+    // 2. Register FWPS (kernel) callout - must happen outside any txn
     // ------------------------------------------------------------------
-    /* status = RegisterKernelCallout( */
-    /*     DeviceObject, */
-    /*     &WFPREDIR_CONNECT_CALLOUT_GUID, */
-    /*     ConnectRedirectClassify, */
-    /*     &g_ConnectCalloutId); */
-    /* if (!NT_SUCCESS(status)) */
-    /* { */
-    /*     DbgPrintEx(DPFLTR_IHVNETWORK_ID, DPFLTR_ERROR_LEVEL, */
-    /*         "[WfpRedir] Connect callout register failed: 0x%08X\n", status); */
-    /*     WfpRedirUnregister(); */
-    /*     return status; */
-    /* } */
-    /* g_ConnectCalloutReg = TRUE; */
-
     status = RegisterKernelCallout(
         DeviceObject,
         &WFPREDIR_BIND_CALLOUT_GUID,
@@ -180,40 +160,7 @@ WfpRedirRegister(_In_ PDEVICE_OBJECT DeviceObject)
         g_SubLayerAdded = TRUE;
     }
 
-    // 3b. Connect-redirect management callout
-    /* status = AddManagementCallout( */
-    /*     g_EngineHandle, */
-    /*     &WFPREDIR_CONNECT_CALLOUT_GUID, */
-    /*     &FWPM_LAYER_ALE_CONNECT_REDIRECT_V4, */
-    /*     L"WfpRedirect Connect Callout"); */
-    /* if (!NT_SUCCESS(status)) */
-    /* { */
-    /*     DbgPrintEx(DPFLTR_IHVNETWORK_ID, DPFLTR_ERROR_LEVEL, */
-    /*         "[WfpRedir] AddManagementCallout (connect) failed: 0x%08X\n", status); */
-    /*     FwpmTransactionAbort0(g_EngineHandle); */
-    /*     WfpRedirUnregister(); */
-    /*     return status; */
-    /* } */
-    /* g_ConnectMgmtAdded = TRUE; */
-
-    /* // 3c. Connect-redirect filter */
-    /* status = AddFilter( */
-    /*     g_EngineHandle, */
-    /*     &WFPREDIR_CONNECT_FILTER_GUID, */
-    /*     &FWPM_LAYER_ALE_CONNECT_REDIRECT_V4, */
-    /*     &WFPREDIR_CONNECT_CALLOUT_GUID, */
-    /*     L"WfpRedirect Connect Filter"); */
-    /* if (!NT_SUCCESS(status)) */
-    /* { */
-    /*     DbgPrintEx(DPFLTR_IHVNETWORK_ID, DPFLTR_ERROR_LEVEL, */
-    /*         "[WfpRedir] AddFilter (connect) failed: 0x%08X\n", status); */
-    /*     FwpmTransactionAbort0(g_EngineHandle); */
-    /*     WfpRedirUnregister(); */
-    /*     return status; */
-    /* } */
-    /* g_ConnectFilterAdded = TRUE; */
-
-    // 3d. Bind-redirect management callout
+    // 3b. Bind-redirect management callout
     status = AddManagementCallout(
         g_EngineHandle,
         &WFPREDIR_BIND_CALLOUT_GUID,
@@ -229,7 +176,7 @@ WfpRedirRegister(_In_ PDEVICE_OBJECT DeviceObject)
     }
     g_BindMgmtAdded = TRUE;
 
-    // 3e. Bind-redirect filter
+    // 3c. Bind-redirect filter
     status = AddFilter(
         g_EngineHandle,
         &WFPREDIR_BIND_FILTER_GUID,
@@ -260,7 +207,7 @@ WfpRedirRegister(_In_ PDEVICE_OBJECT DeviceObject)
 
     DbgPrintEx(DPFLTR_IHVNETWORK_ID, DPFLTR_INFO_LEVEL,
         "[WfpRedir] Registered successfully. "
-        "Connect + Bind redirect layers active.\n");
+        "Bind source-IP forcing active.\n");
     return STATUS_SUCCESS;
 }
 
@@ -273,21 +220,11 @@ WfpRedirUnregister(VOID)
     if (g_EngineHandle)
     {
         // Delete FWPM objects in reverse dependency order:
-        //   filters → callouts → sublayer
-        if (g_ConnectFilterAdded)
-        {
-            FwpmFilterDeleteByKey0(g_EngineHandle, &WFPREDIR_CONNECT_FILTER_GUID);
-            g_ConnectFilterAdded = FALSE;
-        }
+        //   filters -> callouts -> sublayer
         if (g_BindFilterAdded)
         {
             FwpmFilterDeleteByKey0(g_EngineHandle, &WFPREDIR_BIND_FILTER_GUID);
             g_BindFilterAdded = FALSE;
-        }
-        if (g_ConnectMgmtAdded)
-        {
-            FwpmCalloutDeleteByKey0(g_EngineHandle, &WFPREDIR_CONNECT_CALLOUT_GUID);
-            g_ConnectMgmtAdded = FALSE;
         }
         if (g_BindMgmtAdded)
         {
@@ -304,12 +241,7 @@ WfpRedirUnregister(VOID)
         g_EngineHandle = NULL;
     }
 
-    // Unregister FWPS (kernel) callouts after closing the engine
-    if (g_ConnectCalloutReg)
-    {
-        FwpsCalloutUnregisterById0(g_ConnectCalloutId);
-        g_ConnectCalloutReg = FALSE;
-    }
+    // Unregister FWPS (kernel) callout after closing the engine
     if (g_BindCalloutReg)
     {
         FwpsCalloutUnregisterById0(g_BindCalloutId);
