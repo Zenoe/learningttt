@@ -21,7 +21,6 @@
 #include "SandboxEngine.h"
 #include "ProcessMonitor.h"
 #include "DriverManager.h"
-#include "WfpManager.h"
 #include "SandboxExplorer.h"   // ← NEW
 
 class MainWindow : public QMainWindow {
@@ -97,7 +96,6 @@ private:
     // ---- Engine / state ----
     SandboxEngine   m_engine;
     DriverManager   m_driver;
-    WfpManager      m_wfp;
     SandboxExplorer m_explorer;                                // ← NEW
     ProcessMonitor* m_monitor    = nullptr;
     QTimer*         m_statsTimer = nullptr;

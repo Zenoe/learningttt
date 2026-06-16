@@ -76,9 +76,16 @@ public:
                    bool redirectReads = true,
                    bool hideHostFiles = false);
 
+    bool setWfpPolicy(DWORD pid,
+                      const std::wstring& boxName,
+                      ULONG vnicIp,
+                      bool enabled);
+
     // ---- Helpers ------------------------------------------
     static std::wstring defaultSysPath();   // exe dir + SandboxFlt.sys
     static bool isElevated();
+    static bool parseIpv4(const std::wstring& text, ULONG& outHostOrder);
+    static std::wstring formatIpv4(ULONG hostOrder);
 
 private:
     LogFn   m_log;

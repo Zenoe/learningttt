@@ -347,11 +347,6 @@ MainWindow::MainWindow(QWidget* parent)
         QMetaObject::invokeMethod(this, [this, text] { appendLog(text); },
             Qt::QueuedConnection);
     })
-    , m_wfp([this](const std::wstring& m) {
-        const QString text = QString::fromStdWString(m);
-        QMetaObject::invokeMethod(this, [this, text] { appendLog(text); },
-            Qt::QueuedConnection);
-    })
     , m_explorer([this](const std::wstring& m) {
         const QString text = QString::fromStdWString(m);
         QMetaObject::invokeMethod(this, [this, text] { appendLog(text); },
@@ -864,7 +859,7 @@ void MainWindow::onLaunchSandboxed()
     if (m_chkWfpForce->isChecked()) {
         ULONG vnicIp = 0;
         std::wstring ipText = m_wfpVnicIp->text().trimmed().toStdWString();
-        if (!WfpManager::parseIpv4(ipText, vnicIp)) {
+        if (!DriverManager::parseIpv4(ipText, vnicIp)) {
             appendLog("! Invalid WFP vNIC IP: " + m_wfpVnicIp->text());
             if (driverOk) {
                 m_driver.removeProcess(sp.pid);
@@ -874,8 +869,14 @@ void MainWindow::onLaunchSandboxed()
             return;
         }
 
-        if (!m_wfp.addRootProcess(sp.pid, uniqueBox.toStdWString(), vnicIp)) {
-            appendLog("! WFP root PID registration failed; terminating suspended process.");
+        if (!driverOk) {
+            appendLog("! WFP source-IP forcing requires SandboxFlt driver registration.");
+            m_engine.release(sp);
+            return;
+        }
+
+        if (!m_driver.setWfpPolicy(sp.pid, uniqueBox.toStdWString(), vnicIp, true)) {
+            appendLog("! SandboxFlt WFP policy registration failed; terminating suspended process.");
             if (driverOk) {
                 m_driver.removeProcess(sp.pid);
                 m_driver.removeBox(uniqueBox.toStdWString());
@@ -888,7 +889,7 @@ void MainWindow::onLaunchSandboxed()
         sp.wfpVnicIp = vnicIp;
         appendLog(QString("  [WFP] PID %1 registered for vNIC %2")
             .arg(sp.pid)
-            .arg(QString::fromStdWString(WfpManager::formatIpv4(vnicIp))));
+            .arg(QString::fromStdWString(DriverManager::formatIpv4(vnicIp))));
     }
 
     // ── Inject the Show-in-folder shell broker BEFORE resume.
@@ -1007,7 +1008,8 @@ void MainWindow::unregisterWfp(SandboxedProcess& sp)
     if (!sp.wfpEnabled)
         return;
 
-    m_wfp.removeProcessTree(sp.pid);
+    if (m_driver.isLoaded())
+        m_driver.setWfpPolicy(sp.pid, sp.boxName, 0, false);
     sp.wfpEnabled = false;
     sp.wfpVnicIp = 0;
 }
@@ -1154,7 +1156,7 @@ void MainWindow::addProcessRow(const SandboxedProcess& sp, bool sandboxed)
     QString mode = sandboxed ? icon + " Sandbox root" : icon + " Unsandboxed";
     if (sandboxed && sp.wfpEnabled) {
         mode += " | WFP " +
-            QString::fromStdWString(WfpManager::formatIpv4(sp.wfpVnicIp));
+            QString::fromStdWString(DriverManager::formatIpv4(sp.wfpVnicIp));
     }
 
     auto* item = new QTreeWidgetItem({
@@ -1213,12 +1215,20 @@ void MainWindow::refreshProcessTreeFromDriver(const SANDBOX_PROCESS_LIST& list)
             parent = addEntry(entry->RootProcessId);
         }
 
+        QString mode = isRoot ? "⬡ Sandbox root" : "↳ Sandbox child";
+        if (entry->WfpEnabled) {
+            mode += " | WFP " +
+                QString::fromStdWString(DriverManager::formatIpv4(entry->WfpVnicIp));
+            if (entry->WfpNetworkSeen)
+                mode += " active";
+        }
+
         auto* item = new QTreeWidgetItem({
             QString::number(entry->ProcessId),
             QString::fromWCharArray(entry->BoxName),
             entry->ParentProcessId ? QString::number(entry->ParentProcessId) : "—",
             entry->RootProcessId ? QString::number(entry->RootProcessId) : "—",
-            isRoot ? "⬡ Sandbox root" : "↳ Sandbox child"
+            mode
         });
         item->setData(0, Qt::UserRole, static_cast<uint>(entry->ProcessId));
         item->setData(0, Qt::UserRole + 1, true);

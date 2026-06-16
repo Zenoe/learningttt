@@ -58,6 +58,9 @@ typedef struct _PID_ENTRY {
     HANDLE      ParentProcessId;
     HANDLE      RootProcessId;
     PBOX_ENTRY  Box;
+    BOOLEAN     WfpEnabled;
+    ULONG       WfpVnicIp;
+    ULONG       WfpNetworkSeen;
 } PID_ENTRY, * PPID_ENTRY;
 
 typedef struct _DIR_MERGE_CONTEXT {
@@ -145,7 +148,7 @@ SandboxFlt_DirMergeContextCleanup(
     _In_ PFLT_CONTEXT Context,
     _In_ FLT_CONTEXT_TYPE ContextType);
 
-// NtQueryAttributesFile fast-path — force slow path for sandboxed PIDs
+// NtQueryAttributesFile fast-path - force slow path for sandboxed PIDs
 FLT_PREOP_CALLBACK_STATUS
 SandboxFlt_PreNetworkQueryOpen(
     _Inout_  PFLT_CALLBACK_DATA              Data,
@@ -191,7 +194,9 @@ NTSTATUS Pid_AddInherited(
     _In_ ULONG      Pid,
     _In_ ULONG      ParentPid,
     _In_ ULONG      RootPid,
-    _In_ PBOX_ENTRY Box);
+    _In_ PBOX_ENTRY Box,
+    _In_ BOOLEAN    WfpEnabled,
+    _In_ ULONG      WfpVnicIp);
 
 VOID SandboxFlt_ProcessNotify(
     _Inout_  PEPROCESS             Process,
@@ -201,6 +206,15 @@ VOID SandboxFlt_ProcessNotify(
 ULONG Pid_CopyProcessList(
     _Out_writes_(MaxEntries) PSANDBOX_PROCESS_ENTRY Entries,
     _In_ ULONG MaxEntries);
+
+// WFP source-IP forcing
+NTSTATUS SandboxWfp_Register(
+    _In_ PDEVICE_OBJECT DeviceObject);
+
+VOID SandboxWfp_Unregister(VOID);
+
+NTSTATUS SandboxWfp_SetProcessPolicy(
+    _In_ const SANDBOX_WFP_POLICY_INFO* Info);
 
 // Path helpers
 BOOLEAN Path_StartsWith(
@@ -218,11 +232,11 @@ NTSTATUS Path_BuildRedirectRelative(
     _In_  PBOX_ENTRY         Box,
     _Out_ PUNICODE_STRING    RedirectedPath);
 
-// PID bitmap — maintained by BoxMgr (Tier 1)
+// PID bitmap - maintained by BoxMgr (Tier 1)
 VOID PidBitmap_OnAdd(_In_ ULONG Pid);
 VOID PidBitmap_OnRemove(_In_ ULONG Pid);
 
-// Per-process hash table — set/clear by BoxMgr (Tier 2)
+// Per-process hash table - set/clear by BoxMgr (Tier 2)
 NTSTATUS Filter_SetProcContext(_In_ ULONG Pid, _In_ PBOX_ENTRY Box);
 VOID     Filter_ClearProcContext(_In_ ULONG Pid);
 PBOX_ENTRY Filter_GetProcContext(_In_ ULONG Pid);

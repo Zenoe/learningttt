@@ -153,11 +153,14 @@ Pid_AddWithBox(
     _In_ ULONG Pid,
     _In_ ULONG ParentPid,
     _In_ ULONG RootPid,
-    _In_ PBOX_ENTRY Box)
+    _In_ PBOX_ENTRY Box,
+    _In_ BOOLEAN WfpEnabled,
+    _In_ ULONG WfpVnicIp)
 {
     PPID_ENTRY pe;
 
     if (!Box) return STATUS_INVALID_PARAMETER;
+    if (WfpEnabled && WfpVnicIp == 0) return STATUS_INVALID_PARAMETER;
     if (RootPid == 0) RootPid = Pid;
 
     pe = (PPID_ENTRY)ExAllocatePoolWithTag(
@@ -168,6 +171,9 @@ Pid_AddWithBox(
     pe->ParentProcessId = ULongToHandle(ParentPid);
     pe->RootProcessId = ULongToHandle(RootPid);
     pe->Box = Box;
+    pe->WfpEnabled = WfpEnabled;
+    pe->WfpVnicIp = WfpEnabled ? WfpVnicIp : 0;
+    pe->WfpNetworkSeen = 0;
 
     SbAcquireExclusive(&g_Sandbox.PidLock);
     if (Pid_Find(pe->ProcessId)) {
@@ -214,7 +220,7 @@ Pid_Add(_In_ ULONG Pid, _In_ PCWSTR BoxName)
         return STATUS_NOT_FOUND;
     }
 
-    status = Pid_AddWithBox(Pid, 0, Pid, box);
+    status = Pid_AddWithBox(Pid, 0, Pid, box, FALSE, 0);
     if (!NT_SUCCESS(status))
         return status;
 
@@ -227,11 +233,14 @@ Pid_AddInherited(
     _In_ ULONG Pid,
     _In_ ULONG ParentPid,
     _In_ ULONG RootPid,
-    _In_ PBOX_ENTRY Box)
+    _In_ PBOX_ENTRY Box,
+    _In_ BOOLEAN WfpEnabled,
+    _In_ ULONG WfpVnicIp)
 {
     NTSTATUS status;
 
-    status = Pid_AddWithBox(Pid, ParentPid, RootPid, Box);
+    status = Pid_AddWithBox(Pid, ParentPid, RootPid, Box,
+        WfpEnabled, WfpVnicIp);
     if (NT_SUCCESS(status)) {
         DbgPrint("[SandboxFlt] Pid_AddInherited: PID %lu parent=%lu root=%lu -> box '%wZ'\n",
             Pid, ParentPid, RootPid, &Box->BoxName);
@@ -248,6 +257,8 @@ SandboxFlt_ProcessNotify(
     ULONG pid;
     ULONG parentPid;
     ULONG rootPid;
+    BOOLEAN wfpEnabled;
+    ULONG wfpVnicIp;
     PBOX_ENTRY parentBox;
     PPID_ENTRY parentEntry;
 
@@ -255,16 +266,28 @@ SandboxFlt_ProcessNotify(
 
     if (CreateInfo) {
         parentPid = HandleToULong(CreateInfo->ParentProcessId);
-        parentBox = Filter_GetProcContext(parentPid);
-        if (parentBox) {
-            rootPid = parentPid;
-            SbAcquireShared(&g_Sandbox.PidLock);
-            parentEntry = Pid_Find(ULongToHandle(parentPid));
-            if (parentEntry && parentEntry->RootProcessId)
-                rootPid = HandleToULong(parentEntry->RootProcessId);
-            SbRelease(&g_Sandbox.PidLock);
+        parentBox = NULL;
+        wfpEnabled = FALSE;
+        wfpVnicIp = 0;
+        rootPid = parentPid;
 
-            (VOID)Pid_AddInherited(pid, parentPid, rootPid, parentBox);
+        SbAcquireShared(&g_Sandbox.PidLock);
+        parentEntry = Pid_Find(ULongToHandle(parentPid));
+        if (parentEntry) {
+            parentBox = parentEntry->Box;
+            if (parentEntry->RootProcessId)
+                rootPid = HandleToULong(parentEntry->RootProcessId);
+            wfpEnabled = parentEntry->WfpEnabled;
+            wfpVnicIp = parentEntry->WfpVnicIp;
+        }
+        SbRelease(&g_Sandbox.PidLock);
+
+        if (!parentBox)
+            parentBox = Filter_GetProcContext(parentPid);
+
+        if (parentBox) {
+            (VOID)Pid_AddInherited(pid, parentPid, rootPid, parentBox,
+                wfpEnabled, wfpVnicIp);
         }
     }
     else {
@@ -299,6 +322,9 @@ Pid_CopyProcessList(
         Entries[count].ProcessId = HandleToULong(pe->ProcessId);
         Entries[count].ParentProcessId = HandleToULong(pe->ParentProcessId);
         Entries[count].RootProcessId = HandleToULong(pe->RootProcessId);
+        Entries[count].WfpEnabled = pe->WfpEnabled ? 1 : 0;
+        Entries[count].WfpVnicIp = pe->WfpVnicIp;
+        Entries[count].WfpNetworkSeen = pe->WfpNetworkSeen;
         if (pe->Box) {
             copyBytes = pe->Box->BoxName.Length;
             if (copyBytes > (SANDBOX_MAX_BOX - 1) * sizeof(WCHAR))

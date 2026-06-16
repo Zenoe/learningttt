@@ -55,6 +55,9 @@
 #define IOCTL_SANDBOX_QUERY_PROCESSES CTL_CODE(FILE_DEVICE_UNKNOWN, \
     SANDBOX_IOCTL_BASE + 6, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+#define IOCTL_SANDBOX_SET_WFP_POLICY CTL_CODE(FILE_DEVICE_UNKNOWN, \
+    SANDBOX_IOCTL_BASE + 7, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
 // ============================================================
 //  Structures
 // ============================================================
@@ -104,6 +107,10 @@ typedef struct _SANDBOX_PROCESS_ENTRY {
     ULONG  ProcessId;
     ULONG  ParentProcessId;
     ULONG  RootProcessId;
+    ULONG  WfpEnabled;
+    ULONG  WfpVnicIp;                         // host byte order
+    ULONG  WfpNetworkSeen;
+    ULONG  _pad;
     WCHAR  BoxName[SANDBOX_MAX_BOX];
 } SANDBOX_PROCESS_ENTRY, * PSANDBOX_PROCESS_ENTRY;
 
@@ -128,3 +135,16 @@ typedef struct _SANDBOX_POLICY_INFO {
     ULONG                RedirectReads;
     ULONG                HideHostFiles;
 } SANDBOX_POLICY_INFO, * PSANDBOX_POLICY_INFO;
+
+//
+// Optional per-process-tree WFP source-IP forcing.
+// User mode enables this only for sandbox roots that need network gateway
+// steering. Child PIDs inherit the policy in kernel process notifications.
+//
+typedef struct _SANDBOX_WFP_POLICY_INFO {
+    WCHAR  BoxName[SANDBOX_MAX_BOX];
+    ULONG  ProcessId;
+    ULONG  Enabled;
+    ULONG  VnicIp;                            // host byte order
+    ULONG  _pad;
+} SANDBOX_WFP_POLICY_INFO, * PSANDBOX_WFP_POLICY_INFO;

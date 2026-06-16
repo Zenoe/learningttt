@@ -127,6 +127,12 @@ DriverEntry(
     DriverObject->MajorFunction[IRP_MJ_CLOSE] = SandboxFlt_DispatchClose;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = SandboxFlt_DispatchIoctl;
 
+    status = SandboxWfp_Register(ctrlDev);
+    if (!NT_SUCCESS(status)) {
+        DbgPrint("[SandboxFlt] SandboxWfp_Register failed: %08x\n", status);
+        goto Cleanup;
+    }
+
     // --------------------------------------------------------
     //  2. Register the minifilter
     //     Wire up the instance context registration (for the
@@ -168,6 +174,7 @@ Cleanup:
         PsSetCreateProcessNotifyRoutineEx(SandboxFlt_ProcessNotify, TRUE);
         g_Sandbox.ProcessNotifyRegistered = FALSE;
     }
+    SandboxWfp_Unregister();
     if (g_Sandbox.ControlDevice) {
         RtlInitUnicodeString(&symLink, SANDBOX_DOS_DEVICE_NAME);
         IoDeleteSymbolicLink(&symLink);
@@ -195,6 +202,8 @@ SandboxFlt_Unload(_In_ FLT_FILTER_UNLOAD_FLAGS Flags)
         PsSetCreateProcessNotifyRoutineEx(SandboxFlt_ProcessNotify, TRUE);
         g_Sandbox.ProcessNotifyRegistered = FALSE;
     }
+
+    SandboxWfp_Unregister();
 
     // Stop accepting new requests
     if (g_Sandbox.FilterHandle) {
@@ -283,6 +292,7 @@ SandboxFlt_DispatchIoctl(
     PSANDBOX_STATS        st;
     PSANDBOX_PROCESS_LIST procList;
     PSANDBOX_POLICY_INFO  polInfo;
+    PSANDBOX_WFP_POLICY_INFO wfpInfo;
     UNICODE_STRING        boxName;
     PBOX_ENTRY            box;
     PLIST_ENTRY           e;
@@ -395,6 +405,16 @@ SandboxFlt_DispatchIoctl(
                 status = STATUS_NOT_FOUND;
             }
             SbRelease(&g_Sandbox.BoxLock);
+        }
+        else {
+            status = STATUS_BUFFER_TOO_SMALL;
+        }
+        break;
+
+    case IOCTL_SANDBOX_SET_WFP_POLICY:
+        if (inLen >= sizeof(SANDBOX_WFP_POLICY_INFO)) {
+            wfpInfo = (PSANDBOX_WFP_POLICY_INFO)buf;
+            status = SandboxWfp_SetProcessPolicy(wfpInfo);
         }
         else {
             status = STATUS_BUFFER_TOO_SMALL;

@@ -336,6 +336,40 @@ bool DriverManager::setPolicy(const std::wstring& boxName,
     return ok;
 }
 
+bool DriverManager::setWfpPolicy(DWORD pid,
+    const std::wstring& boxName,
+    ULONG vnicIp,
+    bool enabled)
+{
+    if (pid == 0)
+        return false;
+    if (enabled && vnicIp == 0)
+        return false;
+
+    SANDBOX_WFP_POLICY_INFO info{};
+    info.ProcessId = pid;
+    info.Enabled = enabled ? 1UL : 0UL;
+    info.VnicIp = enabled ? vnicIp : 0UL;
+    wcsncpy_s(info.BoxName, boxName.c_str(), SANDBOX_MAX_BOX - 1);
+
+    bool ok = sendIoctl(IOCTL_SANDBOX_SET_WFP_POLICY,
+        &info, sizeof(info),
+        nullptr, 0);
+
+    if (ok) {
+        if (enabled) {
+            log(L"[Driver][WFP] PID=" + std::to_wstring(pid) +
+                L" -> vNIC " + formatIpv4(vnicIp) +
+                L" box='" + boxName + L"'");
+        }
+        else {
+            log(L"[Driver][WFP] disabled for root PID=" +
+                std::to_wstring(pid));
+        }
+    }
+    return ok;
+}
+
 // ============================================================
 //  sendIoctl() — thin wrapper around DeviceIoControl
 // ============================================================
@@ -384,6 +418,45 @@ std::wstring DriverManager::defaultSysPath()
     GetModuleFileNameW(nullptr, buf, MAX_PATH);
     fs::path p(buf);
     return (p.parent_path() / L"SandboxFlt.sys").wstring();
+}
+
+bool DriverManager::parseIpv4(const std::wstring& text, ULONG& outHostOrder)
+{
+    ULONG parts[4]{};
+    const wchar_t* p = text.c_str();
+    wchar_t* end = nullptr;
+
+    for (int i = 0; i < 4; ++i) {
+        if (*p == L'\0')
+            return false;
+        unsigned long value = wcstoul(p, &end, 10);
+        if (end == p || value > 255)
+            return false;
+        parts[i] = static_cast<ULONG>(value);
+        if (i < 3) {
+            if (*end != L'.')
+                return false;
+            p = end + 1;
+        }
+        else if (*end != L'\0') {
+            return false;
+        }
+    }
+
+    outHostOrder = (parts[0] << 24) | (parts[1] << 16) |
+                   (parts[2] << 8) | parts[3];
+    return outHostOrder != 0;
+}
+
+std::wstring DriverManager::formatIpv4(ULONG hostOrder)
+{
+    wchar_t buf[16]{};
+    swprintf_s(buf, L"%u.%u.%u.%u",
+        (hostOrder >> 24) & 0xFF,
+        (hostOrder >> 16) & 0xFF,
+        (hostOrder >> 8) & 0xFF,
+        hostOrder & 0xFF);
+    return buf;
 }
 
 bool DriverManager::isElevated()
