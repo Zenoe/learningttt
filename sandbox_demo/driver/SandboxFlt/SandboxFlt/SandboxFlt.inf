@@ -1,0 +1,102 @@
+; ============================================================
+;  Install:   pnputil /add-driver SandboxFlt.inf /install
+;
+;  Load:      fltMC load SandboxFlt
+;  Unload:    fltMC unload SandboxFlt
+;
+;  NOTE: Requires test-signing mode on the development machine:
+;    bcdedit /set testsigning on
+;  and a self-signed cert created with:
+;    makecert -n "CN=SandboxFltTest" -r -sv SandboxFlt.pvk SandboxFlt.cer
+;    pvk2pfx -pvk SandboxFlt.pvk -spc SandboxFlt.cer -pfx SandboxFlt.pfx
+;    signtool sign /fd sha256 /f SandboxFlt.pfx SandboxFlt.sys
+; ============================================================
+[Version]
+Signature   = "$Windows NT$"
+Class       = "ActivityMonitor"
+ClassGuid   = {b86dff51-a31e-4bac-b3cf-e8cfe75c9fc2}
+Provider    = %ManufacturerName%
+DriverVer   = 01/01/2025,1.0.0.0
+CatalogFile = SandboxFlt.cat
+PnpLockdown = 1
+LegacyUninstall=1
+
+[DestinationDirs]
+DefaultDestDir   = 12          ; %windir%\system32\drivers
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+SandboxFlt.sys = 1,,
+
+; ============================================================
+;  Architecture-decorated Install sections (required for Primitive)
+; ============================================================
+[DefaultInstall.NTamd64]
+OptionDesc  = %ServiceDescription%
+CopyFiles   = SandboxFlt.DriverFiles
+
+[DefaultInstall.NTarm64]
+OptionDesc  = %ServiceDescription%
+CopyFiles   = SandboxFlt.DriverFiles
+
+[DefaultInstall.NTamd64.Services]
+AddService  = %ServiceName%,,SandboxFlt.Service
+
+[DefaultInstall.NTarm64.Services]
+AddService  = %ServiceName%,,SandboxFlt.Service
+
+[DefaultUninstall.NTamd64]
+DelFiles = SandboxFlt.DriverFiles
+
+[DefaultUninstall.NTarm64]
+DelFiles = SandboxFlt.DriverFiles
+
+[DefaultUninstall.NTamd64.Services]
+DelService = %ServiceName%,0x200      ; SPSVCINST_STOPSERVICE
+
+[DefaultUninstall.NTarm64.Services]
+DelService = %ServiceName%,0x200      ; SPSVCINST_STOPSERVICE
+
+; ============================================================
+;  Driver files
+; ============================================================
+[SandboxFlt.DriverFiles]
+%DriverName%.sys
+
+; ============================================================
+;  Service definition
+; ============================================================
+[SandboxFlt.Service]
+DisplayName    = %ServiceDescription%
+Description    = %ServiceDescription%
+ServiceBinary  = %12%\%DriverName%.sys   ; %windir%\system32\drivers\
+ServiceType    = 2                        ; SERVICE_FILE_SYSTEM_DRIVER
+StartType      = 3                        ; SERVICE_DEMAND_START
+ErrorControl   = 1                        ; SERVICE_ERROR_NORMAL
+LoadOrderGroup = "FSFilter Activity Monitor"
+AddReg         = SandboxFlt.AddRegistry
+
+[SandboxFlt.AddRegistry]
+;HKR,,"SupportedFeatures",0x00010001,0x3
+;HKR,"Instances","DefaultInstance",0x00000000,%DefaultInstance%
+;HKR,"Instances\"%DefaultInstance%,"Altitude",0x00000000,%FilterAltitude%
+;HKR,"Instances\"%DefaultInstance%,"Flags",0x00010001,0x0
+
+HKR,"Parameters",                                      "SupportedFeatures", 0x00010001, 0x3
+HKR,"Parameters\Instances",                            "DefaultInstance",   0x00000000, %DefaultInstance%
+HKR,"Parameters\Instances\%DefaultInstance%","Altitude",                    0x00000000, %FilterAltitude%
+HKR,"Parameters\Instances\%DefaultInstance%","Flags",                       0x00010001, 0x0
+
+; ============================================================
+;  Strings
+; ============================================================
+[Strings]
+ManufacturerName    = "SandboxDemo"
+ServiceDescription  = "SandboxFlt Filesystem Redirection Minifilter"
+ServiceName         = "SandboxFlt"
+DriverName          = "SandboxFlt"
+DiskName            = "SandboxFlt Installation Disk"
+DefaultInstance     = "SandboxFlt Instance"
+FilterAltitude      = "370000"
