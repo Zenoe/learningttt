@@ -1,0 +1,12 @@
+.DS_Store
+.vs/
+.filters
+*.vcxproj.filters
+x64/
+# Ignore out folder (root or any level)
+out/
+*.log
+*.user
+tmp/
+
+
