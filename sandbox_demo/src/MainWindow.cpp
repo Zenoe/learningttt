@@ -786,6 +786,11 @@ void MainWindow::onLaunchSandboxed()
         exeLower.contains("msedge") ||
         exeLower.contains("brave");
 
+    //const QString exeName = QFileInfo(exe).fileName().toLower();
+    //const bool isConsoleShell = exeName == "cmd.exe" ||
+    //    +exeName == "powershell.exe" ||
+    //    +exeName == "pwsh.exe";
+
     QString uniqueBox = m_boxName->text().trimmed();
     if (uniqueBox.isEmpty()) uniqueBox = "Box00";
 

@@ -147,6 +147,10 @@
 #include "SandboxFlt.h"
 #include <wdm.h>
 
+#ifndef SANDBOXFLT_TRACE_REDIRECTS
+#define SANDBOXFLT_TRACE_REDIRECTS 0
+#endif
+
 // ============================================================
 //  TIER 0 — global active-box counter
 // ============================================================
@@ -404,6 +408,42 @@ static USHORT Path_GetVolumeEnd(_In_ PC_UNICODE_STRING Path)
         }
     }
     return 0;
+}
+
+static BOOLEAN Path_ContainsSegmentCi(
+    _In_ PC_UNICODE_STRING Path,
+    _In_z_ PCWSTR Segment)
+{
+    USHORT pathChars;
+    USHORT segChars;
+    USHORT i;
+    USHORT j;
+
+    pathChars = Path->Length / sizeof(WCHAR);
+    segChars = (USHORT)wcslen(Segment);
+    if (segChars == 0 || pathChars < segChars)
+        return FALSE;
+
+    for (i = 0; i <= pathChars - segChars; ++i) {
+        for (j = 0; j < segChars; ++j) {
+            if (Hash_Upcase(Path->Buffer[i + j]) != Hash_Upcase(Segment[j]))
+                break;
+        }
+        if (j == segChars) {
+            if (i + segChars == pathChars ||
+                Path->Buffer[i + segChars] == L'\\')
+                return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+static BOOLEAN Path_IsClinkStatePath(_In_ PC_UNICODE_STRING RelPath)
+{
+    static const WCHAR kClinkLocalAppData[] = L"\\appdata\\local\\clink";
+
+    return Path_ContainsSegmentCi(RelPath, kClinkLocalAppData);
 }
 
 // ============================================================
@@ -709,9 +749,9 @@ SandboxFlt_PreCreate(
     KIRQL                      oldIrql;      // BUG D FIX: needed for spinlock
     *CompletionContext = NULL;
 
-    // Initialize path buffers to NULL so cleanup is safe on all exit paths.
-    fullPath.Buffer = NULL;
-    fileObjectPath.Buffer = NULL;
+    // Initialize path buffers so cleanup is safe on all exit paths.
+    RtlZeroMemory(&fullPath, sizeof(fullPath));
+    RtlZeroMemory(&fileObjectPath, sizeof(fileObjectPath));
 
     /* ---- TIER 0 ---- */
     if (g_AnyBoxActive == 0)
@@ -809,6 +849,25 @@ SandboxFlt_PreCreate(
     relPath.Length = nameInfo->Name.Length - (USHORT)(volumeEnd * sizeof(WCHAR));
     relPath.MaximumLength = relPath.Length;
 
+    /*
+     * Clink tolerates ACCESS_DENIED for its log/history/errorlevel state files
+     * and continues interactive startup. Redirecting those files can leave it
+     * retrying or waiting on file state semantics, so block only these writes
+     * while preserving normal copy-on-write behavior for the rest of cmd.exe.
+     */
+    if (Path_IsClinkStatePath((PC_UNICODE_STRING)&relPath)) {
+        FltReleaseFileNameInformation(nameInfo);
+        if (isWrite) {
+            InterlockedIncrement(&g_Sandbox.TotalBlocked);
+            Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+            Data->IoStatus.Information = 0;
+            return FLT_PREOP_COMPLETE;
+        }
+
+        InterlockedIncrement(&g_Sandbox.TotalPassThrough);
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
     if (Path_IsExcluded((PC_UNICODE_STRING)&relPath,
         (PC_UNICODE_STRING)&box->SandboxRootNt)) {
         FltReleaseFileNameInformation(nameInfo);
@@ -896,18 +955,20 @@ SandboxFlt_PreCreate(
         if (isWrite)
 			// Cache the write-intent path for redirecting future reads without needing to parse the full path again.
             Cache_Add(g_WritePathCache, WRITE_PATH_CACHE_SIZE, writeKey);
+#if SANDBOXFLT_TRACE_REDIRECTS
         DbgPrint("[SandboxFlt] PID=%lu REDIR -> %wZ\n", pid, &fullPath);
+#endif
     }
     else {
         InterlockedIncrement(&g_Sandbox.TotalPassThrough);
         DbgPrint("[SandboxFlt] IoReplaceFileObjectName failed: %08x\n", status);
-		if (fileObjectPath.Buffer)
-			ExFreePoolWithTag(fileObjectPath.Buffer, SANDBOX_POOL_TAG);
     }
 
 	// BUG B FIX: fullPath.Buffer is always caller-owned regardless of
     // IoReplaceFileObjectName's outcome.  Free it unconditionally here,
 	// after all uses (DbgPrint above) are complete.
+    if (fileObjectPath.Buffer)
+        ExFreePoolWithTag(fileObjectPath.Buffer, SANDBOX_POOL_TAG);
     if (fullPath.Buffer)
         ExFreePoolWithTag(fullPath.Buffer, SANDBOX_POOL_TAG);
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
