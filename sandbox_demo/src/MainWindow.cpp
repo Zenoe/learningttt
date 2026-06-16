@@ -347,6 +347,11 @@ MainWindow::MainWindow(QWidget* parent)
         QMetaObject::invokeMethod(this, [this, text] { appendLog(text); },
             Qt::QueuedConnection);
     })
+    , m_wfp([this](const std::wstring& m) {
+        const QString text = QString::fromStdWString(m);
+        QMetaObject::invokeMethod(this, [this, text] { appendLog(text); },
+            Qt::QueuedConnection);
+    })
     , m_explorer([this](const std::wstring& m) {
         const QString text = QString::fromStdWString(m);
         QMetaObject::invokeMethod(this, [this, text] { appendLog(text); },
@@ -411,7 +416,10 @@ MainWindow::~MainWindow()
             DestroyWindow(entry.overlay);
     }
     g_hostBorders.clear();
-    for (auto& sp : m_sandboxProcs) m_engine.release(sp);
+    for (auto& sp : m_sandboxProcs) {
+        unregisterWfp(sp);
+        m_engine.release(sp);
+    }
     for (auto& sp : m_normalProcs)  m_engine.release(sp);
 }
 
@@ -534,12 +542,14 @@ void MainWindow::setupUi()
     auto* optRow = new QHBoxLayout;
     m_chkRestrictUI  = new QCheckBox("Restrict UI (Job UILimits)");
     m_chkKillOnClose = new QCheckBox("Kill-on-Close (Job)");
+    m_chkWfpForce = new QCheckBox("Force network via vNIC (WFP)");
     m_chkRestrictUI->setChecked(true);
     m_chkKillOnClose->setChecked(true);
     QString cbStyle = "QCheckBox{color:#aab;}"
                       "QCheckBox::indicator:checked{background:#0af;}";
     m_chkRestrictUI->setStyleSheet(cbStyle);
     m_chkKillOnClose->setStyleSheet(cbStyle);
+    m_chkWfpForce->setStyleSheet(cbStyle);
 
     auto* policyLabel = makeLabel("Write policy:");
     m_cmbPolicy = new QComboBox;
@@ -549,11 +559,21 @@ void MainWindow::setupUi()
         "border-radius:3px;padding:2px 6px;}"
         "QComboBox QAbstractItemView{background:#15151f;color:#ccc;}");
 
+    auto* wfpLabel = makeLabel("vNIC IP:");
+    m_wfpVnicIp = makeEdit("10.8.0.4", mono);
+    m_wfpVnicIp->setText("10.8.0.4");
+    m_wfpVnicIp->setFixedWidth(120);
+    m_wfpVnicIp->setEnabled(false);
+
     optRow->addWidget(m_chkRestrictUI);
     optRow->addWidget(m_chkKillOnClose);
     optRow->addSpacing(20);
     optRow->addWidget(policyLabel);
     optRow->addWidget(m_cmbPolicy);
+    optRow->addSpacing(20);
+    optRow->addWidget(m_chkWfpForce);
+    optRow->addWidget(wfpLabel);
+    optRow->addWidget(m_wfpVnicIp);
     optRow->addStretch();
     cfgGrid->addLayout(optRow, 4, 0, 1, 3);
 
@@ -639,6 +659,8 @@ void MainWindow::setupUi()
     connect(m_btnKillAll,   &QPushButton::clicked, this, &MainWindow::onKillAll);
     connect(m_cmbPolicy,    QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &MainWindow::onPolicyChanged);
+    connect(m_chkWfpForce, &QCheckBox::toggled,
+            m_wfpVnicIp, &QLineEdit::setEnabled);
     // ── NEW: restart pipe server if FS root changes
     connect(m_fsRoot, &QLineEdit::editingFinished,
             this, &MainWindow::onFsRootChanged);
@@ -836,6 +858,39 @@ void MainWindow::onLaunchSandboxed()
         }
     }
 
+    // ---- Optional WFP source-IP forcing.  Must be registered before resume
+    //      so child processes (Chrome Network Service, etc.) inherit the rule
+    //      before their first bind().
+    if (m_chkWfpForce->isChecked()) {
+        ULONG vnicIp = 0;
+        std::wstring ipText = m_wfpVnicIp->text().trimmed().toStdWString();
+        if (!WfpManager::parseIpv4(ipText, vnicIp)) {
+            appendLog("! Invalid WFP vNIC IP: " + m_wfpVnicIp->text());
+            if (driverOk) {
+                m_driver.removeProcess(sp.pid);
+                m_driver.removeBox(uniqueBox.toStdWString());
+            }
+            m_engine.release(sp);
+            return;
+        }
+
+        if (!m_wfp.addRootProcess(sp.pid, uniqueBox.toStdWString(), vnicIp)) {
+            appendLog("! WFP root PID registration failed; terminating suspended process.");
+            if (driverOk) {
+                m_driver.removeProcess(sp.pid);
+                m_driver.removeBox(uniqueBox.toStdWString());
+            }
+            m_engine.release(sp);
+            return;
+        }
+
+        sp.wfpEnabled = true;
+        sp.wfpVnicIp = vnicIp;
+        appendLog(QString("  [WFP] PID %1 registered for vNIC %2")
+            .arg(sp.pid)
+            .arg(QString::fromStdWString(WfpManager::formatIpv4(vnicIp))));
+    }
+
     // ── Inject the Show-in-folder shell broker BEFORE resume.
     // sp.suspended is still true here — resume() has not been called yet.
     // Must happen at this exact point: after addProcess() (so the driver
@@ -856,6 +911,7 @@ void MainWindow::onLaunchSandboxed()
 
     if (!m_engine.resume(sp)) {
         appendLog("! Failed to resume sandboxed process.");
+        unregisterWfp(sp);
         if (driverOk) {
             m_driver.removeProcess(sp.pid);
             m_driver.removeBox(uniqueBox.toStdWString());
@@ -892,6 +948,7 @@ void MainWindow::onKillSelected()
 
     for (auto& sp : m_sandboxProcs) {
         if (sp.pid == pid && sp.valid) {
+            unregisterWfp(sp);
             m_driver.removeProcess(pid);
             m_driver.removeBox(sp.boxName);
             m_engine.release(sp);
@@ -916,6 +973,7 @@ void MainWindow::onKillAll()
     m_monitor->stopAll();
     for (auto& sp : m_sandboxProcs) {
         if (sp.valid) {
+            unregisterWfp(sp);
             m_driver.removeProcess(sp.pid);
             m_driver.removeBox(sp.boxName);
             m_engine.release(sp);
@@ -942,6 +1000,16 @@ void MainWindow::onPolicyChanged()
         if (sp.valid)
             m_driver.setPolicy(sp.boxName, (SANDBOX_WRITE_POLICY)pol, true, false);
     }
+}
+
+void MainWindow::unregisterWfp(SandboxedProcess& sp)
+{
+    if (!sp.wfpEnabled)
+        return;
+
+    m_wfp.removeProcessTree(sp.pid);
+    sp.wfpEnabled = false;
+    sp.wfpVnicIp = 0;
 }
 
 // ── NEW: restart pipe server when the FS root field changes ─────────────────
@@ -1039,6 +1107,7 @@ void MainWindow::onProcessExited(DWORD pid, const QString& label, DWORD code)
 
     for (auto& sp : m_sandboxProcs) {
         if (sp.pid == pid && sp.valid) {
+            unregisterWfp(sp);
             m_engine.release(sp);
             m_driver.removeProcess(pid);
             m_driver.removeBox(sp.boxName);
@@ -1083,6 +1152,10 @@ void MainWindow::addProcessRow(const SandboxedProcess& sp, bool sandboxed)
     QString icon = sandboxed ? "⬡" : "▶";
     QString box  = sandboxed ? QString::fromStdWString(sp.boxName) : "(none)";
     QString mode = sandboxed ? icon + " Sandbox root" : icon + " Unsandboxed";
+    if (sandboxed && sp.wfpEnabled) {
+        mode += " | WFP " +
+            QString::fromStdWString(WfpManager::formatIpv4(sp.wfpVnicIp));
+    }
 
     auto* item = new QTreeWidgetItem({
         QString::number(sp.pid),

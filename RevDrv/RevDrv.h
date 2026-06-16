@@ -2,10 +2,9 @@
 
 //
 // WFP source-IP forcing driver.
-// Forces target-PID sockets that bind to INADDR_ANY to bind to a specified
-// local vNIC IP instead. Non-target PIDs that explicitly bind to that vNIC IP
-// are transparently re-bound to INADDR_ANY so the normal route/interface
-// selection logic can run.
+// Root PIDs are registered from user mode with a local vNIC IP. Child PIDs are
+// inherited in kernel through process-create notifications. At bind time, only
+// tracked PIDs that actually perform network I/O are rewritten.
 //
 // Include order is critical for WDK 10.0.26100+
 //
@@ -31,35 +30,66 @@
 #define WFPREDIR_IOCTL_BASE     0x8000
 
 //
-// IOCTL_WFPREDIR_SET_PID
-//   Input:  ULONG pid
-//   Effect: Begin source-IP forcing for <pid> using g_DestIp.
+// IOCTL_WFPREDIR_ADD_PROCESS
+//   Input:  WFPREDIR_PROCESS_INPUT
+//   Effect: Add/update a root PID and its per-tree vNIC source IP.
 //
-#define IOCTL_WFPREDIR_SET_PID \
+#define IOCTL_WFPREDIR_ADD_PROCESS \
     CTL_CODE(FILE_DEVICE_UNKNOWN, WFPREDIR_IOCTL_BASE + 1, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 //
-// IOCTL_WFPREDIR_SET_DEST_IP
-//   Input: ULONG destIp  (host byte order)
-//   Effect: Sets the local vNIC/tunnel IP used for source-IP forcing.
+// IOCTL_WFPREDIR_REMOVE_PROCESS
+//   Input:  ULONG rootPid
+//   Effect: Remove the root PID and all inherited children from the table.
 //
-#define IOCTL_WFPREDIR_SET_DEST_IP \
+#define IOCTL_WFPREDIR_REMOVE_PROCESS \
     CTL_CODE(FILE_DEVICE_UNKNOWN, WFPREDIR_IOCTL_BASE + 2, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 //
 // IOCTL_WFPREDIR_CLEAR
 //   Input:  none
-//   Effect: Disable all redirection; zero all globals.
+//   Effect: Disable all redirection; clear the PID table.
 //
 #define IOCTL_WFPREDIR_CLEAR \
     CTL_CODE(FILE_DEVICE_UNKNOWN, WFPREDIR_IOCTL_BASE + 3, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // ---------------------------------------------------------------
-// Global state  (set by IOCTL, read by callouts)
+// Shared structures
+// ---------------------------------------------------------------
+#define WFPREDIR_MAX_BOX 64
+#define WFPREDIR_MAX_TRACKED_PIDS 4096
+
+typedef struct _WFPREDIR_PROCESS_INPUT
+{
+    ULONG ProcessId;
+    ULONG VnicIp;  // host byte order, e.g. 0x0A080004 for 10.8.0.4
+    WCHAR BoxName[WFPREDIR_MAX_BOX];
+} WFPREDIR_PROCESS_INPUT, *PWFPREDIR_PROCESS_INPUT;
+
+typedef struct _WFPREDIR_PID_ENTRY
+{
+    ULONG ProcessId;
+    ULONG ParentProcessId;
+    ULONG RootProcessId;
+    ULONG VnicIp;
+    ULONG NetworkSeen;
+    WCHAR BoxName[WFPREDIR_MAX_BOX];
+} WFPREDIR_PID_ENTRY, *PWFPREDIR_PID_ENTRY;
+
+// ---------------------------------------------------------------
+// PID table API
 // ---------------------------------------------------------------
 #ifdef _KERNEL_MODE_   // only expose storage in kernel compilation units
-extern volatile LONG   g_TargetPid;   // 0  = disabled
-extern volatile ULONG  g_DestIp;      // VPN IP,         host byte order
+NTSTATUS WfpPidTableInitialize(VOID);
+VOID     WfpPidTableClear(VOID);
+NTSTATUS WfpPidAddRoot(_In_ const WFPREDIR_PROCESS_INPUT* Input);
+NTSTATUS WfpPidRemoveTree(_In_ ULONG RootPid);
+BOOLEAN  WfpPidFindAndMarkNetwork(_In_ ULONG Pid, _Out_ WFPREDIR_PID_ENTRY* Entry);
+BOOLEAN  WfpPidIsProtectedVnicIp(_In_ ULONG VnicIp);
+VOID     WfpRedirProcessNotify(
+    _Inout_  PEPROCESS Process,
+    _In_     HANDLE ProcessId,
+    _In_opt_ PPS_CREATE_NOTIFY_INFO CreateInfo);
 #endif
 
 // ---------------------------------------------------------------

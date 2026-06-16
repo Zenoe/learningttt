@@ -4,15 +4,20 @@
 //
 // Usage:
 //   wfpredir_ctrl set <PID> <dest_ip>
-//       Force <PID> sockets that bind to INADDR_ANY to bind to <dest_ip>.
+//       Add <PID> as a source-IP-forcing root and bind its process tree to
+//       <dest_ip> when sockets bind to INADDR_ANY.
 //       Non-target PIDs that explicitly bind to <dest_ip> are reset to
 //       INADDR_ANY by the driver.
+//
+//   wfpredir_ctrl unset <PID>
+//       Remove <PID> and its inherited children from source-IP forcing.
 //
 //   wfpredir_ctrl clear
 //       Disable all redirection.
 //
 // Example:
 //   wfpredir_ctrl set 1234 10.8.0.2
+//   wfpredir_ctrl unset 1234
 //
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -39,14 +44,23 @@
 // ---------------------------------------------------------------
 #define WFPREDIR_IOCTL_BASE   0x8000
 
-#define IOCTL_WFPREDIR_SET_PID \
+#define IOCTL_WFPREDIR_ADD_PROCESS \
     CTL_CODE(FILE_DEVICE_UNKNOWN, WFPREDIR_IOCTL_BASE + 1, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
-#define IOCTL_WFPREDIR_SET_DEST_IP \
+#define IOCTL_WFPREDIR_REMOVE_PROCESS \
     CTL_CODE(FILE_DEVICE_UNKNOWN, WFPREDIR_IOCTL_BASE + 2, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #define IOCTL_WFPREDIR_CLEAR \
     CTL_CODE(FILE_DEVICE_UNKNOWN, WFPREDIR_IOCTL_BASE + 3, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#define WFPREDIR_MAX_BOX 64
+
+typedef struct _WFPREDIR_PROCESS_INPUT
+{
+    ULONG ProcessId;
+    ULONG VnicIp;
+    WCHAR BoxName[WFPREDIR_MAX_BOX];
+} WFPREDIR_PROCESS_INPUT;
 
 // ---------------------------------------------------------------
 // Parse "a.b.c.d" → ULONG host byte order
@@ -104,6 +118,7 @@ int main(int argc, char* argv[])
     {
         printf("Usage:\n"
             "  wfpredir_ctrl set <PID> <dest_ip>\n"
+            "  wfpredir_ctrl unset <PID>\n"
             "  wfpredir_ctrl clear\n");
         return 1;
     }
@@ -155,20 +170,15 @@ int main(int argc, char* argv[])
             goto Cleanup;
         }
 
-        // ---- Send IOCTL_WFPREDIR_SET_DEST_IP ----
-        if (!SendIoctl(hDevice, IOCTL_WFPREDIR_SET_DEST_IP, &destIp, sizeof(destIp)))
-        {
-            fprintf(stderr, "[!] IOCTL_WFPREDIR_SET_DEST_IP failed: %lu\n",
-                GetLastError());
-            exitCode = 1;
-            goto Cleanup;
-        }
-        printf("[+] Source-IP forcing address set: %s\n", FmtIp(destIp));
+        WFPREDIR_PROCESS_INPUT input = { 0 };
+        input.ProcessId = pid;
+        input.VnicIp = destIp;
+        wcscpy_s(input.BoxName, WFPREDIR_MAX_BOX, L"(cli)");
 
-        // ---- Activate by setting the target PID ----
-        if (!SendIoctl(hDevice, IOCTL_WFPREDIR_SET_PID, &pid, sizeof(pid)))
+        // ---- Add the root PID and source IP atomically ----
+        if (!SendIoctl(hDevice, IOCTL_WFPREDIR_ADD_PROCESS, &input, sizeof(input)))
         {
-            fprintf(stderr, "[!] IOCTL_WFPREDIR_SET_PID failed: %lu\n",
+            fprintf(stderr, "[!] IOCTL_WFPREDIR_ADD_PROCESS failed: %lu\n",
                 GetLastError());
             exitCode = 1;
             goto Cleanup;
@@ -177,6 +187,45 @@ int main(int argc, char* argv[])
             "    Non-target PIDs binding to %s will be reset to 0.0.0.0\n"
             "    Watch DebugView for per-connection logs.\n",
             pid, argv[3], argv[3]);
+    }
+    else if (_stricmp(argv[1], "unset") == 0)
+    {
+        // ------------------------------------------------------------
+        // "unset <PID>"
+        // ------------------------------------------------------------
+        if (argc < 3)
+        {
+            fprintf(stderr, "Usage: wfpredir_ctrl unset <PID>\n");
+            exitCode = 1;
+            goto Cleanup;
+        }
+
+        ULONG pid = (ULONG)strtoul(argv[2], NULL, 10);
+        if (pid == 0)
+        {
+            fprintf(stderr, "[!] Invalid PID: %s\n", argv[2]);
+            exitCode = 1;
+            goto Cleanup;
+        }
+
+        if (!SendIoctl(hDevice, IOCTL_WFPREDIR_REMOVE_PROCESS, &pid, sizeof(pid)))
+        {
+            DWORD err = GetLastError();
+            if (err == ERROR_NOT_FOUND)
+            {
+                printf("[+] PID %lu was not registered.\n", pid);
+            }
+            else
+            {
+                fprintf(stderr, "[!] IOCTL_WFPREDIR_REMOVE_PROCESS failed: %lu\n", err);
+                exitCode = 1;
+                goto Cleanup;
+            }
+        }
+        else
+        {
+            printf("[+] Removed source-IP forcing for PID tree root %lu.\n", pid);
+        }
     }
     else if (_stricmp(argv[1], "clear") == 0)
     {

@@ -3,9 +3,9 @@
 // driver.c  -  DriverEntry, IRP dispatch, unload
 //
 // Handles device creation and the three IOCTLs:
-//   IOCTL_WFPREDIR_SET_PID     - set target PID
-//   IOCTL_WFPREDIR_SET_DEST_IP - set local vNIC/tunnel IP
-//   IOCTL_WFPREDIR_CLEAR       - disable all redirection
+//   IOCTL_WFPREDIR_ADD_PROCESS    - add root PID + vNIC IP
+//   IOCTL_WFPREDIR_REMOVE_PROCESS - remove root PID tree
+//   IOCTL_WFPREDIR_CLEAR          - clear the PID table
 //
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -15,6 +15,7 @@
 static PDEVICE_OBJECT  g_DeviceObject = NULL;
 static UNICODE_STRING  g_DeviceName;
 static UNICODE_STRING  g_SymlinkName;
+static BOOLEAN         g_ProcessNotifyRegistered = FALSE;
 
 // ---------------------------------------------------------------
 // IRP_MJ_CREATE / IRP_MJ_CLOSE
@@ -52,42 +53,30 @@ DispatchIoControl(
     switch (ioctl)
     {
     // ----------------------------------------------------------------
-    // IOCTL_WFPREDIR_SET_PID  -  input: ULONG pid
+    // IOCTL_WFPREDIR_ADD_PROCESS  -  input: WFPREDIR_PROCESS_INPUT
     // ----------------------------------------------------------------
-    case IOCTL_WFPREDIR_SET_PID:
+    case IOCTL_WFPREDIR_ADD_PROCESS:
     {
-        if (inputLen < sizeof(ULONG) || buffer == NULL)
+        if (inputLen < sizeof(WFPREDIR_PROCESS_INPUT) || buffer == NULL)
         {
             status = STATUS_INVALID_PARAMETER;
             break;
         }
-        ULONG pid = *(ULONG*)buffer;
-        InterlockedExchange(&g_TargetPid, (LONG)pid);
-        DbgPrintEx(DPFLTR_IHVNETWORK_ID, DPFLTR_INFO_LEVEL,
-            "[WfpRedir] Target PID set to: %lu\n", pid);
+        status = WfpPidAddRoot((const WFPREDIR_PROCESS_INPUT*)buffer);
         break;
     }
 
     // ----------------------------------------------------------------
-    // IOCTL_WFPREDIR_SET_DEST_IP  -  input: ULONG destIp
-    //
-    //  DestIp = the local VPN / tunnel IP to bind target sockets to.
+    // IOCTL_WFPREDIR_REMOVE_PROCESS  -  input: ULONG rootPid
     // ----------------------------------------------------------------
-    case IOCTL_WFPREDIR_SET_DEST_IP:
+    case IOCTL_WFPREDIR_REMOVE_PROCESS:
     {
         if (inputLen < sizeof(ULONG) || buffer == NULL)
         {
             status = STATUS_INVALID_PARAMETER;
             break;
         }
-        ULONG destIp = *(ULONG*)buffer;
-
-        InterlockedExchange((volatile LONG*)&g_DestIp, (LONG)destIp);
-
-        DbgPrintEx(DPFLTR_IHVNETWORK_ID, DPFLTR_INFO_LEVEL,
-            "[WfpRedir] DestIp    = %d.%d.%d.%d\n",
-            (destIp >> 24) & 0xFF, (destIp >> 16) & 0xFF,
-            (destIp >>  8) & 0xFF,  destIp        & 0xFF);
+        status = WfpPidRemoveTree(*(ULONG*)buffer);
         break;
     }
 
@@ -95,10 +84,9 @@ DispatchIoControl(
     // IOCTL_WFPREDIR_CLEAR  -  disable everything
     // ----------------------------------------------------------------
     case IOCTL_WFPREDIR_CLEAR:
-        InterlockedExchange(&g_TargetPid,              0);
-        InterlockedExchange((volatile LONG*)&g_DestIp,    0);
+        WfpPidTableClear();
         DbgPrintEx(DPFLTR_IHVNETWORK_ID, DPFLTR_INFO_LEVEL,
-            "[WfpRedir] Redirection disabled.\n");
+            "[WfpRedir] PID table cleared.\n");
         break;
 
     default:
@@ -123,7 +111,14 @@ WfpRedirUnload(_In_ PDRIVER_OBJECT DriverObject)
     DbgPrintEx(DPFLTR_IHVNETWORK_ID, DPFLTR_INFO_LEVEL,
         "[WfpRedir] Unloading...\n");
 
+    if (g_ProcessNotifyRegistered)
+    {
+        PsSetCreateProcessNotifyRoutineEx(WfpRedirProcessNotify, TRUE);
+        g_ProcessNotifyRegistered = FALSE;
+    }
+
     WfpRedirUnregister();
+    WfpPidTableClear();
     IoDeleteSymbolicLink(&g_SymlinkName);
 
     if (g_DeviceObject)
@@ -150,6 +145,8 @@ DriverEntry(
 
     DbgPrintEx(DPFLTR_IHVNETWORK_ID, DPFLTR_INFO_LEVEL,
         "[WfpRedir] DriverEntry.\n");
+
+    WfpPidTableInitialize();
 
     RtlInitUnicodeString(&g_DeviceName, WFPREDIR_DEVICE_NAME);
     RtlInitUnicodeString(&g_SymlinkName, WFPREDIR_SYMLINK_NAME);
@@ -197,7 +194,21 @@ DriverEntry(
         return status;
     }
 
+    status = PsSetCreateProcessNotifyRoutineEx(WfpRedirProcessNotify, FALSE);
+    if (!NT_SUCCESS(status))
+    {
+        DbgPrintEx(DPFLTR_IHVNETWORK_ID, DPFLTR_ERROR_LEVEL,
+            "[WfpRedir] PsSetCreateProcessNotifyRoutineEx failed: 0x%08X\n", status);
+        WfpRedirUnregister();
+        IoDeleteSymbolicLink(&g_SymlinkName);
+        IoDeleteDevice(g_DeviceObject);
+        g_DeviceObject = NULL;
+        WfpPidTableClear();
+        return status;
+    }
+    g_ProcessNotifyRegistered = TRUE;
+
     DbgPrintEx(DPFLTR_IHVNETWORK_ID, DPFLTR_INFO_LEVEL,
-        "[WfpRedir] Ready. Send IOCTL_WFPREDIR_SET_PID to begin.\n");
+        "[WfpRedir] Ready. Add root PIDs to enable source-IP forcing.\n");
     return STATUS_SUCCESS;
 }

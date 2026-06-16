@@ -30,6 +30,7 @@ set(SOURCES
     src/SandboxEngine.cpp
     src/ProcessMonitor.cpp
     src/DriverManager.cpp
+    src/WfpManager.cpp
     src/SandboxExplorer.cpp
     src/SandboxEngine_Inject.cpp
     src/StringUtil.cpp
@@ -41,6 +42,7 @@ set(HEADERS
     include/SandboxExplorer.h
     include/ProcessMonitor.h
     include/DriverManager.h
+    include/WfpManager.h
     include/NtDefs.h
     driver/include/SandboxIpc.h   # shared with kernel driver
 )

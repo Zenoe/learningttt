@@ -21,6 +21,7 @@
 #include "SandboxEngine.h"
 #include "ProcessMonitor.h"
 #include "DriverManager.h"
+#include "WfpManager.h"
 #include "SandboxExplorer.h"   // ← NEW
 
 class MainWindow : public QMainWindow {
@@ -55,6 +56,7 @@ private:
     void unregisterDriverPids(SandboxedProcess& sp);
     void updateSandboxWindowBorders();
     bool isSandboxWindow(HWND hwnd, std::wstring* boxName = nullptr) const;
+    void unregisterWfp(SandboxedProcess& sp);
 
     // ---- Driver panel ----
     QLineEdit*   m_sysPath      = nullptr;
@@ -78,6 +80,8 @@ private:
     QLineEdit*   m_extraArgs     = nullptr;
     QCheckBox*   m_chkRestrictUI = nullptr;
     QCheckBox*   m_chkKillOnClose= nullptr;
+    QCheckBox*   m_chkWfpForce   = nullptr;
+    QLineEdit*   m_wfpVnicIp     = nullptr;
     QComboBox*   m_cmbPolicy     = nullptr;
     QPushButton* m_btnBrowse     = nullptr;
     QPushButton* m_btnNormal     = nullptr;
@@ -93,6 +97,7 @@ private:
     // ---- Engine / state ----
     SandboxEngine   m_engine;
     DriverManager   m_driver;
+    WfpManager      m_wfp;
     SandboxExplorer m_explorer;                                // ← NEW
     ProcessMonitor* m_monitor    = nullptr;
     QTimer*         m_statsTimer = nullptr;

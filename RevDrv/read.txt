@@ -5,11 +5,13 @@ Control a specific process ID and force sockets that bind to INADDR_ANY
 (0.0.0.0) to bind to the vNIC IP, for example 10.8.0.4.
 
 Current model:
-1. RevDrvCtl sends the target PID and vNIC IP to the kernel driver.
-2. RevDrv registers only FWPM_LAYER_ALE_BIND_REDIRECT_V4.
-3. For the target PID, localAddressAndPort is changed from 0.0.0.0 to
-   the vNIC IP.
-4. For non-target PIDs that explicitly bind the vNIC IP, localAddressAndPort
+1. User mode sends a root PID, box name, and vNIC IP to the kernel driver.
+2. RevDrv keeps a fixed-size PID table and inherits child PIDs in kernel via
+   PsSetCreateProcessNotifyRoutineEx.
+3. RevDrv registers only FWPM_LAYER_ALE_BIND_REDIRECT_V4.
+4. For tracked PIDs, localAddressAndPort is changed from 0.0.0.0 to the vNIC
+   IP when the process actually binds a socket.
+5. For non-target PIDs that explicitly bind the vNIC IP, localAddressAndPort
    is reset to 0.0.0.0 so normal route/interface selection applies.
 
 Route requirement:

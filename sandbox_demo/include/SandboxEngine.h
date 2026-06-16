@@ -21,6 +21,8 @@ struct SandboxedProcess {
     std::wstring boxName;
     std::wstring fsRoot;
     std::vector<DWORD> driverPids;
+    bool   wfpEnabled   = false;
+    ULONG  wfpVnicIp    = 0;
     bool   valid        = false;
     bool   suspended    = false;
 };
