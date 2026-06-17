@@ -325,11 +325,14 @@ static ULONG Path_WriteCacheKey(
     return hash;
 }
 
-static ULONG Path_ParentCacheKey(_In_ PC_UNICODE_STRING Path)
+static ULONG Path_ParentCacheKey(
+    _In_ PC_UNICODE_STRING Path,
+    _In_ PBOX_ENTRY Box)
 {
     UNICODE_STRING parent;
     USHORT i;
     USHORT charCount;
+    ULONG hash;
 
     charCount = Path->Length / sizeof(WCHAR);
     if (charCount == 0)
@@ -342,7 +345,16 @@ static ULONG Path_ParentCacheKey(_In_ PC_UNICODE_STRING Path)
             parent.Buffer = Path->Buffer;
             parent.Length = (USHORT)((i - 1) * sizeof(WCHAR));
             parent.MaximumLength = parent.Length;
-            return Hash_Unicode((PC_UNICODE_STRING)&parent, 2166136261u);
+
+            hash = Hash_Unicode((PC_UNICODE_STRING)&Box->BoxName,
+                2166136261u);
+            hash ^= Box->CacheGeneration;
+            hash *= 16777619u;
+            hash ^= 0x85ebca6bu;
+            hash = Hash_Unicode((PC_UNICODE_STRING)&parent, hash);
+            if (hash == CACHE_EMPTY_KEY)
+                hash = 2166136261u;
+            return hash;
         }
     }
 
@@ -1143,8 +1155,8 @@ SandboxFlt_PreCreate(
      * STATUS_OBJECT_PATH_NOT_FOUND and Chrome crashes.
      */
     if (isWrite) {
-        parentKey = Path_ParentCacheKey((PC_UNICODE_STRING)&fullPath);
-        if (!Cache_Contains(g_DirPathCache, DIR_PATH_CACHE_SIZE, parentKey)) {
+        parentKey = Path_ParentCacheKey((PC_UNICODE_STRING)&fullPath, box);
+        {
             UNICODE_STRING ensurePath;
             UNICODE_STRING ensureRoot;
             PFLT_INSTANCE ensureInstance;
@@ -1168,6 +1180,10 @@ SandboxFlt_PreCreate(
                 (PC_UNICODE_STRING)&ensurePath,
                 (PC_UNICODE_STRING)&ensureRoot)) {
                 Cache_Add(g_DirPathCache, DIR_PATH_CACHE_SIZE, parentKey);
+            }
+            else {
+                DbgPrint("[SandboxFlt] Path_EnsureParentDir failed for %wZ\n",
+                    &ensurePath);
             }
 
             if (ensurePathAllocated && ensurePath.Buffer)

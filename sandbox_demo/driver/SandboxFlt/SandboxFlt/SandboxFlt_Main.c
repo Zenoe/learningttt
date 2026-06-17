@@ -46,18 +46,6 @@ static const FLT_OPERATION_REGISTRATION c_Callbacks[] = {
         SandboxFlt_PreNetworkQueryOpen,
         NULL
     },
-    {
-        IRP_MJ_READ,
-        FLTFL_OPERATION_REGISTRATION_SKIP_PAGING_IO,
-        SandboxFlt_PreRead,
-        SandboxFlt_PostRead
-    },
-    {
-        IRP_MJ_WRITE,
-        FLTFL_OPERATION_REGISTRATION_SKIP_PAGING_IO,
-        SandboxFlt_PreWrite,
-        SandboxFlt_PostWrite
-    },
     { IRP_MJ_OPERATION_END }
 };
 

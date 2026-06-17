@@ -9,6 +9,16 @@ static BCRYPT_ALG_HANDLE g_ShaAlg = NULL;
 static ULONG g_AesObjectLength = 0;
 static ULONG g_ShaObjectLength = 0;
 
+#define CRYPTO_INTERNAL_IO_SLOTS 64
+
+typedef struct _CRYPTO_INTERNAL_IO_SLOT {
+    PETHREAD Thread;
+    LONG     Count;
+} CRYPTO_INTERNAL_IO_SLOT, *PCRYPTO_INTERNAL_IO_SLOT;
+
+static KSPIN_LOCK g_CryptoInternalIoLock;
+static CRYPTO_INTERNAL_IO_SLOT g_CryptoInternalIo[CRYPTO_INTERNAL_IO_SLOTS];
+
 typedef struct _CRYPTO_IO_CONTEXT {
     PVOID         CryptoBuffer;
     PMDL          CryptoMdl;
@@ -38,6 +48,88 @@ Crypto_FreeIoContext(_In_opt_ PCRYPTO_IO_CONTEXT Ctx)
 }
 
 static NTSTATUS
+Crypto_InternalIoEnter(VOID)
+{
+    PETHREAD thread;
+    KIRQL oldIrql;
+    ULONG i;
+    ULONG freeSlot;
+
+    thread = PsGetCurrentThread();
+    freeSlot = CRYPTO_INTERNAL_IO_SLOTS;
+
+    KeAcquireSpinLock(&g_CryptoInternalIoLock, &oldIrql);
+    for (i = 0; i < CRYPTO_INTERNAL_IO_SLOTS; ++i) {
+        if (g_CryptoInternalIo[i].Thread == thread) {
+            g_CryptoInternalIo[i].Count++;
+            KeReleaseSpinLock(&g_CryptoInternalIoLock, oldIrql);
+            return STATUS_SUCCESS;
+        }
+        if (!g_CryptoInternalIo[i].Thread &&
+            freeSlot == CRYPTO_INTERNAL_IO_SLOTS) {
+            freeSlot = i;
+        }
+    }
+
+    if (freeSlot != CRYPTO_INTERNAL_IO_SLOTS) {
+        g_CryptoInternalIo[freeSlot].Thread = thread;
+        g_CryptoInternalIo[freeSlot].Count = 1;
+        KeReleaseSpinLock(&g_CryptoInternalIoLock, oldIrql);
+        return STATUS_SUCCESS;
+    }
+
+    KeReleaseSpinLock(&g_CryptoInternalIoLock, oldIrql);
+    return STATUS_INSUFFICIENT_RESOURCES;
+}
+
+static VOID
+Crypto_InternalIoLeave(VOID)
+{
+    PETHREAD thread;
+    KIRQL oldIrql;
+    ULONG i;
+
+    thread = PsGetCurrentThread();
+
+    KeAcquireSpinLock(&g_CryptoInternalIoLock, &oldIrql);
+    for (i = 0; i < CRYPTO_INTERNAL_IO_SLOTS; ++i) {
+        if (g_CryptoInternalIo[i].Thread == thread) {
+            g_CryptoInternalIo[i].Count--;
+            if (g_CryptoInternalIo[i].Count <= 0) {
+                g_CryptoInternalIo[i].Thread = NULL;
+                g_CryptoInternalIo[i].Count = 0;
+            }
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_CryptoInternalIoLock, oldIrql);
+}
+
+static BOOLEAN
+Crypto_InternalIoActive(VOID)
+{
+    PETHREAD thread;
+    KIRQL oldIrql;
+    ULONG i;
+    BOOLEAN active;
+
+    thread = PsGetCurrentThread();
+    active = FALSE;
+
+    KeAcquireSpinLock(&g_CryptoInternalIoLock, &oldIrql);
+    for (i = 0; i < CRYPTO_INTERNAL_IO_SLOTS; ++i) {
+        if (g_CryptoInternalIo[i].Thread == thread &&
+            g_CryptoInternalIo[i].Count > 0) {
+            active = TRUE;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_CryptoInternalIoLock, oldIrql);
+
+    return active;
+}
+
+static NTSTATUS
 Crypto_QueryObjectLength(_In_ BCRYPT_ALG_HANDLE Alg, _Out_ PULONG Length)
 {
     ULONG bytes = 0;
@@ -49,12 +141,11 @@ NTSTATUS Crypto_Initialize(VOID)
 {
     NTSTATUS status;
 
+    KeInitializeSpinLock(&g_CryptoInternalIoLock);
+    RtlZeroMemory(g_CryptoInternalIo, sizeof(g_CryptoInternalIo));
+
     status = BCryptOpenAlgorithmProvider(&g_AesAlg,
         BCRYPT_AES_ALGORITHM, NULL, BCRYPT_PROV_DISPATCH);
-    if (!NT_SUCCESS(status)) {
-        status = BCryptOpenAlgorithmProvider(&g_AesAlg,
-            BCRYPT_AES_ALGORITHM, NULL, 0);
-    }
     if (!NT_SUCCESS(status))
         return status;
 
@@ -69,10 +160,6 @@ NTSTATUS Crypto_Initialize(VOID)
 
     status = BCryptOpenAlgorithmProvider(&g_ShaAlg,
         BCRYPT_SHA256_ALGORITHM, NULL, BCRYPT_PROV_DISPATCH);
-    if (!NT_SUCCESS(status)) {
-        status = BCryptOpenAlgorithmProvider(&g_ShaAlg,
-            BCRYPT_SHA256_ALGORITHM, NULL, 0);
-    }
     if (!NT_SUCCESS(status))
         goto Fail;
 
@@ -396,23 +483,26 @@ Done:
 }
 
 static PVOID
+Crypto_MapMdl(_In_opt_ PMDL Mdl)
+{
+    if (!Mdl)
+        return NULL;
+    return MmGetSystemAddressForMdlSafe(Mdl, NormalPagePriority);
+}
+
+static PVOID
 Crypto_GetWriteSourceBuffer(_In_ PFLT_CALLBACK_DATA Data)
 {
     PMDL mdl;
 
     mdl = Data->Iopb->Parameters.Write.MdlAddress;
-    if (mdl)
-        return MmGetSystemAddressForMdlSafe(mdl, NormalPagePriority);
-    return Data->Iopb->Parameters.Write.WriteBuffer;
+    return Crypto_MapMdl(mdl);
 }
 
 static PVOID
 Crypto_GetOriginalReadBuffer(_In_ PCRYPTO_IO_CONTEXT Ctx)
 {
-    if (Ctx->OriginalMdl)
-        return MmGetSystemAddressForMdlSafe(Ctx->OriginalMdl,
-            NormalPagePriority);
-    return Ctx->OriginalBuffer;
+    return Crypto_MapMdl(Ctx->OriginalMdl);
 }
 
 static BOOLEAN
@@ -447,6 +537,10 @@ Crypto_ReadPlainBlockForWrite(
 
     offset.QuadPart = Crypto_BlockPhysicalOffset(BlockIndex);
     bytesRead = 0;
+    status = Crypto_InternalIoEnter();
+    if (!NT_SUCCESS(status))
+        goto Cleanup;
+
     status = FltReadFile(FltObjects->Instance,
         FltObjects->FileObject,
         &offset,
@@ -456,6 +550,8 @@ Crypto_ReadPlainBlockForWrite(
         &bytesRead,
         NULL,
         NULL);
+    Crypto_InternalIoLeave();
+
     if (NT_SUCCESS(status) &&
         bytesRead == CRYPTO_BLOCK_SIZE + CRYPTO_HEADER_SIZE) {
         status = Crypto_DecryptBlock(Box, BlockIndex, cipherBlock,
@@ -465,6 +561,7 @@ Crypto_ReadPlainBlockForWrite(
         status = STATUS_SUCCESS;
     }
 
+Cleanup:
     RtlSecureZeroMemory(cipherBlock,
         CRYPTO_BLOCK_SIZE + CRYPTO_HEADER_SIZE);
     ExFreePoolWithTag(cipherBlock, SANDBOX_POOL_TAG);
@@ -494,6 +591,9 @@ SandboxFlt_PreWrite(
 
     *CompletionContext = NULL;
 
+    if (Crypto_InternalIoActive())
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
     if (FlagOn(Data->Iopb->IrpFlags, IRP_PAGING_IO) ||
         FlagOn(Data->Iopb->IrpFlags, IRP_SYNCHRONOUS_PAGING_IO) ||
         FLT_IS_REISSUED_IO(Data))
@@ -511,25 +611,37 @@ SandboxFlt_PreWrite(
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
     status = FltLockUserBuffer(Data);
-    if (!NT_SUCCESS(status))
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (!NT_SUCCESS(status)) {
+        Data->IoStatus.Status = status;
+        Data->IoStatus.Information = 0;
+        return FLT_PREOP_COMPLETE;
+    }
 
     source = Crypto_GetWriteSourceBuffer(Data);
-    if (!source)
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (!source) {
+        Data->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
+        Data->IoStatus.Information = 0;
+        return FLT_PREOP_COMPLETE;
+    }
 
     logicalEnd = logicalOffset + logicalLength;
     firstBlock = (ULONG)(logicalOffset / CRYPTO_BLOCK_SIZE);
     lastBlock = (ULONG)((logicalEnd - 1) / CRYPTO_BLOCK_SIZE);
     blockCount = lastBlock - firstBlock + 1;
-    if (blockCount > (MAXULONG / (CRYPTO_BLOCK_SIZE + CRYPTO_HEADER_SIZE)))
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (blockCount > (MAXULONG / (CRYPTO_BLOCK_SIZE + CRYPTO_HEADER_SIZE))) {
+        Data->IoStatus.Status = STATUS_INVALID_BUFFER_SIZE;
+        Data->IoStatus.Information = 0;
+        return FLT_PREOP_COMPLETE;
+    }
     physicalLength = blockCount * (CRYPTO_BLOCK_SIZE + CRYPTO_HEADER_SIZE);
 
     ctx = (PCRYPTO_IO_CONTEXT)ExAllocatePoolWithTag(
         NonPagedPool, sizeof(CRYPTO_IO_CONTEXT), SANDBOX_POOL_TAG);
-    if (!ctx)
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (!ctx) {
+        Data->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
+        Data->IoStatus.Information = 0;
+        return FLT_PREOP_COMPLETE;
+    }
     RtlZeroMemory(ctx, sizeof(*ctx));
 
     encrypted = (UCHAR*)ExAllocatePoolWithTag(
@@ -542,7 +654,9 @@ SandboxFlt_PreWrite(
         if (plainBlock)
             ExFreePoolWithTag(plainBlock, SANDBOX_POOL_TAG);
         ExFreePoolWithTag(ctx, SANDBOX_POOL_TAG);
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        Data->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
+        Data->IoStatus.Information = 0;
+        return FLT_PREOP_COMPLETE;
     }
 
     for (i = 0; i < blockCount; ++i) {
@@ -613,7 +727,9 @@ SandboxFlt_PreWrite(
     ctx->IsRead = FALSE;
     if (!Crypto_BuildMdlForBuffer(ctx, physicalLength)) {
         Crypto_FreeIoContext(ctx);
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        Data->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
+        Data->IoStatus.Information = 0;
+        return FLT_PREOP_COMPLETE;
     }
 
     Data->Iopb->Parameters.Write.WriteBuffer = encrypted;
@@ -624,7 +740,7 @@ SandboxFlt_PreWrite(
     FltSetCallbackDataDirty(Data);
 
     *CompletionContext = ctx;
-    return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+    return FLT_PREOP_SYNCHRONIZE;
 }
 
 FLT_POSTOP_CALLBACK_STATUS
@@ -674,6 +790,9 @@ SandboxFlt_PreRead(
 
     *CompletionContext = NULL;
 
+    if (Crypto_InternalIoActive())
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
     if (FlagOn(Data->Iopb->IrpFlags, IRP_PAGING_IO) ||
         FlagOn(Data->Iopb->IrpFlags, IRP_SYNCHRONOUS_PAGING_IO) ||
         FLT_IS_REISSUED_IO(Data))
@@ -691,28 +810,39 @@ SandboxFlt_PreRead(
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
     status = FltLockUserBuffer(Data);
-    if (!NT_SUCCESS(status))
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (!NT_SUCCESS(status)) {
+        Data->IoStatus.Status = status;
+        Data->IoStatus.Information = 0;
+        return FLT_PREOP_COMPLETE;
+    }
 
     logicalEnd = logicalOffset + logicalLength;
     firstBlock = (ULONG)(logicalOffset / CRYPTO_BLOCK_SIZE);
     lastBlock = (ULONG)((logicalEnd - 1) / CRYPTO_BLOCK_SIZE);
     blockCount = lastBlock - firstBlock + 1;
-    if (blockCount > (MAXULONG / (CRYPTO_BLOCK_SIZE + CRYPTO_HEADER_SIZE)))
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (blockCount > (MAXULONG / (CRYPTO_BLOCK_SIZE + CRYPTO_HEADER_SIZE))) {
+        Data->IoStatus.Status = STATUS_INVALID_BUFFER_SIZE;
+        Data->IoStatus.Information = 0;
+        return FLT_PREOP_COMPLETE;
+    }
     physicalLength = blockCount * (CRYPTO_BLOCK_SIZE + CRYPTO_HEADER_SIZE);
 
     ctx = (PCRYPTO_IO_CONTEXT)ExAllocatePoolWithTag(
         NonPagedPool, sizeof(CRYPTO_IO_CONTEXT), SANDBOX_POOL_TAG);
-    if (!ctx)
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (!ctx) {
+        Data->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
+        Data->IoStatus.Information = 0;
+        return FLT_PREOP_COMPLETE;
+    }
     RtlZeroMemory(ctx, sizeof(*ctx));
 
     ctx->CryptoBuffer = ExAllocatePoolWithTag(
         NonPagedPool, physicalLength, SANDBOX_POOL_TAG);
     if (!ctx->CryptoBuffer) {
         ExFreePoolWithTag(ctx, SANDBOX_POOL_TAG);
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        Data->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
+        Data->IoStatus.Information = 0;
+        return FLT_PREOP_COMPLETE;
     }
     RtlZeroMemory(ctx->CryptoBuffer, physicalLength);
 
@@ -727,7 +857,9 @@ SandboxFlt_PreRead(
     ctx->IsRead = TRUE;
     if (!Crypto_BuildMdlForBuffer(ctx, physicalLength)) {
         Crypto_FreeIoContext(ctx);
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        Data->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
+        Data->IoStatus.Information = 0;
+        return FLT_PREOP_COMPLETE;
     }
 
     Data->Iopb->Parameters.Read.ReadBuffer = ctx->CryptoBuffer;
@@ -738,7 +870,7 @@ SandboxFlt_PreRead(
     FltSetCallbackDataDirty(Data);
 
     *CompletionContext = ctx;
-    return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+    return FLT_PREOP_SYNCHRONIZE;
 }
 
 FLT_POSTOP_CALLBACK_STATUS

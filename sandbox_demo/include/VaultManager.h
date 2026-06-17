@@ -40,7 +40,8 @@ private:
     bool createVhdx(const VaultConfig& cfg, LogCallback log);
     bool readSaltMetadata(const std::wstring& vaultFilePath,
                           std::array<uint8_t, 32>& salt,
-                          LogCallback log) const;
+                          LogCallback log,
+                          DWORD* outError = nullptr) const;
     bool writeSaltMetadata(HANDLE virtualDisk,
                            const std::array<uint8_t, 32>& salt,
                            LogCallback log) const;

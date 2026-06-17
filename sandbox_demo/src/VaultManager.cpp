@@ -2,10 +2,12 @@
 
 #include <bcrypt.h>
 #include <virtdisk.h>
+#include <winioctl.h>
 #include <filesystem>
 #include <fstream>
 #include <cstdlib>
 #include <sstream>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -21,6 +23,168 @@ static const GUID kVirtualStorageVendorMicrosoft = {
     { 0x90, 0x1f, 0x71, 0x41, 0x5a, 0x66, 0x34, 0x5b }
 };
 
+static bool vaultFileExistsNonEmpty(const std::wstring& path)
+{
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data))
+        return false;
+    if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        return false;
+
+    ULARGE_INTEGER size{};
+    size.HighPart = data.nFileSizeHigh;
+    size.LowPart = data.nFileSizeLow;
+    return size.QuadPart != 0;
+}
+
+static std::wstring withTrailingBackslash(std::wstring path)
+{
+    if (!path.empty() && path.back() != L'\\' && path.back() != L'/')
+        path.push_back(L'\\');
+    return path;
+}
+
+static bool prepareMountPointDirectory(const std::wstring& mountPoint,
+                                       LogCallback log)
+{
+    std::error_code ec;
+    fs::path mountPath(mountPoint);
+    fs::path parent = mountPath.parent_path();
+    if (!parent.empty()) {
+        fs::create_directories(parent, ec);
+        if (ec) {
+            if (log) {
+                log(L"[Vault] cannot create mount parent " +
+                    parent.wstring() + L": " + std::to_wstring(ec.value()));
+            }
+            return false;
+        }
+    }
+
+    DWORD attrs = GetFileAttributesW(mountPoint.c_str());
+    if (attrs != INVALID_FILE_ATTRIBUTES) {
+        if ((attrs & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+            if (log)
+                log(L"[Vault] mount point path exists but is not a directory.");
+            return false;
+        }
+
+        if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) {
+            std::wstring volumeMountPoint = withTrailingBackslash(mountPoint);
+            if (DeleteVolumeMountPointW(volumeMountPoint.c_str())) {
+                if (log)
+                    log(L"[Vault] removed stale mount point " + mountPoint);
+            }
+            else {
+                DWORD err = GetLastError();
+                if (err != ERROR_INVALID_PARAMETER &&
+                    err != ERROR_PATH_NOT_FOUND &&
+                    err != ERROR_FILE_NOT_FOUND) {
+                    if (log) {
+                        log(L"[Vault] DeleteVolumeMountPoint failed for " +
+                            mountPoint + L": " + std::to_wstring(err));
+                    }
+                    return false;
+                }
+            }
+        }
+    }
+
+    fs::create_directories(mountPath, ec);
+    if (ec) {
+        if (log) {
+            log(L"[Vault] cannot create mount point " + mountPoint +
+                L": " + std::to_wstring(ec.value()));
+        }
+        return false;
+    }
+
+    return true;
+}
+
+static HANDLE openVolumeForExtents(const std::wstring& volumeName)
+{
+    std::wstring openName = volumeName;
+    if (!openName.empty() &&
+        (openName.back() == L'\\' || openName.back() == L'/')) {
+        openName.pop_back();
+    }
+
+    return CreateFileW(openName.c_str(),
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        0,
+        nullptr);
+}
+
+static bool volumeBelongsToDisk(const std::wstring& volumeName,
+                                unsigned long diskNumber)
+{
+    HANDLE volume = openVolumeForExtents(volumeName);
+    if (volume == INVALID_HANDLE_VALUE)
+        return false;
+
+    std::vector<BYTE> buffer(sizeof(VOLUME_DISK_EXTENTS) +
+        sizeof(DISK_EXTENT) * 15);
+    DWORD bytesReturned = 0;
+    BOOL ok = DeviceIoControl(volume,
+        IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+        nullptr,
+        0,
+        buffer.data(),
+        static_cast<DWORD>(buffer.size()),
+        &bytesReturned,
+        nullptr);
+    CloseHandle(volume);
+
+    if (!ok)
+        return false;
+
+    auto* extents = reinterpret_cast<VOLUME_DISK_EXTENTS*>(buffer.data());
+    for (DWORD i = 0; i < extents->NumberOfDiskExtents; ++i) {
+        if (extents->Extents[i].DiskNumber == diskNumber)
+            return true;
+    }
+
+    return false;
+}
+
+static bool findVolumeForDisk(unsigned long diskNumber,
+                              std::wstring& outVolumeName,
+                              LogCallback log)
+{
+    wchar_t volumeName[MAX_PATH]{};
+    HANDLE find = FindFirstVolumeW(volumeName, ARRAYSIZE(volumeName));
+    if (find == INVALID_HANDLE_VALUE) {
+        if (log) {
+            log(L"[Vault] FindFirstVolume failed: " +
+                std::to_wstring(GetLastError()));
+        }
+        return false;
+    }
+
+    bool found = false;
+    do {
+        std::wstring candidate(volumeName);
+        if (volumeBelongsToDisk(candidate, diskNumber)) {
+            outVolumeName = candidate;
+            found = true;
+            break;
+        }
+    } while (FindNextVolumeW(find, volumeName, ARRAYSIZE(volumeName)));
+
+    DWORD err = GetLastError();
+    FindVolumeClose(find);
+
+    if (!found && err != ERROR_NO_MORE_FILES && log) {
+        log(L"[Vault] FindNextVolume failed: " + std::to_wstring(err));
+    }
+
+    return found;
+}
+
 VaultManager::~VaultManager()
 {
     for (auto& item : m_attachedVaults) {
@@ -34,9 +198,7 @@ VaultManager::~VaultManager()
 
 std::wstring VaultManager::createAndMount(const VaultConfig& cfg, LogCallback log)
 {
-    std::error_code ec;
-    if (fs::exists(fs::path(cfg.vaultFilePath), ec) &&
-        fs::file_size(fs::path(cfg.vaultFilePath), ec) > 0) {
+    if (vaultFileExistsNonEmpty(cfg.vaultFilePath)) {
         return mount(cfg, log);
     }
 
@@ -92,9 +254,17 @@ bool VaultManager::loadOrCreateSalt(const std::wstring& vaultFilePath,
         logLine(log, L"[Vault] removed empty stale vault file.");
     }
 
-    if (fs::exists(vaultPath, ec)) {
-        if (readSaltMetadata(vaultFilePath, salt, log))
+    if (vaultFileExistsNonEmpty(vaultFilePath)) {
+        DWORD metadataErr = ERROR_SUCCESS;
+        if (readSaltMetadata(vaultFilePath, salt, log, &metadataErr))
             return true;
+
+        if (metadataErr != ERROR_NOT_FOUND &&
+            metadataErr != ERROR_FILE_NOT_FOUND) {
+            logLine(log, L"[Vault] refusing to overwrite existing vault salt.");
+            return false;
+        }
+
         logLine(log, L"[Vault] existing vault has no salt metadata; creating one.");
     }
 
@@ -107,7 +277,7 @@ bool VaultManager::loadOrCreateSalt(const std::wstring& vaultFilePath,
         return false;
     }
 
-    if (fs::exists(vaultPath, ec)) {
+    if (vaultFileExistsNonEmpty(vaultFilePath)) {
         VIRTUAL_STORAGE_TYPE storageType{};
         storageType.DeviceId = VIRTUAL_STORAGE_TYPE_DEVICE_VHDX;
         storageType.VendorId = kVirtualStorageVendorMicrosoft;
@@ -119,7 +289,7 @@ bool VaultManager::loadOrCreateSalt(const std::wstring& vaultFilePath,
         DWORD err = OpenVirtualDisk(
             &storageType,
             vaultFilePath.c_str(),
-            VIRTUAL_DISK_ACCESS_METAOPS,
+            VIRTUAL_DISK_ACCESS_GET_INFO | VIRTUAL_DISK_ACCESS_METAOPS,
             OPEN_VIRTUAL_DISK_FLAG_NONE,
             &openParams,
             &handle);
@@ -151,7 +321,7 @@ bool VaultManager::createVhdx(const VaultConfig& cfg, LogCallback log)
         }
     }
 
-    if (fs::exists(vaultPath, ec) && fs::file_size(vaultPath, ec) > 0) {
+    if (vaultFileExistsNonEmpty(cfg.vaultFilePath)) {
         logLine(log, L"[Vault] using existing vault file " + cfg.vaultFilePath);
         return true;
     }
@@ -248,8 +418,12 @@ bool VaultManager::createVhdx(const VaultConfig& cfg, LogCallback log)
 
 bool VaultManager::readSaltMetadata(const std::wstring& vaultFilePath,
                                     std::array<uint8_t, 32>& salt,
-                                    LogCallback log) const
+                                    LogCallback log,
+                                    DWORD* outError) const
 {
+    if (outError)
+        *outError = ERROR_SUCCESS;
+
     VIRTUAL_STORAGE_TYPE storageType{};
     storageType.DeviceId = VIRTUAL_STORAGE_TYPE_DEVICE_VHDX;
     storageType.VendorId = kVirtualStorageVendorMicrosoft;
@@ -261,11 +435,13 @@ bool VaultManager::readSaltMetadata(const std::wstring& vaultFilePath,
     DWORD err = OpenVirtualDisk(
         &storageType,
         vaultFilePath.c_str(),
-        VIRTUAL_DISK_ACCESS_METAOPS,
+        VIRTUAL_DISK_ACCESS_GET_INFO | VIRTUAL_DISK_ACCESS_METAOPS,
         OPEN_VIRTUAL_DISK_FLAG_NONE,
         &openParams,
         &handle);
     if (err != ERROR_SUCCESS) {
+        if (outError)
+            *outError = err;
         logLine(log, L"[Vault] OpenVirtualDisk(meta read) failed: " +
             std::to_wstring(err));
         return false;
@@ -279,6 +455,8 @@ bool VaultManager::readSaltMetadata(const std::wstring& vaultFilePath,
     CloseHandle(handle);
 
     if (err != ERROR_SUCCESS || metadataSize != salt.size()) {
+        if (outError)
+            *outError = err;
         logLine(log, L"[Vault] GetVirtualDiskMetadata(salt) failed: " +
             std::to_wstring(err));
         return false;
@@ -416,8 +594,8 @@ bool VaultManager::formatAttachedDisk(const std::wstring& physicalDrive,
         return false;
     }
 
-    std::error_code ec;
-    fs::create_directories(fs::path(mountPoint), ec);
+    if (!prepareMountPointDirectory(mountPoint, log))
+        return false;
 
     std::wostringstream script;
     script << L"select disk " << diskNumber << L"\r\n"
@@ -425,10 +603,12 @@ bool VaultManager::formatAttachedDisk(const std::wstring& physicalDrive,
            << L"attributes disk clear readonly noerr\r\n"
            << L"convert gpt noerr\r\n"
            << L"create partition primary\r\n"
-           << L"format fs=ntfs quick label=\"SandboxVault\"\r\n"
-           << L"assign mount=\"" << mountPoint << L"\"\r\n";
+           << L"format fs=ntfs quick label=\"SandboxVault\"\r\n";
 
-    return runDiskPart(script.str(), log);
+    if (!runDiskPart(script.str(), log))
+        return false;
+
+    return assignMountPoint(physicalDrive, mountPoint, log);
 }
 
 bool VaultManager::assignMountPoint(const std::wstring& physicalDrive,
@@ -441,16 +621,32 @@ bool VaultManager::assignMountPoint(const std::wstring& physicalDrive,
         return false;
     }
 
-    std::error_code ec;
-    fs::create_directories(fs::path(mountPoint), ec);
+    if (!prepareMountPointDirectory(mountPoint, log))
+        return false;
 
-    std::wostringstream script;
-    script << L"select disk " << diskNumber << L"\r\n"
-           << L"online disk noerr\r\n"
-           << L"select partition 1\r\n"
-           << L"assign mount=\"" << mountPoint << L"\"\r\n";
+    std::wstring volumeName;
+    for (int i = 0; i < 50; ++i) {
+        if (findVolumeForDisk(diskNumber, volumeName, log))
+            break;
+        Sleep(100);
+    }
+    if (volumeName.empty()) {
+        logLine(log, L"[Vault] cannot find volume for " + physicalDrive);
+        return false;
+    }
 
-    return runDiskPart(script.str(), log);
+    std::wstring mountPointName = withTrailingBackslash(mountPoint);
+    if (!SetVolumeMountPointW(mountPointName.c_str(), volumeName.c_str())) {
+        DWORD err = GetLastError();
+        logLine(log, L"[Vault] SetVolumeMountPoint failed: " +
+            std::to_wstring(err) + L" volume=" + volumeName +
+            L" mount=" + mountPointName);
+        return false;
+    }
+
+    logLine(log, L"[Vault] assigned mount point " + mountPointName +
+        L" -> " + volumeName);
+    return true;
 }
 
 std::wstring VaultManager::normalizePath(const std::wstring& path)
