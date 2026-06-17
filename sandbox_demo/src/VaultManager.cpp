@@ -188,12 +188,13 @@ static bool findVolumeForDisk(unsigned long diskNumber,
 VaultManager::~VaultManager()
 {
     for (auto& item : m_attachedVaults) {
-        if (item.second && item.second != INVALID_HANDLE_VALUE) {
-            DetachVirtualDisk(item.second, DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
-            CloseHandle(item.second);
+        if (item.second.handle && item.second.handle != INVALID_HANDLE_VALUE) {
+            DetachVirtualDisk(item.second.handle, DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
+            CloseHandle(item.second.handle);
         }
     }
     m_attachedVaults.clear();
+    m_saltCache.clear();
 }
 
 std::wstring VaultManager::createAndMount(const VaultConfig& cfg, LogCallback log)
@@ -214,12 +215,32 @@ std::wstring VaultManager::createAndMount(const VaultConfig& cfg, LogCallback lo
         return {};
     }
 
+    {
+        const std::wstring key = normalizePath(cfg.vaultFilePath);
+        auto existing = m_attachedVaults.find(key);
+        if (existing != m_attachedVaults.end())
+            existing->second.mountPoint = cfg.mountPoint;
+    }
+
     logLine(log, L"[Vault] created and mounted at " + cfg.mountPoint);
     return cfg.mountPoint;
 }
 
 std::wstring VaultManager::mount(const VaultConfig& cfg, LogCallback log)
 {
+    const std::wstring key = normalizePath(cfg.vaultFilePath);
+    auto existing = m_attachedVaults.find(key);
+    if (existing != m_attachedVaults.end()) {
+        existing->second.refCount++;
+        if (existing->second.mountPoint.empty())
+            existing->second.mountPoint = cfg.mountPoint;
+        logLine(log, L"[Vault] reused mounted vault " + cfg.vaultFilePath +
+            L" refs=" + std::to_wstring(existing->second.refCount));
+        return existing->second.mountPoint.empty()
+            ? cfg.mountPoint
+            : existing->second.mountPoint;
+    }
+
     std::wstring physicalDrive;
     if (!attachVhdx(cfg.vaultFilePath, physicalDrive, log))
         return {};
@@ -228,6 +249,10 @@ std::wstring VaultManager::mount(const VaultConfig& cfg, LogCallback log)
         detachVhdx(cfg.vaultFilePath, log);
         return {};
     }
+
+    existing = m_attachedVaults.find(key);
+    if (existing != m_attachedVaults.end())
+        existing->second.mountPoint = cfg.mountPoint;
 
     logLine(log, L"[Vault] mounted at " + cfg.mountPoint);
     return cfg.mountPoint;
@@ -248,6 +273,14 @@ bool VaultManager::loadOrCreateSalt(const std::wstring& vaultFilePath,
                                     LogCallback log)
 {
     std::error_code ec;
+    const std::wstring key = normalizePath(vaultFilePath);
+    auto cached = m_saltCache.find(key);
+    if (cached != m_saltCache.end()) {
+        salt = cached->second;
+        logLine(log, L"[Vault] loaded salt from memory cache.");
+        return true;
+    }
+
     fs::path vaultPath(vaultFilePath);
     if (fs::exists(vaultPath, ec) && fs::file_size(vaultPath, ec) == 0) {
         fs::remove(vaultPath, ec);
@@ -256,8 +289,10 @@ bool VaultManager::loadOrCreateSalt(const std::wstring& vaultFilePath,
 
     if (vaultFileExistsNonEmpty(vaultFilePath)) {
         DWORD metadataErr = ERROR_SUCCESS;
-        if (readSaltMetadata(vaultFilePath, salt, log, &metadataErr))
+        if (readSaltMetadata(vaultFilePath, salt, log, &metadataErr)) {
+            m_saltCache[key] = salt;
             return true;
+        }
 
         if (metadataErr != ERROR_NOT_FOUND &&
             metadataErr != ERROR_FILE_NOT_FOUND) {
@@ -301,9 +336,12 @@ bool VaultManager::loadOrCreateSalt(const std::wstring& vaultFilePath,
 
         bool ok = writeSaltMetadata(handle, salt, log);
         CloseHandle(handle);
+        if (ok)
+            m_saltCache[key] = salt;
         return ok;
     }
 
+    m_saltCache[key] = salt;
     return true;
 }
 
@@ -491,17 +529,10 @@ bool VaultManager::attachVhdx(const std::wstring& vaultFilePath,
     const std::wstring key = normalizePath(vaultFilePath);
     auto existing = m_attachedVaults.find(key);
     if (existing != m_attachedVaults.end()) {
-        ULONG len = 0;
-        DWORD err = GetVirtualDiskPhysicalPath(existing->second, &len, nullptr);
-        if (err == ERROR_INSUFFICIENT_BUFFER && len > 1) {
-            std::wstring path(len, L'\0');
-            err = GetVirtualDiskPhysicalPath(existing->second, &len, path.data());
-            if (err == ERROR_SUCCESS) {
-                path.resize(wcsnlen(path.c_str(), path.size()));
-                outPhysicalDrive = path;
-                return true;
-            }
-        }
+        existing->second.refCount++;
+        outPhysicalDrive = existing->second.physicalDrive;
+        logLine(log, L"[Vault] reused attached vault " + vaultFilePath +
+            L" refs=" + std::to_wstring(existing->second.refCount));
         return true;
     }
 
@@ -550,7 +581,11 @@ bool VaultManager::attachVhdx(const std::wstring& vaultFilePath,
             if (err == ERROR_SUCCESS) {
                 path.resize(wcsnlen(path.c_str(), path.size()));
                 outPhysicalDrive = path;
-                m_attachedVaults[key] = handle;
+                AttachedVault attached;
+                attached.handle = handle;
+                attached.refCount = 1;
+                attached.physicalDrive = path;
+                m_attachedVaults[key] = attached;
                 logLine(log, L"[Vault] attached as " + outPhysicalDrive);
                 return true;
             }
@@ -571,8 +606,15 @@ bool VaultManager::detachVhdx(const std::wstring& vaultFilePath, LogCallback log
     if (it == m_attachedVaults.end())
         return true;
 
-    DWORD err = DetachVirtualDisk(it->second, DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
-    CloseHandle(it->second);
+    if (it->second.refCount > 1) {
+        it->second.refCount--;
+        logLine(log, L"[Vault] kept mounted " + vaultFilePath +
+            L" refs=" + std::to_wstring(it->second.refCount));
+        return true;
+    }
+
+    DWORD err = DetachVirtualDisk(it->second.handle, DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
+    CloseHandle(it->second.handle);
     m_attachedVaults.erase(it);
 
     if (err != ERROR_SUCCESS) {

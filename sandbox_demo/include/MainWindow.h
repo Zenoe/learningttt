@@ -55,6 +55,7 @@ private:
     void unregisterDriverPids(SandboxedProcess& sp);
     void updateSandboxWindowBorders();
     bool isSandboxWindow(HWND hwnd, std::wstring* boxName = nullptr) const;
+    bool hasOtherSandboxInBox(const std::wstring& boxName, DWORD exceptPid) const;
     void unregisterWfp(SandboxedProcess& sp);
 
     // ---- Driver panel ----

@@ -535,10 +535,17 @@ HANDLE SandboxEngine::createPrivateNamespace(const std::wstring& boxName)
         if (err == ERROR_ALREADY_EXISTS) {
             log(L"[~] Private namespace '" + boxName + L"' already exists, opening.");
             hNs = OpenPrivateNamespaceW(hBd, boxName.c_str());
+            if (!hNs) {
+                DWORD openErr = GetLastError();
+                log(L"[!] OpenPrivateNamespace failed: " +
+                    std::to_wstring(openErr));
+            }
         }
-        if (!hNs) {
+        else {
             log(L"[!] CreatePrivateNamespace failed: " + std::to_wstring(err) +
                 L" (ensure app runs as Administrator)");
+        }
+        if (!hNs) {
             DeleteBoundaryDescriptor(hBd);
             return nullptr;
         }
@@ -579,7 +586,11 @@ HANDLE SandboxEngine::createPrivateNamespace(const std::wstring& boxName)
 // ------------------------------------------------------------
 HANDLE SandboxEngine::createJobObject(const SandboxConfig& cfg)
 {
-    std::wstring jobName = L"SandboxDemo_" + cfg.boxName;
+    static volatile LONG s_jobSequence = 0;
+    LONG seq = InterlockedIncrement(&s_jobSequence);
+    std::wstring jobName = L"SandboxDemo_" + cfg.boxName +
+        L"_" + std::to_wstring(GetCurrentProcessId()) +
+        L"_" + std::to_wstring(seq);
     HANDLE hJob = CreateJobObjectW(nullptr, jobName.c_str());
     if (!hJob) {
         log(L"[!] CreateJobObject failed: " +

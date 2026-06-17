@@ -37,6 +37,13 @@ public:
                           LogCallback log);
 
 private:
+    struct AttachedVault {
+        HANDLE handle = INVALID_HANDLE_VALUE;
+        unsigned long refCount = 0;
+        std::wstring physicalDrive;
+        std::wstring mountPoint;
+    };
+
     bool createVhdx(const VaultConfig& cfg, LogCallback log);
     bool readSaltMetadata(const std::wstring& vaultFilePath,
                           std::array<uint8_t, 32>& salt,
@@ -62,5 +69,6 @@ private:
                                          unsigned long& outDiskNumber);
     static void logLine(LogCallback log, const std::wstring& msg);
 
-    std::unordered_map<std::wstring, HANDLE> m_attachedVaults;
+    std::unordered_map<std::wstring, AttachedVault> m_attachedVaults;
+    std::unordered_map<std::wstring, std::array<uint8_t, 32>> m_saltCache;
 };

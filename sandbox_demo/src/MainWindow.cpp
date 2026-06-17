@@ -894,8 +894,10 @@ void MainWindow::onLaunchSandboxed()
 
         if (!driverOk) {
             appendLog("! Driver box/vault registration failed; terminating suspended process.");
-            m_driver.clearCryptoKey(uniqueBox.toStdWString());
-            m_driver.removeBox(uniqueBox.toStdWString());
+            if (!hasOtherSandboxInBox(uniqueBox.toStdWString(), sp.pid)) {
+                m_driver.clearCryptoKey(uniqueBox.toStdWString());
+                m_driver.removeBox(uniqueBox.toStdWString());
+            }
             m_engine.release(sp);
             return;
         }
@@ -911,8 +913,10 @@ void MainWindow::onLaunchSandboxed()
                 .arg(sp.pid));
         if (!pidOk) {
             appendLog("! Driver PID registration failed; terminating suspended process.");
-            m_driver.clearCryptoKey(uniqueBox.toStdWString());
-            m_driver.removeBox(uniqueBox.toStdWString());
+            if (!hasOtherSandboxInBox(uniqueBox.toStdWString(), sp.pid)) {
+                m_driver.clearCryptoKey(uniqueBox.toStdWString());
+                m_driver.removeBox(uniqueBox.toStdWString());
+            }
             m_engine.release(sp);
             return;
         }
@@ -927,9 +931,11 @@ void MainWindow::onLaunchSandboxed()
         if (!DriverManager::parseIpv4(ipText, vnicIp)) {
             appendLog("! Invalid WFP vNIC IP: " + m_wfpVnicIp->text());
             if (driverOk) {
-                m_driver.clearCryptoKey(sp.boxName);
                 m_driver.removeProcess(sp.pid);
-                m_driver.removeBox(uniqueBox.toStdWString());
+                if (!hasOtherSandboxInBox(sp.boxName, sp.pid)) {
+                    m_driver.clearCryptoKey(sp.boxName);
+                    m_driver.removeBox(uniqueBox.toStdWString());
+                }
             }
             m_engine.release(sp);
             return;
@@ -944,9 +950,11 @@ void MainWindow::onLaunchSandboxed()
         if (!m_driver.setWfpPolicy(sp.pid, uniqueBox.toStdWString(), vnicIp, true)) {
             appendLog("! SandboxFlt WFP policy registration failed; terminating suspended process.");
             if (driverOk) {
-                m_driver.clearCryptoKey(sp.boxName);
                 m_driver.removeProcess(sp.pid);
-                m_driver.removeBox(uniqueBox.toStdWString());
+                if (!hasOtherSandboxInBox(sp.boxName, sp.pid)) {
+                    m_driver.clearCryptoKey(sp.boxName);
+                    m_driver.removeBox(uniqueBox.toStdWString());
+                }
             }
             m_engine.release(sp);
             return;
@@ -981,9 +989,11 @@ void MainWindow::onLaunchSandboxed()
         appendLog("! Failed to resume sandboxed process.");
         unregisterWfp(sp);
         if (driverOk) {
-            m_driver.clearCryptoKey(sp.boxName);
             m_driver.removeProcess(sp.pid);
-            m_driver.removeBox(uniqueBox.toStdWString());
+            if (!hasOtherSandboxInBox(sp.boxName, sp.pid)) {
+                m_driver.clearCryptoKey(sp.boxName);
+                m_driver.removeBox(uniqueBox.toStdWString());
+            }
         }
         m_engine.release(sp);
         return;
@@ -1078,6 +1088,20 @@ void MainWindow::unregisterWfp(SandboxedProcess& sp)
     sp.wfpVnicIp = 0;
 }
 
+bool MainWindow::hasOtherSandboxInBox(const std::wstring& boxName,
+                                      DWORD exceptPid) const
+{
+    for (const auto& other : m_sandboxProcs) {
+        if (!other.valid)
+            continue;
+        if (other.pid == exceptPid)
+            continue;
+        if (other.boxName == boxName)
+            return true;
+    }
+    return false;
+}
+
 void MainWindow::syncDriverPids(SandboxedProcess& sp)
 {
     if (!m_driver.isLoaded() || !sp.valid)
@@ -1092,13 +1116,16 @@ void MainWindow::unregisterDriverPids(SandboxedProcess& sp)
     if (!m_driver.isLoaded())
         return;
 
-    m_driver.clearCryptoKey(sp.boxName);
     m_driver.removeProcess(sp.pid);
     for (DWORD pid : sp.driverPids) {
         if (pid != sp.pid)
             m_driver.removeProcess(pid);
     }
-    m_driver.removeBox(sp.boxName);
+
+    if (!hasOtherSandboxInBox(sp.boxName, sp.pid)) {
+        m_driver.clearCryptoKey(sp.boxName);
+        m_driver.removeBox(sp.boxName);
+    }
 }
 
 // ── NEW: restart pipe server when the FS root field changes ─────────────────
