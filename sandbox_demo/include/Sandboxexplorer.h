@@ -79,6 +79,7 @@ public:
                              SandboxEngine&       engine,
                              const std::wstring&  boxName,
                              const std::wstring&  realPath,
+                             const std::wstring&  sandboxRoot,
                              const std::wstring&  fsRootBase);
 
     // Default DLL path: same directory as the host EXE

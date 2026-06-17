@@ -6,6 +6,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cctype>
+#include <cwchar>
 #include "StringUtil.h"
 namespace fs = std::filesystem;
 
@@ -117,20 +118,23 @@ void SandboxExplorer::pipeServerLoop(DriverManager* driver,
             log(L"[Explorer] Pipe message received: " +
                 std::to_wstring(read) + L" bytes.");
 
-            // Parse: {"cmd":"openFolder","box":"Box00","path":"C:\\..."}
+            // Parse: {"cmd":"openFolder","box":"Box00","root":"C:\\SandboxMounts\\Box00","path":"C:\\..."}
             std::string cmd  = jsonGetField(json, "cmd");
             std::string box  = jsonGetField(json, "box");
+            std::string root = jsonGetField(json, "root");
             std::string path = jsonGetField(json, "path");
 
             if (cmd == "openFolder" && !box.empty() && !path.empty()) {
                 // Convert UTF-8 fields to wide strings
                 std::wstring wBox  = StringUtil::utf8ToWide(box);
+                std::wstring wRoot = StringUtil::utf8ToWide(root);
                 std::wstring wPath = StringUtil::utf8ToWide(path);
 
                 log(L"[Explorer] openFolder request: box=" + wBox +
-                    L" path=" + wPath);
+                    L" root=" + wRoot + L" path=" + wPath);
 
-                openFolderInSandbox(*driver, *engine, wBox, wPath, fsRootBase);
+                openFolderInSandbox(*driver, *engine, wBox, wPath,
+                    wRoot, fsRootBase);
             }
             else {
                 log(L"[Explorer] Ignored malformed/unknown pipe message: cmd=" +
@@ -178,11 +182,14 @@ bool SandboxExplorer::openFolderInSandbox(DriverManager&      driver,
                                            SandboxEngine&       engine,
                                            const std::wstring&  boxName,
                                            const std::wstring&  realPath,
+                                           const std::wstring&  sandboxRoot,
                                            const std::wstring&  fsRootBase)
 {
     // 1. Compute sandbox root for this box
-    //    e.g. C:\SandboxDemo\Box00
-    std::wstring boxRoot = fsRootBase + L"\\" + boxName;
+    //    e.g. C:\SandboxMounts\Box00 in vault mode, or C:\SandboxDemo\Box00
+    std::wstring boxRoot = sandboxRoot.empty()
+        ? fsRootBase + L"\\" + boxName
+        : sandboxRoot;
 
     // 2. Map real path → virtual path
     //    C:\Users\foo\Downloads →
@@ -194,10 +201,24 @@ bool SandboxExplorer::openFolderInSandbox(DriverManager&      driver,
     //    written anything there yet — in that case we open the sandbox
     //    root's drive folder so the user at least sees something)
     DWORD attr = GetFileAttributesW(virtualPath.c_str());
-    if (attr == INVALID_FILE_ATTRIBUTES ||
-        !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
-        virtualPath = boxRoot + L"\\drive";
-        log(L"[Explorer] Virtual path not found; falling back to " + virtualPath);
+    if (attr == INVALID_FILE_ATTRIBUTES) {
+        fs::path parent = fs::path(virtualPath).parent_path();
+        DWORD parentAttr = parent.empty()
+            ? INVALID_FILE_ATTRIBUTES
+            : GetFileAttributesW(parent.c_str());
+        if (parentAttr != INVALID_FILE_ATTRIBUTES &&
+            (parentAttr & FILE_ATTRIBUTE_DIRECTORY)) {
+            virtualPath = parent.wstring();
+            attr = parentAttr;
+            log(L"[Explorer] Virtual path not found; falling back to parent " +
+                virtualPath);
+        }
+        else {
+            virtualPath = boxRoot + L"\\drive";
+            attr = GetFileAttributesW(virtualPath.c_str());
+            log(L"[Explorer] Virtual path not found; falling back to " +
+                virtualPath);
+        }
     }
 
     // 4. Launch explorer.exe /select,"<virtualPath>" sandboxed
@@ -213,8 +234,12 @@ bool SandboxExplorer::openFolderInSandbox(DriverManager&      driver,
     SandboxConfig cfg;
     cfg.boxName        = boxName;
     cfg.executablePath = explorerPath;
-    cfg.commandLine    = L"/select,\"" + virtualPath + L"\"";
+    cfg.commandLine    = (attr != INVALID_FILE_ATTRIBUTES &&
+                          (attr & FILE_ATTRIBUTE_DIRECTORY))
+        ? L"/separate,\"" + virtualPath + L"\""
+        : L"/separate,/select,\"" + virtualPath + L"\"";
     cfg.fsRootBase     = fsRootBase;
+    cfg.borderDllPath  = defaultDllPath();
     cfg.restrictUI     = false;   // Explorer needs full UI access
     cfg.killOnClose    = false;   // Don't kill Explorer when we close
 
@@ -234,14 +259,12 @@ bool SandboxExplorer::openFolderInSandbox(DriverManager&      driver,
         }
     }
 
-    // 6. Inject the shell broker DLL before resume.
+    // 6. SandboxEngine uses DetourCreateProcessWithDllExW when
+    //    borderDllPath is set, so no suspended-thread hijack is needed here.
     {
-        std::wstring dllPath = defaultDllPath();
-        if (!dllPath.empty()) {
-            bool ok = engine.injectWhileSuspended(sp, dllPath);
-            log(ok
-                ? L"[Explorer] Shell broker installed for Explorer PID " + std::to_wstring(sp.pid)
-                : L"[Explorer] Shell broker injection failed for Explorer");
+        if (!cfg.borderDllPath.empty()) {
+            log(L"[Explorer] Shell broker injected by Detours for Explorer PID " +
+                std::to_wstring(sp.pid));
         } else {
             log(L"[Explorer] SandboxBorder.dll not found — Show in folder broker unavailable.");
         }
@@ -278,6 +301,23 @@ std::wstring SandboxExplorer::realToVirtual(const std::wstring& realPath,
     // Normalise slashes
     std::wstring norm = realPath;
     std::replace(norm.begin(), norm.end(), L'/', L'\\');
+
+    std::wstring normalizedRoot = boxRoot;
+    std::replace(normalizedRoot.begin(), normalizedRoot.end(), L'/', L'\\');
+    while (!normalizedRoot.empty() &&
+           normalizedRoot.back() == L'\\')
+        normalizedRoot.pop_back();
+
+    if (!normalizedRoot.empty()) {
+        if (_wcsicmp(norm.c_str(), normalizedRoot.c_str()) == 0)
+            return norm;
+        if (norm.size() > normalizedRoot.size() &&
+            norm[normalizedRoot.size()] == L'\\' &&
+            _wcsnicmp(norm.c_str(), normalizedRoot.c_str(),
+                normalizedRoot.size()) == 0) {
+            return norm;
+        }
+    }
 
     // Strip drive letter (e.g. "C:")
     std::wstring rel = norm;

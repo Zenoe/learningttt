@@ -13,6 +13,13 @@
 #include <algorithm>
 #include <fstream>
 #include <cwctype>
+#if __has_include(<detours/detours.h>)
+#include <detours/detours.h>
+#elif __has_include(<detours.h>)
+#include <detours.h>
+#else
+#error Microsoft Detours headers are required to build SandboxDemo
+#endif
 
 namespace fs = std::filesystem;
 
@@ -97,6 +104,24 @@ static std::string utf8FromWide(const std::wstring& text)
     std::string out(static_cast<size_t>(needed), '\0');
     WideCharToMultiByte(CP_UTF8, 0, text.c_str(),
         static_cast<int>(text.size()), out.data(), needed, nullptr, nullptr);
+    return out;
+}
+
+static std::string acpFromWide(const std::wstring& text)
+{
+    if (text.empty())
+        return {};
+
+    int needed = WideCharToMultiByte(CP_ACP, 0, text.c_str(), -1,
+        nullptr, 0, nullptr, nullptr);
+    if (needed <= 0)
+        return {};
+
+    std::string out(static_cast<size_t>(needed), '\0');
+    WideCharToMultiByte(CP_ACP, 0, text.c_str(), -1,
+        out.data(), needed, nullptr, nullptr);
+    if (!out.empty() && out.back() == '\0')
+        out.pop_back();
     return out;
 }
 
@@ -709,18 +734,49 @@ bool SandboxEngine::spawnInJob(const SandboxConfig& cfg,
         | CREATE_NEW_CONSOLE
         | CREATE_UNICODE_ENVIRONMENT;// envBlock is wide chars
 
-    BOOL ok = CreateProcessW(
-        cfg.executablePath.c_str(),
-        cmdLine.data(),
-        nullptr,              // process SA
-        nullptr,              // thread SA
-        FALSE,                // inherit handles = no
-        flags,
-        envBlock.data(),      // our modified environment
-        nullptr,              // current directory (inherit)
-        &si,
-        &pi
-    );
+    BOOL ok = FALSE;
+    if (!cfg.borderDllPath.empty()) {
+        std::string dllPathA = acpFromWide(cfg.borderDllPath);
+        if (dllPathA.empty() ||
+            GetFileAttributesA(dllPathA.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            log(L"[!] Detours DLL path conversion failed: " +
+                cfg.borderDllPath);
+            return false;
+        }
+        ok = DetourCreateProcessWithDllExW(
+            cfg.executablePath.c_str(),
+            cmdLine.data(),
+            nullptr,              // process SA
+            nullptr,              // thread SA
+            FALSE,                // inherit handles = no
+            flags,
+            envBlock.data(),      // our modified environment
+            nullptr,              // current directory (inherit)
+            &si,
+            &pi,
+            dllPathA.c_str(),
+            nullptr);
+        if (!ok) {
+            log(L"[!] DetourCreateProcessWithDllExW failed: " +
+                std::to_wstring(GetLastError()) +
+                L" dll=" + cfg.borderDllPath +
+                L" cmd=" + cmdLine);
+        }
+    }
+    else {
+        ok = CreateProcessW(
+            cfg.executablePath.c_str(),
+            cmdLine.data(),
+            nullptr,              // process SA
+            nullptr,              // thread SA
+            FALSE,                // inherit handles = no
+            flags,
+            envBlock.data(),      // our modified environment
+            nullptr,              // current directory (inherit)
+            &si,
+            &pi
+        );
+    }
 
     if (!ok) {
         log(L"[!] CreateProcess failed: " +

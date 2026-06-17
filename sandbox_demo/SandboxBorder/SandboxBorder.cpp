@@ -1,184 +1,600 @@
 // ============================================================
-//  SandboxBorder.cpp  —  Injected shell-broker payload
+//  SandboxBorder.cpp  —  injected shell broker payload
 //
-//  Window borders and title prefixes are owned by the Qt host. This DLL
-//  only redirects "Show in folder" requests to the host broker so Explorer
-//  can be launched inside the same sandbox box.
+//  Detours-based Chrome "Show in folder" interception.  This follows the
+//  successful otherDemo hook shape:
+//    - primary: shell32!SHOpenFolderAndSelectItems
+//    - nets:    shell32!ShellExecuteW / ShellExecuteExW
+//    - net:     kernel32!CreateProcessW for explorer.exe /select,...
+//
+//  Matching calls are suppressed and forwarded to the Qt broker over the
+//  existing JSON named pipe.
 // ============================================================
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #define SANDBOXBORDER_EXPORTS
 #include "SandboxBorder.h"
+
+#include <windows.h>
 #include <shlobj.h>
 #include <shellapi.h>
 #include <string>
 #include <cstdio>
+#include <cstdarg>
+#include <algorithm>
+#include <cwctype>
+
+#if __has_include(<detours/detours.h>)
+#include <detours/detours.h>
+#elif __has_include(<detours.h>)
+#include <detours.h>
+#else
+#error Microsoft Detours headers are required to build SandboxBorder.dll
+#endif
 
 #pragma comment(lib, "Shell32.lib")
 
+namespace {
+
 static wchar_t g_BoxName[64] = {};
+static wchar_t g_SandboxRoot[MAX_PATH] = {};
 static constexpr wchar_t g_PipeName[] = SANDBOX_PIPE_NAME;
 
 using PFN_SHOpenFolderAndSelectItems = HRESULT(WINAPI*)(
     PCIDLIST_ABSOLUTE, UINT, PCUITEMID_CHILD_ARRAY, DWORD);
 using PFN_ShellExecuteW = HINSTANCE(WINAPI*)(
     HWND, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, INT);
+using PFN_ShellExecuteExW = BOOL(WINAPI*)(SHELLEXECUTEINFOW*);
+using PFN_CreateProcessW = BOOL(WINAPI*)(
+    LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES,
+    BOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
 
 static PFN_SHOpenFolderAndSelectItems g_origSHOpen = nullptr;
 static PFN_ShellExecuteW g_origShellExecuteW = nullptr;
+static PFN_ShellExecuteExW g_origShellExecuteExW = nullptr;
+static PFN_CreateProcessW g_origCreateProcessW = nullptr;
+static bool g_HooksInstalled = false;
 
-static void NotifyHostOpenFolder(const wchar_t* realPath)
+thread_local int g_HookDepth = 0;
+thread_local bool g_SentThisAction = false;
+
+struct SendScope {
+    SendScope()
+    {
+        if (g_HookDepth == 0)
+            g_SentThisAction = false;
+        ++g_HookDepth;
+    }
+
+    ~SendScope()
+    {
+        --g_HookDepth;
+    }
+};
+
+static void LogLine(const wchar_t* fmt, ...)
 {
-    HANDLE hPipe = CreateFileW(g_PipeName, GENERIC_WRITE, 0, nullptr,
-        OPEN_EXISTING, 0, nullptr);
-    if (hPipe == INVALID_HANDLE_VALUE)
+    wchar_t dir[MAX_PATH] = {};
+    DWORD n = GetTempPathW(MAX_PATH, dir);
+    if (n == 0 || n >= MAX_PATH)
         return;
 
-    char boxUtf8[64] = {};
-    char pathUtf8[MAX_PATH * 2] = {};
-    WideCharToMultiByte(CP_UTF8, 0, g_BoxName, -1,
-        boxUtf8, sizeof(boxUtf8), nullptr, nullptr);
-    WideCharToMultiByte(CP_UTF8, 0, realPath, -1,
-        pathUtf8, sizeof(pathUtf8), nullptr, nullptr);
+    wchar_t path[MAX_PATH] = {};
+    _snwprintf_s(path, MAX_PATH, _TRUNCATE,
+        L"%sSandboxBorder.log", dir);
 
-    std::string escapedPath;
-    for (char ch : std::string(pathUtf8))
-        escapedPath += ch == '\\' ? "\\\\" : std::string(1, ch);
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, path, L"a, ccs=UTF-8") != 0 || !file)
+        return;
 
-    char message[1024];
-    int length = _snprintf_s(message, sizeof(message), _TRUNCATE,
-        "{\"cmd\":\"openFolder\",\"box\":\"%s\",\"path\":\"%s\"}\n",
-        boxUtf8, escapedPath.c_str());
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    fwprintf(file, L"[%02u:%02u:%02u.%03u pid=%lu tid=%lu] ",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+        GetCurrentProcessId(), GetCurrentThreadId());
 
-    DWORD written = 0;
-    WriteFile(hPipe, message, static_cast<DWORD>(length), &written, nullptr);
-    CloseHandle(hPipe);
+    va_list args;
+    va_start(args, fmt);
+    vfwprintf(file, fmt, args);
+    va_end(args);
+
+    fputwc(L'\n', file);
+    fclose(file);
 }
 
-static bool PatchIAT(HMODULE module, const char* dll, const char* function,
-    PROC replacement, PROC* original)
+static std::wstring ToLower(std::wstring text)
 {
-    if (!module)
+    for (auto& ch : text)
+        ch = static_cast<wchar_t>(towlower(ch));
+    return text;
+}
+
+static bool Contains(const std::wstring& haystack, const wchar_t* needle)
+{
+    return haystack.find(needle) != std::wstring::npos;
+}
+
+static std::wstring Trim(std::wstring text)
+{
+    while (!text.empty() && iswspace(text.front()))
+        text.erase(text.begin());
+    while (!text.empty() && iswspace(text.back()))
+        text.pop_back();
+    if (text.size() >= 2 && text.front() == L'"' && text.back() == L'"')
+        text = text.substr(1, text.size() - 2);
+    return text;
+}
+
+static std::wstring NormalizeDir(std::wstring path)
+{
+    std::replace(path.begin(), path.end(), L'/', L'\\');
+    while (!path.empty() && path.back() == L'\\')
+        path.pop_back();
+    return ToLower(std::move(path));
+}
+
+static bool IsExplorerReveal(LPCWSTR app, LPCWSTR cmdline, std::wstring& outPath)
+{
+    const std::wstring appText = app ? app : L"";
+    const std::wstring cmdText = cmdline ? cmdline : L"";
+    const std::wstring appLower = ToLower(appText);
+    const std::wstring cmdLower = ToLower(cmdText);
+
+    const bool isExplorer =
+        Contains(appLower, L"explorer.exe") ||
+        Contains(cmdLower, L"explorer.exe") ||
+        Contains(appLower, L"\\explorer") ||
+        (appText.empty() && cmdLower.rfind(L"explorer", 0) == 0);
+    if (!isExplorer)
         return false;
 
-    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(module);
-    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(
-        reinterpret_cast<BYTE*>(module) + dos->e_lfanew);
-    auto& importDir =
-        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (!importDir.VirtualAddress)
+    size_t pos = cmdLower.find(L"/select,");
+    size_t advance = 8;
+    if (pos == std::wstring::npos) {
+        pos = cmdLower.find(L"/n,");
+        advance = 3;
+    }
+    if (pos == std::wstring::npos)
         return false;
 
-    auto* descriptor = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(
-        reinterpret_cast<BYTE*>(module) + importDir.VirtualAddress);
-    for (; descriptor->Name; ++descriptor) {
-        auto* importedDll = reinterpret_cast<char*>(
-            reinterpret_cast<BYTE*>(module) + descriptor->Name);
-        if (_stricmp(importedDll, dll) != 0)
-            continue;
+    std::wstring rest = cmdText.substr(pos + advance);
+    rest = Trim(std::move(rest));
+    if (rest.empty())
+        return false;
 
-        auto* thunk = reinterpret_cast<IMAGE_THUNK_DATA*>(
-            reinterpret_cast<BYTE*>(module) + descriptor->FirstThunk);
-        auto* originalThunk = reinterpret_cast<IMAGE_THUNK_DATA*>(
-            reinterpret_cast<BYTE*>(module) + descriptor->OriginalFirstThunk);
+    if (rest.front() == L'"') {
+        rest.erase(0, 1);
+        size_t quote = rest.find(L'"');
+        if (quote != std::wstring::npos)
+            rest = rest.substr(0, quote);
+    }
+    else {
+        size_t end = rest.find_last_not_of(L" \t");
+        if (end != std::wstring::npos)
+            rest = rest.substr(0, end + 1);
+    }
 
-        for (; originalThunk->u1.AddressOfData; ++thunk, ++originalThunk) {
-            if (IMAGE_SNAP_BY_ORDINAL(originalThunk->u1.Ordinal))
-                continue;
+    outPath = rest;
+    return !outPath.empty();
+}
 
-            auto* import = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
-                reinterpret_cast<BYTE*>(module) +
-                originalThunk->u1.AddressOfData);
-            if (_stricmp(reinterpret_cast<char*>(import->Name), function) != 0)
-                continue;
+static bool IsSandboxDownloadsFolderOpen(
+    LPCWSTR verb,
+    LPCWSTR file,
+    std::wstring& outPath)
+{
+    if (!file || g_SandboxRoot[0] == L'\0')
+        return false;
 
-            DWORD oldProtection = 0;
-            if (!VirtualProtect(&thunk->u1.Function, sizeof(PROC),
-                PAGE_READWRITE, &oldProtection)) {
-                return false;
-            }
-            if (original)
-                *original = reinterpret_cast<PROC>(thunk->u1.Function);
-            thunk->u1.Function = reinterpret_cast<ULONG_PTR>(replacement);
-            VirtualProtect(&thunk->u1.Function, sizeof(PROC),
-                oldProtection, &oldProtection);
-            return true;
+    const std::wstring verbText = verb ? ToLower(verb) : L"";
+    if (!(verbText.empty() || verbText == L"open" || verbText == L"explore"))
+        return false;
+
+    std::wstring downloads = std::wstring(g_SandboxRoot) + L"\\drive\\Downloads";
+    if (NormalizeDir(file) != NormalizeDir(downloads))
+        return false;
+
+    DWORD attr = GetFileAttributesW(file);
+    if (attr == INVALID_FILE_ATTRIBUTES ||
+        !(attr & FILE_ATTRIBUTE_DIRECTORY))
+        return false;
+
+    outPath = file;
+    return true;
+}
+
+static std::wstring PidlToPath(
+    PCIDLIST_ABSOLUTE folder,
+    UINT count,
+    PCUITEMID_CHILD_ARRAY children)
+{
+    std::wstring path;
+
+    if (count >= 1 && children && children[0]) {
+        PIDLIST_ABSOLUTE full = ILCombine(folder, children[0]);
+        if (full) {
+            wchar_t buffer[MAX_PATH] = {};
+            if (SHGetPathFromIDListW(full, buffer))
+                path = buffer;
+            ILFree(full);
         }
     }
-    return false;
+
+    if (path.empty() && folder) {
+        wchar_t buffer[MAX_PATH] = {};
+        if (SHGetPathFromIDListW(folder, buffer))
+            path = buffer;
+    }
+
+    return path;
+}
+
+static std::string Utf8FromWide(const wchar_t* text)
+{
+    if (!text || text[0] == L'\0')
+        return {};
+
+    int needed = WideCharToMultiByte(CP_UTF8, 0, text, -1,
+        nullptr, 0, nullptr, nullptr);
+    if (needed <= 0)
+        return {};
+
+    std::string out(static_cast<size_t>(needed), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text, -1,
+        out.data(), needed, nullptr, nullptr);
+    if (!out.empty() && out.back() == '\0')
+        out.pop_back();
+    return out;
+}
+
+static std::string JsonEscape(const std::string& text)
+{
+    std::string escaped;
+    escaped.reserve(text.size());
+    for (char ch : text) {
+        if (ch == '\\')
+            escaped += "\\\\";
+        else if (ch == '"')
+            escaped += "\\\"";
+        else
+            escaped += ch;
+    }
+    return escaped;
+}
+
+static bool NotifyHostOpenFolder(const std::wstring& realPath)
+{
+    if (realPath.empty() || g_BoxName[0] == L'\0')
+        return false;
+
+    HANDLE pipe = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < 3 && pipe == INVALID_HANDLE_VALUE; ++attempt) {
+        pipe = CreateFileW(g_PipeName, GENERIC_WRITE, 0,
+            nullptr, OPEN_EXISTING, 0, nullptr);
+        if (pipe != INVALID_HANDLE_VALUE)
+            break;
+
+        DWORD gle = GetLastError();
+        LogLine(L"[pipe] connect attempt %d failed gle=%lu", attempt, gle);
+        WaitNamedPipeW(g_PipeName, 1000);
+    }
+
+    if (pipe == INVALID_HANDLE_VALUE) {
+        LogLine(L"[pipe] unreachable path=%s", realPath.c_str());
+        return false;
+    }
+
+    std::string box = JsonEscape(Utf8FromWide(g_BoxName));
+    std::string root = JsonEscape(Utf8FromWide(g_SandboxRoot));
+    std::string path = JsonEscape(Utf8FromWide(realPath.c_str()));
+
+    char message[4096] = {};
+    int length = _snprintf_s(message, sizeof(message), _TRUNCATE,
+        "{\"cmd\":\"openFolder\",\"box\":\"%s\",\"root\":\"%s\",\"path\":\"%s\"}\n",
+        box.c_str(), root.c_str(), path.c_str());
+    if (length <= 0) {
+        CloseHandle(pipe);
+        LogLine(L"[pipe] message format failed path=%s", realPath.c_str());
+        return false;
+    }
+
+    DWORD written = 0;
+    BOOL ok = WriteFile(pipe, message, static_cast<DWORD>(length),
+        &written, nullptr);
+    CloseHandle(pipe);
+
+    LogLine(L"[pipe] write ok=%d written=%lu/%d path=%s",
+        ok, written, length, realPath.c_str());
+    return ok && written == static_cast<DWORD>(length);
+}
+
+static void SignalOnce(const std::wstring& path)
+{
+    if (g_SentThisAction)
+        return;
+    if (NotifyHostOpenFolder(path))
+        g_SentThisAction = true;
 }
 
 static HRESULT WINAPI Hook_SHOpenFolderAndSelectItems(
-    PCIDLIST_ABSOLUTE pidl, UINT count,
-    PCUITEMID_CHILD_ARRAY children, DWORD flags)
+    PCIDLIST_ABSOLUTE folder,
+    UINT count,
+    PCUITEMID_CHILD_ARRAY children,
+    DWORD flags)
 {
-    wchar_t path[MAX_PATH] = {};
-    if (SHGetPathFromIDListW(pidl, path)) {
-        NotifyHostOpenFolder(path);
-        return S_OK;
+    SendScope scope;
+    const std::wstring path = PidlToPath(folder, count, children);
+    LogLine(L"[hook] SHOpenFolderAndSelectItems path=%s",
+        path.empty() ? L"<unknown>" : path.c_str());
+
+    if (!path.empty()) {
+        SignalOnce(path);
+        if (g_SentThisAction)
+            return S_OK;
     }
+
     return g_origSHOpen
-        ? g_origSHOpen(pidl, count, children, flags)
+        ? g_origSHOpen(folder, count, children, flags)
         : E_FAIL;
 }
 
 static HINSTANCE WINAPI Hook_ShellExecuteW(
-    HWND window, LPCWSTR operation, LPCWSTR file, LPCWSTR parameters,
-    LPCWSTR directory, INT showCommand)
+    HWND window,
+    LPCWSTR verb,
+    LPCWSTR file,
+    LPCWSTR parameters,
+    LPCWSTR directory,
+    INT showCommand)
 {
-    bool isOpen = !operation || !_wcsicmp(operation, L"open") ||
-        !_wcsicmp(operation, L"explore");
-    if (isOpen && file) {
-        DWORD attributes = GetFileAttributesW(file);
-        if (attributes != INVALID_FILE_ATTRIBUTES &&
-            (attributes & FILE_ATTRIBUTE_DIRECTORY)) {
-            NotifyHostOpenFolder(file);
+    SendScope scope;
+    std::wstring target;
+    if (IsExplorerReveal(file, parameters, target) ||
+        IsSandboxDownloadsFolderOpen(verb, file, target)) {
+        LogLine(L"[hook] ShellExecuteW reveal -> %s", target.c_str());
+        SignalOnce(target);
+        if (g_SentThisAction)
             return reinterpret_cast<HINSTANCE>(static_cast<INT_PTR>(42));
-        }
     }
 
     return g_origShellExecuteW
-        ? g_origShellExecuteW(window, operation, file, parameters,
+        ? g_origShellExecuteW(window, verb, file, parameters,
             directory, showCommand)
         : reinterpret_cast<HINSTANCE>(static_cast<INT_PTR>(2));
 }
 
-extern "C" SBAPI BOOL WINAPI SandboxBorder_Init(void)
+static BOOL WINAPI Hook_ShellExecuteExW(SHELLEXECUTEINFOW* execInfo)
+{
+    SendScope scope;
+    if (execInfo) {
+        std::wstring target;
+        if (IsExplorerReveal(execInfo->lpFile, execInfo->lpParameters, target) ||
+            IsSandboxDownloadsFolderOpen(execInfo->lpVerb,
+                execInfo->lpFile, target)) {
+            LogLine(L"[hook] ShellExecuteExW reveal -> %s", target.c_str());
+            SignalOnce(target);
+            if (g_SentThisAction) {
+                execInfo->hInstApp =
+                    reinterpret_cast<HINSTANCE>(static_cast<INT_PTR>(42));
+                return TRUE;
+            }
+        }
+    }
+
+    return g_origShellExecuteExW
+        ? g_origShellExecuteExW(execInfo)
+        : FALSE;
+}
+
+static BOOL WINAPI Hook_CreateProcessW(
+    LPCWSTR applicationName,
+    LPWSTR commandLine,
+    LPSECURITY_ATTRIBUTES processAttributes,
+    LPSECURITY_ATTRIBUTES threadAttributes,
+    BOOL inheritHandles,
+    DWORD creationFlags,
+    LPVOID environment,
+    LPCWSTR currentDirectory,
+    LPSTARTUPINFOW startupInfo,
+    LPPROCESS_INFORMATION processInformation)
+{
+    SendScope scope;
+    std::wstring target;
+    if (IsExplorerReveal(applicationName, commandLine, target)) {
+        LogLine(L"[hook] CreateProcessW explorer reveal -> %s", target.c_str());
+        SignalOnce(target);
+        if (g_SentThisAction) {
+            wchar_t noop[] = L"cmd.exe /c exit";
+            return g_origCreateProcessW
+                ? g_origCreateProcessW(nullptr, noop, processAttributes,
+                    threadAttributes, FALSE, creationFlags | CREATE_NO_WINDOW,
+                    environment, currentDirectory, startupInfo,
+                    processInformation)
+                : FALSE;
+        }
+    }
+
+    return g_origCreateProcessW
+        ? g_origCreateProcessW(applicationName, commandLine,
+            processAttributes, threadAttributes, inheritHandles,
+            creationFlags, environment, currentDirectory, startupInfo,
+            processInformation)
+        : FALSE;
+}
+
+template <typename Fn>
+static bool ResolveOne(const wchar_t* moduleName,
+    const char* functionName,
+    Fn& original,
+    const wchar_t* label)
+{
+    HMODULE module = GetModuleHandleW(moduleName);
+    if (!module)
+        module = LoadLibraryW(moduleName);
+    if (!module) {
+        LogLine(L"[hook] LoadLibraryW %s failed gle=%lu",
+            moduleName, GetLastError());
+        return false;
+    }
+
+    original = reinterpret_cast<Fn>(GetProcAddress(module, functionName));
+    if (!original) {
+        LogLine(L"[hook] GetProcAddress %s!%S failed gle=%lu",
+            moduleName, functionName, GetLastError());
+        return false;
+    }
+
+    LogLine(L"[hook] resolved %s", label);
+    return true;
+}
+
+template <typename Fn>
+static bool AttachOne(Fn& original, Fn detour, const wchar_t* label)
+{
+    if (!original)
+        return false;
+
+    LONG rc = DetourAttach(reinterpret_cast<PVOID*>(&original),
+        reinterpret_cast<PVOID>(detour));
+    LogLine(L"[hook] DetourAttach %s = %ld", label, rc);
+    return rc == NO_ERROR;
+}
+
+template <typename Fn>
+static void DetachOne(Fn& original, Fn detour, const wchar_t* label)
+{
+    if (!original)
+        return;
+
+    LONG rc = DetourDetach(reinterpret_cast<PVOID*>(&original),
+        reinterpret_cast<PVOID>(detour));
+    LogLine(L"[hook] DetourDetach %s = %ld", label, rc);
+}
+
+static bool LoadSandboxIdentity()
 {
     GetEnvironmentVariableW(SANDBOX_BORDER_BOX_ENV,
         g_BoxName, ARRAYSIZE(g_BoxName));
-    if (g_BoxName[0] == L'\0')
-        return FALSE;
+    GetEnvironmentVariableW(L"SANDBOX_ROOT",
+        g_SandboxRoot, ARRAYSIZE(g_SandboxRoot));
 
-    HMODULE executable = GetModuleHandleW(nullptr);
+    LogLine(L"[hook] identity box=%s root=%s",
+        g_BoxName[0] ? g_BoxName : L"<empty>",
+        g_SandboxRoot[0] ? g_SandboxRoot : L"<empty>");
+    return g_BoxName[0] != L'\0';
+}
+
+static bool InstallDetours()
+{
+    if (g_HooksInstalled)
+        return true;
+    if (!LoadSandboxIdentity())
+        return false;
+
+    if (!ResolveOne(L"shell32.dll", "SHOpenFolderAndSelectItems",
+        g_origSHOpen, L"SHOpenFolderAndSelectItems")) {
+        return false;
+    }
+
+    ResolveOne(L"shell32.dll", "ShellExecuteW",
+        g_origShellExecuteW, L"ShellExecuteW");
+    ResolveOne(L"shell32.dll", "ShellExecuteExW",
+        g_origShellExecuteExW, L"ShellExecuteExW");
+    ResolveOne(L"kernel32.dll", "CreateProcessW",
+        g_origCreateProcessW, L"CreateProcessW");
+
+    LONG rc = DetourTransactionBegin();
+    if (rc != NO_ERROR) {
+        LogLine(L"[hook] DetourTransactionBegin = %ld", rc);
+        return false;
+    }
+    DetourUpdateThread(GetCurrentThread());
+
+    bool primary = AttachOne(g_origSHOpen, Hook_SHOpenFolderAndSelectItems,
+        L"SHOpenFolderAndSelectItems");
+    AttachOne(g_origShellExecuteW, Hook_ShellExecuteW, L"ShellExecuteW");
+    AttachOne(g_origShellExecuteExW, Hook_ShellExecuteExW, L"ShellExecuteExW");
+    AttachOne(g_origCreateProcessW, Hook_CreateProcessW, L"CreateProcessW");
+
+    rc = DetourTransactionCommit();
+    LogLine(L"[hook] DetourTransactionCommit = %ld", rc);
+    if (rc != NO_ERROR)
+        return false;
+
+    g_HooksInstalled = true;
+
     HMODULE shell = GetModuleHandleW(L"shell32.dll");
-    PatchIAT(executable, "shell32.dll", "SHOpenFolderAndSelectItems",
-        reinterpret_cast<PROC>(Hook_SHOpenFolderAndSelectItems),
-        reinterpret_cast<PROC*>(&g_origSHOpen));
-    PatchIAT(executable, "shell32.dll", "ShellExecuteW",
-        reinterpret_cast<PROC>(Hook_ShellExecuteW),
-        reinterpret_cast<PROC*>(&g_origShellExecuteW));
-
-    if (!g_origSHOpen && shell) {
-        g_origSHOpen = reinterpret_cast<PFN_SHOpenFolderAndSelectItems>(
+    if (shell) {
+        const auto* code = reinterpret_cast<const BYTE*>(
             GetProcAddress(shell, "SHOpenFolderAndSelectItems"));
+        if (code) {
+            LogLine(L"[hook] SHOpen entry byte after enable = 0x%02X",
+                code[0]);
+        }
     }
-    if (!g_origShellExecuteW && shell) {
-        g_origShellExecuteW = reinterpret_cast<PFN_ShellExecuteW>(
-            GetProcAddress(shell, "ShellExecuteW"));
-    }
-    return TRUE;
+
+    LogLine(L"[hook] Install done primary=%d", primary);
+    return primary;
+}
+
+static void RemoveDetours()
+{
+    if (!g_HooksInstalled)
+        return;
+
+    if (DetourTransactionBegin() != NO_ERROR)
+        return;
+    DetourUpdateThread(GetCurrentThread());
+    DetachOne(g_origSHOpen, Hook_SHOpenFolderAndSelectItems,
+        L"SHOpenFolderAndSelectItems");
+    DetachOne(g_origShellExecuteW, Hook_ShellExecuteW, L"ShellExecuteW");
+    DetachOne(g_origShellExecuteExW, Hook_ShellExecuteExW, L"ShellExecuteExW");
+    DetachOne(g_origCreateProcessW, Hook_CreateProcessW, L"CreateProcessW");
+    LONG rc = DetourTransactionCommit();
+    LogLine(L"[hook] Detour detach commit = %ld", rc);
+    if (rc == NO_ERROR)
+        g_HooksInstalled = false;
+}
+
+static DWORD WINAPI InitThreadProc(LPVOID)
+{
+    LogLine(L"[dll] init thread; installing hooks");
+    InstallDetours();
+    return 0;
+}
+
+} // namespace
+
+extern "C" SBAPI BOOL WINAPI SandboxBorder_Init(void)
+{
+    return InstallDetours() ? TRUE : FALSE;
 }
 
 extern "C" SBAPI BOOL WINAPI SandboxBorder_Uninit(void)
 {
+    RemoveDetours();
     return TRUE;
 }
 
-BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
+BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
 {
-    if (reason == DLL_PROCESS_ATTACH)
+    UNREFERENCED_PARAMETER(reserved);
+
+    if (DetourIsHelperProcess())
+        return TRUE;
+
+    if (reason == DLL_PROCESS_ATTACH) {
+        DetourRestoreAfterWith();
         DisableThreadLibraryCalls(instance);
+
+        HANDLE thread = CreateThread(nullptr, 0, InitThreadProc,
+            nullptr, 0, nullptr);
+        if (thread)
+            CloseHandle(thread);
+    }
+    else if (reason == DLL_PROCESS_DETACH) {
+        RemoveDetours();
+    }
+
     return TRUE;
 }

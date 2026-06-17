@@ -852,6 +852,7 @@ void MainWindow::onLaunchSandboxed()
     cfg.passphrase     = m_chkPassphrase->isChecked()
         ? m_passphrase->text().toStdWString()
         : std::wstring();
+    cfg.borderDllPath  = SandboxExplorer::defaultDllPath();
     cfg.restrictUI     = m_chkRestrictUI->isChecked() && !isChromium;
     cfg.killOnClose    = m_chkKillOnClose->isChecked();
     if (isChromium && m_chkRestrictUI->isChecked()) {
@@ -973,12 +974,9 @@ void MainWindow::onLaunchSandboxed()
     // knows the PID) but before ResumeThread (so Job UI restrictions are
     // not yet enforced and VirtualAllocEx / SetThreadContext work freely).
     {
-        std::wstring dllPath = SandboxExplorer::defaultDllPath();
-        if (!dllPath.empty()) {
-            bool ok = m_engine.injectWhileSuspended(sp, dllPath);
-            appendLog(ok
-                ? QString("  [Broker] Shell hook installed for PID %1").arg(sp.pid)
-                : QString("  [!] Shell broker injection failed for PID %1").arg(sp.pid));
+        if (!cfg.borderDllPath.empty()) {
+            appendLog(QString("  [Broker] Shell hook injected by Detours for PID %1")
+                .arg(sp.pid));
         } else {
             appendLog("  [!] SandboxBorder.dll not found — Show in folder broker unavailable.");
             appendLog("      Build SandboxBorder.dll and place it next to this EXE.");
