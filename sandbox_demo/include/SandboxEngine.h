@@ -7,10 +7,23 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <array>
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <functional>
 #include "NtDefs.h"
+#include "VaultManager.h"
+
+#ifndef SANDBOX_LOG_CALLBACK_DEFINED
+#define SANDBOX_LOG_CALLBACK_DEFINED
+using LogCallback = std::function<void(const std::wstring&)>;
+#endif
+
+struct DerivedKeys {
+    std::array<uint8_t, 32> masterKey{};
+    std::array<uint8_t, 32> hmacKey{};
+};
 
 struct SandboxedProcess {
     DWORD  pid          = 0;
@@ -20,9 +33,16 @@ struct SandboxedProcess {
     HANDLE hNamespaceDir= nullptr;
     std::wstring boxName;
     std::wstring fsRoot;
+    std::wstring vaultFilePath;
+    std::wstring vaultMountPoint;
+    std::wstring mountPointNt;
+    std::array<uint8_t, 32> masterKey{};
+    std::array<uint8_t, 32> hmacKey{};
     std::vector<DWORD> driverPids;
     bool   wfpEnabled   = false;
     ULONG  wfpVnicIp    = 0;
+    bool   vaultMounted  = false;
+    bool   cryptoKeysValid = false;
     bool   valid        = false;
     bool   suspended    = false;
 };
@@ -32,13 +52,16 @@ struct SandboxConfig {
     std::wstring executablePath;
     std::wstring commandLine;
     std::wstring fsRootBase;
+    bool useVault = true;
+    std::wstring vaultDir = L"C:\\SandboxBoxes";
+    std::wstring mountDir = L"C:\\SandboxMounts";
+    uint64_t vaultSizeMB = 512;
+    std::wstring passphrase;
     std::wstring borderDllPath;   // path to injected shell broker; empty = skip
     bool restrictUI     = true;
     bool killOnClose    = true;
     bool inheritConsole = false;
 };
-
-using LogCallback = std::function<void(const std::wstring&)>;
 
 class SandboxEngine {
 public:
@@ -63,9 +86,13 @@ public:
     static bool isAlive(DWORD pid);
     static bool isAlive(const SandboxedProcess& sp);
     static std::wstring describeJob(HANDLE hJob);
+    static DerivedKeys deriveKeys(const std::wstring& boxName,
+                                  const std::vector<uint8_t>& salt,
+                                  const std::wstring& passphrase);
 
 private:
     LogCallback m_log;
+    VaultManager m_vault;
 
     HANDLE createPrivateNamespace(const std::wstring& boxName);
     HANDLE createJobObject(const SandboxConfig& cfg);
@@ -75,5 +102,6 @@ private:
                       SandboxedProcess& out);
     std::wstring prepareFsRoot(const std::wstring& base,
                                 const std::wstring& boxName);
+    std::wstring prepareFsRootAt(const std::wstring& root);
     void log(const std::wstring& msg);
 };

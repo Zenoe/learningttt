@@ -73,6 +73,9 @@ Box_Add(_In_ struct _SANDBOX_BOX_INFO* Info)
     box->WritePolicy = SandboxPolicy_Redirect;
     box->RedirectReads = TRUE;   /* must be TRUE: app reads back its own writes */
     box->HideHostFiles = FALSE;
+    box->CryptoEnabled = FALSE;
+    box->CryptoBlockSize = CRYPTO_BLOCK_SIZE;
+    box->AccessControlEnabled = FALSE;
     box->CacheGeneration = (ULONG)InterlockedIncrement(&g_BoxGeneration);
     if (box->CacheGeneration == 0)
         box->CacheGeneration = (ULONG)InterlockedIncrement(&g_BoxGeneration);
@@ -123,6 +126,8 @@ Box_Remove(_In_ PCWSTR BoxName)
     RemoveEntryList(&box->ListEntry);
     SbRelease(&g_Sandbox.BoxLock);
 
+    RtlSecureZeroMemory(box->MasterKey, sizeof(box->MasterKey));
+    RtlSecureZeroMemory(box->HmacKey, sizeof(box->HmacKey));
     ExFreePoolWithTag(box, SANDBOX_POOL_TAG);
     InterlockedDecrement(&g_AnyBoxActive);   /* Tier 0 */
     DbgPrint("[SandboxFlt] Box_Remove: '%S'\n", BoxName);

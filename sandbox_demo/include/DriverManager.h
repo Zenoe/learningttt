@@ -17,6 +17,8 @@
 #define NOMINMAX
 #include <windows.h>
 #include <winsvc.h>
+#include <array>
+#include <cstdint>
 #include <string>
 #include <functional>
 
@@ -80,6 +82,15 @@ public:
                       const std::wstring& boxName,
                       ULONG vnicIp,
                       bool enabled);
+
+    bool setCryptoKey(const std::wstring& boxName,
+                      const std::array<uint8_t, 32>& masterKey,
+                      const std::array<uint8_t, 32>& hmacKey);
+
+    bool clearCryptoKey(const std::wstring& boxName);
+
+    bool setMountPoint(const std::wstring& boxName,
+                       const std::wstring& mountPointNt);
 
     // ---- Helpers ------------------------------------------
     static std::wstring defaultSysPath();   // exe dir + SandboxFlt.sys

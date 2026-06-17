@@ -46,6 +46,18 @@ static const FLT_OPERATION_REGISTRATION c_Callbacks[] = {
         SandboxFlt_PreNetworkQueryOpen,
         NULL
     },
+    {
+        IRP_MJ_READ,
+        FLTFL_OPERATION_REGISTRATION_SKIP_PAGING_IO,
+        SandboxFlt_PreRead,
+        SandboxFlt_PostRead
+    },
+    {
+        IRP_MJ_WRITE,
+        FLTFL_OPERATION_REGISTRATION_SKIP_PAGING_IO,
+        SandboxFlt_PreWrite,
+        SandboxFlt_PostWrite
+    },
     { IRP_MJ_OPERATION_END }
 };
 
@@ -133,6 +145,12 @@ DriverEntry(
         goto Cleanup;
     }
 
+    status = Crypto_Initialize();
+    if (!NT_SUCCESS(status)) {
+        DbgPrint("[SandboxFlt] Crypto_Initialize failed: %08x\n", status);
+        goto Cleanup;
+    }
+
     // --------------------------------------------------------
     //  2. Register the minifilter
     //     Wire up the instance context registration (for the
@@ -174,6 +192,7 @@ Cleanup:
         PsSetCreateProcessNotifyRoutineEx(SandboxFlt_ProcessNotify, TRUE);
         g_Sandbox.ProcessNotifyRegistered = FALSE;
     }
+    Crypto_Cleanup();
     SandboxWfp_Unregister();
     if (g_Sandbox.ControlDevice) {
         RtlInitUnicodeString(&symLink, SANDBOX_DOS_DEVICE_NAME);
@@ -203,6 +222,7 @@ SandboxFlt_Unload(_In_ FLT_FILTER_UNLOAD_FLAGS Flags)
         g_Sandbox.ProcessNotifyRegistered = FALSE;
     }
 
+    Crypto_Cleanup();
     SandboxWfp_Unregister();
 
     // Stop accepting new requests
@@ -293,9 +313,12 @@ SandboxFlt_DispatchIoctl(
     PSANDBOX_PROCESS_LIST procList;
     PSANDBOX_POLICY_INFO  polInfo;
     PSANDBOX_WFP_POLICY_INFO wfpInfo;
+    PSANDBOX_CRYPTO_INFO cryptoInfo;
+    PSANDBOX_MOUNT_POINT_INFO mountInfo;
     UNICODE_STRING        boxName;
     PBOX_ENTRY            box;
     PLIST_ENTRY           e;
+    ULONG                 mountLen;
 
     stack = IoGetCurrentIrpStackLocation(Irp);
     code = stack->Parameters.DeviceIoControl.IoControlCode;
@@ -415,6 +438,96 @@ SandboxFlt_DispatchIoctl(
         if (inLen >= sizeof(SANDBOX_WFP_POLICY_INFO)) {
             wfpInfo = (PSANDBOX_WFP_POLICY_INFO)buf;
             status = SandboxWfp_SetProcessPolicy(wfpInfo);
+        }
+        else {
+            status = STATUS_BUFFER_TOO_SMALL;
+        }
+        break;
+
+    case IOCTL_SANDBOX_SET_CRYPTO_KEY:
+        if (inLen >= sizeof(SANDBOX_CRYPTO_INFO)) {
+            cryptoInfo = (PSANDBOX_CRYPTO_INFO)buf;
+            if (cryptoInfo->BlockSize != CRYPTO_BLOCK_SIZE) {
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+
+            RtlInitUnicodeString(&boxName, cryptoInfo->BoxName);
+            SbAcquireExclusive(&g_Sandbox.BoxLock);
+            box = Box_Find(&boxName);
+            if (box) {
+                RtlCopyMemory(box->MasterKey, cryptoInfo->MasterKey,
+                    sizeof(box->MasterKey));
+                RtlCopyMemory(box->HmacKey, cryptoInfo->HmacKey,
+                    sizeof(box->HmacKey));
+                box->CryptoBlockSize = CRYPTO_BLOCK_SIZE;
+                box->CryptoEnabled = TRUE;
+                status = STATUS_SUCCESS;
+            }
+            else {
+                status = STATUS_NOT_FOUND;
+            }
+            SbRelease(&g_Sandbox.BoxLock);
+            RtlSecureZeroMemory(cryptoInfo->MasterKey,
+                sizeof(cryptoInfo->MasterKey));
+            RtlSecureZeroMemory(cryptoInfo->HmacKey,
+                sizeof(cryptoInfo->HmacKey));
+        }
+        else {
+            status = STATUS_BUFFER_TOO_SMALL;
+        }
+        break;
+
+    case IOCTL_SANDBOX_CLEAR_CRYPTO_KEY:
+        if (inLen >= sizeof(SANDBOX_CRYPTO_INFO)) {
+            cryptoInfo = (PSANDBOX_CRYPTO_INFO)buf;
+            RtlInitUnicodeString(&boxName, cryptoInfo->BoxName);
+            SbAcquireExclusive(&g_Sandbox.BoxLock);
+            box = Box_Find(&boxName);
+            if (box) {
+                RtlSecureZeroMemory(box->MasterKey, sizeof(box->MasterKey));
+                RtlSecureZeroMemory(box->HmacKey, sizeof(box->HmacKey));
+                box->CryptoEnabled = FALSE;
+                status = STATUS_SUCCESS;
+            }
+            else {
+                status = STATUS_NOT_FOUND;
+            }
+            SbRelease(&g_Sandbox.BoxLock);
+            RtlSecureZeroMemory(cryptoInfo, sizeof(*cryptoInfo));
+        }
+        else {
+            status = STATUS_BUFFER_TOO_SMALL;
+        }
+        break;
+
+    case IOCTL_SANDBOX_SET_MOUNT_POINT:
+        if (inLen >= sizeof(SANDBOX_MOUNT_POINT_INFO)) {
+            mountInfo = (PSANDBOX_MOUNT_POINT_INFO)buf;
+            mountLen = (ULONG)wcsnlen(mountInfo->MountPointNt,
+                SANDBOX_MAX_PATH);
+            if (mountLen == 0 || mountLen >= SANDBOX_MAX_PATH) {
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+
+            RtlInitUnicodeString(&boxName, mountInfo->BoxName);
+            SbAcquireExclusive(&g_Sandbox.BoxLock);
+            box = Box_Find(&boxName);
+            if (box) {
+                RtlZeroMemory(box->MountPointBuf,
+                    sizeof(box->MountPointBuf));
+                RtlCopyMemory(box->MountPointBuf, mountInfo->MountPointNt,
+                    (mountLen + 1) * sizeof(WCHAR));
+                RtlInitUnicodeString(&box->MountPointNt,
+                    box->MountPointBuf);
+                box->AccessControlEnabled = TRUE;
+                status = STATUS_SUCCESS;
+            }
+            else {
+                status = STATUS_NOT_FOUND;
+            }
+            SbRelease(&g_Sandbox.BoxLock);
         }
         else {
             status = STATUS_BUFFER_TOO_SMALL;

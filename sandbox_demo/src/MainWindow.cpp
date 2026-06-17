@@ -412,7 +412,7 @@ MainWindow::~MainWindow()
     }
     g_hostBorders.clear();
     for (auto& sp : m_sandboxProcs) {
-        unregisterWfp(sp);
+        unregisterDriverPids(sp);
         m_engine.release(sp);
     }
     for (auto& sp : m_normalProcs)  m_engine.release(sp);
@@ -518,8 +518,19 @@ void MainWindow::setupUi()
 
     m_boxName   = makeEdit("Box00", mono);
     m_boxName->setText("Box00");
-    m_fsRoot    = makeEdit("C:\\SandboxDemo", mono);
-    m_fsRoot->setText("C:\\SandboxDemo");
+    m_fsRoot    = makeEdit("C:\\SandboxMounts", mono);
+    m_fsRoot->setText("C:\\SandboxMounts");
+    m_vaultDir = makeEdit("C:\\SandboxBoxes", mono);
+    m_vaultDir->setText("C:\\SandboxBoxes");
+    m_vaultSizeMb = makeEdit("512", mono);
+    m_vaultSizeMb->setText("512");
+    m_vaultSizeMb->setFixedWidth(100);
+    m_chkPassphrase = new QCheckBox("Use passphrase");
+    m_chkPassphrase->setStyleSheet("QCheckBox{color:#aab;}"
+        "QCheckBox::indicator:checked{background:#0af;}");
+    m_passphrase = makeEdit("(optional)", mono);
+    m_passphrase->setEchoMode(QLineEdit::Password);
+    m_passphrase->setEnabled(false);
     m_extraArgs = makeEdit("(optional extra arguments)", mono);
 
     m_btnBrowse = makeBtn("…", "#334", 26); m_btnBrowse->setFixedWidth(30);
@@ -528,10 +539,20 @@ void MainWindow::setupUi()
     cfgGrid->addWidget(m_exePath,   0, 1); cfgGrid->addWidget(m_btnBrowse, 0, 2);
     cfgGrid->addWidget(makeLabel("Box Name:"),   1, 0);
     cfgGrid->addWidget(m_boxName,   1, 1);
-    cfgGrid->addWidget(makeLabel("FS Root:"),    2, 0);
+    cfgGrid->addWidget(makeLabel("Mount Dir:"),  2, 0);
     cfgGrid->addWidget(m_fsRoot,    2, 1);
-    cfgGrid->addWidget(makeLabel("Extra Args:"), 3, 0);
-    cfgGrid->addWidget(m_extraArgs, 3, 1);
+    cfgGrid->addWidget(makeLabel("Vault Dir:"),  3, 0);
+    cfgGrid->addWidget(m_vaultDir,  3, 1);
+    cfgGrid->addWidget(makeLabel("Vault Size:"), 4, 0);
+    auto* vaultRow = new QHBoxLayout;
+    vaultRow->addWidget(m_vaultSizeMb);
+    vaultRow->addWidget(makeLabel("MB"));
+    vaultRow->addSpacing(20);
+    vaultRow->addWidget(m_chkPassphrase);
+    vaultRow->addWidget(m_passphrase, 1);
+    cfgGrid->addLayout(vaultRow, 4, 1);
+    cfgGrid->addWidget(makeLabel("Extra Args:"), 5, 0);
+    cfgGrid->addWidget(m_extraArgs, 5, 1);
 
     // Options row
     auto* optRow = new QHBoxLayout;
@@ -570,7 +591,7 @@ void MainWindow::setupUi()
     optRow->addWidget(wfpLabel);
     optRow->addWidget(m_wfpVnicIp);
     optRow->addStretch();
-    cfgGrid->addLayout(optRow, 4, 0, 1, 3);
+    cfgGrid->addLayout(optRow, 6, 0, 1, 3);
 
     // Launch buttons
     m_btnNormal    = makeBtn("▶  Launch Normal", "#1a4a88");
@@ -584,7 +605,7 @@ void MainWindow::setupUi()
     launchRow->addStretch();
     launchRow->addWidget(m_btnKillSel);
     launchRow->addWidget(m_btnKillAll);
-    cfgGrid->addLayout(launchRow, 5, 0, 1, 3);
+    cfgGrid->addLayout(launchRow, 7, 0, 1, 3);
 
     rootLayout->addWidget(cfgGroup);
 
@@ -656,6 +677,8 @@ void MainWindow::setupUi()
             this, &MainWindow::onPolicyChanged);
     connect(m_chkWfpForce, &QCheckBox::toggled,
             m_wfpVnicIp, &QLineEdit::setEnabled);
+    connect(m_chkPassphrase, &QCheckBox::toggled,
+            m_passphrase, &QLineEdit::setEnabled);
     // ── NEW: restart pipe server if FS root changes
     connect(m_fsRoot, &QLineEdit::editingFinished,
             this, &MainWindow::onFsRootChanged);
@@ -794,30 +817,24 @@ void MainWindow::onLaunchSandboxed()
     QString uniqueBox = m_boxName->text().trimmed();
     if (uniqueBox.isEmpty()) uniqueBox = "Box00";
 
-    // ---- Determine sandbox FS root (volume-relative for driver) ----
-    QString fsRoot = m_fsRoot->text().trimmed();
-    if (fsRoot.isEmpty()) fsRoot = "C:\\SandboxDemo";
-    QString relRoot = fsRoot;
-    if (relRoot.length() >= 2 && relRoot[1] == ':')
-        relRoot = relRoot.mid(2);
-    relRoot = relRoot.replace('/', '\\');
-    if (!relRoot.startsWith('\\')) relRoot.prepend('\\');
-    QString sandboxVolRelative = relRoot + "\\" + uniqueBox + "\\drive";
+    QString mountDir = m_fsRoot->text().trimmed();
+    if (mountDir.isEmpty()) mountDir = "C:\\SandboxMounts";
+    QString vaultDir = m_vaultDir->text().trimmed();
+    if (vaultDir.isEmpty()) vaultDir = "C:\\SandboxBoxes";
+    bool sizeOk = false;
+    uint64_t vaultSizeMb = m_vaultSizeMb->text().trimmed().toULongLong(&sizeOk);
+    if (!sizeOk || vaultSizeMb < 64) {
+        appendLog("! Vault size must be at least 64 MB.");
+        return;
+    }
+    if (!DriverManager::isElevated()) {
+        appendLog("! Vault-backed sandbox launch requires Administrator privileges.");
+        appendLog("  CreateVirtualDisk/AttachVirtualDisk cannot run from a non-elevated process.");
+        return;
+    }
 
     appendLog("--- Launch SANDBOXED box=\"" + uniqueBox + "\" ---");
-
-    // ---- Register box with driver first ----
-    bool driverOk = false;
-    if (m_driver.isLoaded()) {
-        driverOk = m_driver.addBox(uniqueBox.toStdWString(),
-                                    sandboxVolRelative.toStdWString(),
-                                    L"\\");
-        if (driverOk) {
-            int pol = m_cmbPolicy->currentIndex();
-            m_driver.setPolicy(uniqueBox.toStdWString(),
-                               (SANDBOX_WRITE_POLICY)pol, true, false);
-        }
-    } else {
+    if (!m_driver.isLoaded()) {
         appendLog("  [!] Driver not loaded — FS redirection via driver DISABLED.");
         appendLog("      Job Object + namespace isolation still active.");
     }
@@ -827,7 +844,14 @@ void MainWindow::onLaunchSandboxed()
     cfg.boxName        = uniqueBox.toStdWString();
     cfg.executablePath = exe.toStdWString();
     cfg.commandLine    = m_extraArgs->text().toStdWString();
-    cfg.fsRootBase     = fsRoot.toStdWString();
+    cfg.fsRootBase     = mountDir.toStdWString();
+    cfg.useVault       = true;
+    cfg.vaultDir       = vaultDir.toStdWString();
+    cfg.mountDir       = mountDir.toStdWString();
+    cfg.vaultSizeMB    = vaultSizeMb;
+    cfg.passphrase     = m_chkPassphrase->isChecked()
+        ? m_passphrase->text().toStdWString()
+        : std::wstring();
     cfg.restrictUI     = m_chkRestrictUI->isChecked() && !isChromium;
     cfg.killOnClose    = m_chkKillOnClose->isChecked();
     if (isChromium && m_chkRestrictUI->isChecked()) {
@@ -838,8 +862,43 @@ void MainWindow::onLaunchSandboxed()
     SandboxedProcess sp = m_engine.launch(cfg);
     if (!sp.valid) {
         appendLog("! Process launch failed.");
-        if (driverOk) m_driver.removeBox(uniqueBox.toStdWString());
         return;
+    }
+
+    // ---- Register the mounted vault root and crypto context with the driver. ----
+    bool driverOk = false;
+    if (m_driver.isLoaded()) {
+        QString sandboxRoot = QString::fromStdWString(sp.fsRoot + L"\\drive");
+        QString sandboxVolRelative = sandboxRoot;
+        if (sandboxVolRelative.length() >= 2 && sandboxVolRelative[1] == ':')
+            sandboxVolRelative = sandboxVolRelative.mid(2);
+        sandboxVolRelative = sandboxVolRelative.replace('/', '\\');
+        if (!sandboxVolRelative.startsWith('\\'))
+            sandboxVolRelative.prepend('\\');
+
+        driverOk = m_driver.addBox(uniqueBox.toStdWString(),
+                                    sandboxVolRelative.toStdWString(),
+                                    L"\\");
+        if (driverOk) {
+            int pol = m_cmbPolicy->currentIndex();
+            m_driver.setPolicy(uniqueBox.toStdWString(),
+                               (SANDBOX_WRITE_POLICY)pol, true, false);
+            if (!sp.mountPointNt.empty())
+                driverOk = m_driver.setMountPoint(uniqueBox.toStdWString(),
+                                                  sp.mountPointNt);
+            if (driverOk && sp.cryptoKeysValid)
+                driverOk = m_driver.setCryptoKey(uniqueBox.toStdWString(),
+                                                 sp.masterKey,
+                                                 sp.hmacKey);
+        }
+
+        if (!driverOk) {
+            appendLog("! Driver box/vault registration failed; terminating suspended process.");
+            m_driver.clearCryptoKey(uniqueBox.toStdWString());
+            m_driver.removeBox(uniqueBox.toStdWString());
+            m_engine.release(sp);
+            return;
+        }
     }
 
     // ---- Tell the driver about the new PID ----
@@ -852,6 +911,7 @@ void MainWindow::onLaunchSandboxed()
                 .arg(sp.pid));
         if (!pidOk) {
             appendLog("! Driver PID registration failed; terminating suspended process.");
+            m_driver.clearCryptoKey(uniqueBox.toStdWString());
             m_driver.removeBox(uniqueBox.toStdWString());
             m_engine.release(sp);
             return;
@@ -867,6 +927,7 @@ void MainWindow::onLaunchSandboxed()
         if (!DriverManager::parseIpv4(ipText, vnicIp)) {
             appendLog("! Invalid WFP vNIC IP: " + m_wfpVnicIp->text());
             if (driverOk) {
+                m_driver.clearCryptoKey(sp.boxName);
                 m_driver.removeProcess(sp.pid);
                 m_driver.removeBox(uniqueBox.toStdWString());
             }
@@ -883,6 +944,7 @@ void MainWindow::onLaunchSandboxed()
         if (!m_driver.setWfpPolicy(sp.pid, uniqueBox.toStdWString(), vnicIp, true)) {
             appendLog("! SandboxFlt WFP policy registration failed; terminating suspended process.");
             if (driverOk) {
+                m_driver.clearCryptoKey(sp.boxName);
                 m_driver.removeProcess(sp.pid);
                 m_driver.removeBox(uniqueBox.toStdWString());
             }
@@ -919,6 +981,7 @@ void MainWindow::onLaunchSandboxed()
         appendLog("! Failed to resume sandboxed process.");
         unregisterWfp(sp);
         if (driverOk) {
+            m_driver.clearCryptoKey(sp.boxName);
             m_driver.removeProcess(sp.pid);
             m_driver.removeBox(uniqueBox.toStdWString());
         }
@@ -954,9 +1017,7 @@ void MainWindow::onKillSelected()
 
     for (auto& sp : m_sandboxProcs) {
         if (sp.pid == pid && sp.valid) {
-            unregisterWfp(sp);
-            m_driver.removeProcess(pid);
-            m_driver.removeBox(sp.boxName);
+            unregisterDriverPids(sp);
             m_engine.release(sp);
             item->setText(4, item->text(4) + " [killed]");
             for (int c = 0; c < m_processTree->columnCount(); ++c)
@@ -979,9 +1040,7 @@ void MainWindow::onKillAll()
     m_monitor->stopAll();
     for (auto& sp : m_sandboxProcs) {
         if (sp.valid) {
-            unregisterWfp(sp);
-            m_driver.removeProcess(sp.pid);
-            m_driver.removeBox(sp.boxName);
+            unregisterDriverPids(sp);
             m_engine.release(sp);
         }
     }
@@ -1017,6 +1076,29 @@ void MainWindow::unregisterWfp(SandboxedProcess& sp)
         m_driver.setWfpPolicy(sp.pid, sp.boxName, 0, false);
     sp.wfpEnabled = false;
     sp.wfpVnicIp = 0;
+}
+
+void MainWindow::syncDriverPids(SandboxedProcess& sp)
+{
+    if (!m_driver.isLoaded() || !sp.valid)
+        return;
+    for (DWORD pid : sp.driverPids)
+        m_driver.addProcess(pid, sp.boxName);
+}
+
+void MainWindow::unregisterDriverPids(SandboxedProcess& sp)
+{
+    unregisterWfp(sp);
+    if (!m_driver.isLoaded())
+        return;
+
+    m_driver.clearCryptoKey(sp.boxName);
+    m_driver.removeProcess(sp.pid);
+    for (DWORD pid : sp.driverPids) {
+        if (pid != sp.pid)
+            m_driver.removeProcess(pid);
+    }
+    m_driver.removeBox(sp.boxName);
 }
 
 // ── NEW: restart pipe server when the FS root field changes ─────────────────
@@ -1114,10 +1196,8 @@ void MainWindow::onProcessExited(DWORD pid, const QString& label, DWORD code)
 
     for (auto& sp : m_sandboxProcs) {
         if (sp.pid == pid && sp.valid) {
-            unregisterWfp(sp);
+            unregisterDriverPids(sp);
             m_engine.release(sp);
-            m_driver.removeProcess(pid);
-            m_driver.removeBox(sp.boxName);
             break;
         }
     }

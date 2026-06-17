@@ -30,6 +30,7 @@ set(SOURCES
     src/SandboxEngine.cpp
     src/ProcessMonitor.cpp
     src/DriverManager.cpp
+    src/VaultManager.cpp
     src/SandboxExplorer.cpp
     src/SandboxEngine_Inject.cpp
     src/StringUtil.cpp
@@ -41,6 +42,7 @@ set(HEADERS
     include/SandboxExplorer.h
     include/ProcessMonitor.h
     include/DriverManager.h
+    include/VaultManager.h
     include/NtDefs.h
     driver/include/SandboxIpc.h   # shared with kernel driver
 )
@@ -58,6 +60,8 @@ target_link_libraries(SandboxDemo PRIVATE
     ntdll
     psapi
     advapi32                # SCM / registry APIs used by DriverManager
+    virtdisk
+    bcrypt
 )
 
 target_compile_options(SandboxDemo PRIVATE /W3 /wd4996)

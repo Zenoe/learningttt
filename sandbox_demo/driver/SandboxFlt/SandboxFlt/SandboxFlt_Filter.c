@@ -391,6 +391,111 @@ Path_StartsWith(_In_ PC_UNICODE_STRING Full, _In_ PC_UNICODE_STRING Prefix)
     return (RtlCompareUnicodeString(&sub, (PUNICODE_STRING)Prefix, TRUE) == 0);
 }
 
+static BOOLEAN
+Path_StartsWithBoundary(
+    _In_ PC_UNICODE_STRING Full,
+    _In_ PC_UNICODE_STRING Prefix)
+{
+    USHORT prefixChars;
+
+    if (!Path_StartsWith(Full, Prefix))
+        return FALSE;
+    if (Full->Length == Prefix->Length)
+        return TRUE;
+
+    prefixChars = Prefix->Length / sizeof(WCHAR);
+    return (BOOLEAN)(Full->Buffer[prefixChars] == L'\\');
+}
+
+static BOOLEAN
+AccessControl_HasMounts(VOID)
+{
+    PLIST_ENTRY entry;
+    PBOX_ENTRY box;
+    BOOLEAN result;
+
+    result = FALSE;
+    SbAcquireShared(&g_Sandbox.BoxLock);
+    for (entry = g_Sandbox.BoxList.Flink;
+        entry != &g_Sandbox.BoxList;
+        entry = entry->Flink) {
+        box = CONTAINING_RECORD(entry, BOX_ENTRY, ListEntry);
+        if (box->AccessControlEnabled && box->MountPointNt.Length != 0) {
+            result = TRUE;
+            break;
+        }
+    }
+    SbRelease(&g_Sandbox.BoxLock);
+    return result;
+}
+
+static BOOLEAN
+AccessControl_ShouldDeny(
+    _In_ PC_UNICODE_STRING FilePath,
+    _In_ ULONG CallerPid)
+{
+    PLIST_ENTRY entry;
+    PBOX_ENTRY box;
+    PBOX_ENTRY callerBox;
+    BOOLEAN deny;
+
+    if (CallerPid == 4)
+        return FALSE;
+
+    callerBox = Filter_GetProcContext(CallerPid);
+    deny = FALSE;
+
+    SbAcquireShared(&g_Sandbox.BoxLock);
+    for (entry = g_Sandbox.BoxList.Flink;
+        entry != &g_Sandbox.BoxList;
+        entry = entry->Flink) {
+        box = CONTAINING_RECORD(entry, BOX_ENTRY, ListEntry);
+        if (!box->AccessControlEnabled || box->MountPointNt.Length == 0)
+            continue;
+
+        if (Path_StartsWithBoundary(FilePath,
+            (PC_UNICODE_STRING)&box->MountPointNt)) {
+            if (callerBox != box)
+                deny = TRUE;
+            break;
+        }
+    }
+    SbRelease(&g_Sandbox.BoxLock);
+    return deny;
+}
+
+static BOOLEAN
+AccessControl_CheckCreatePath(
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_ ULONG CallerPid)
+{
+    PFLT_FILE_NAME_INFORMATION nameInfo;
+    NTSTATUS status;
+    BOOLEAN deny;
+
+    UNREFERENCED_PARAMETER(FltObjects);
+
+    if (!AccessControl_HasMounts())
+        return FALSE;
+
+    nameInfo = NULL;
+    deny = FALSE;
+    status = FltGetFileNameInformation(Data,
+        FLT_FILE_NAME_OPENED | FLT_FILE_NAME_QUERY_DEFAULT,
+        &nameInfo);
+    if (!NT_SUCCESS(status))
+        return FALSE;
+
+    if (AccessControl_ShouldDeny((PC_UNICODE_STRING)&nameInfo->Name,
+        CallerPid)) {
+        deny = TRUE;
+    }
+
+    FltReleaseFileNameInformation(nameInfo);
+    return deny;
+}
+
 // ============================================================
 //  Path_GetVolumeEnd
 //  Returns index of the 3rd backslash in an NT path, e.g.:
@@ -615,6 +720,93 @@ static BOOLEAN Path_EnsureParentDir(
     return TRUE;
 }
 
+static BOOLEAN
+Path_GetVaultRootRelative(
+    _In_ PBOX_ENTRY Box,
+    _Out_ PUNICODE_STRING VaultRootRelative)
+{
+    USHORT i;
+    USHORT charCount;
+    USHORT lastSlash;
+
+    RtlZeroMemory(VaultRootRelative, sizeof(*VaultRootRelative));
+    if (!Box->AccessControlEnabled || Box->MountPointNt.Length == 0 ||
+        Box->SandboxRootNt.Length == 0)
+        return FALSE;
+
+    charCount = Box->SandboxRootNt.Length / sizeof(WCHAR);
+    lastSlash = 0;
+    for (i = 1; i < charCount; ++i) {
+        if (Box->SandboxRootNt.Buffer[i] == L'\\')
+            lastSlash = i;
+    }
+
+    VaultRootRelative->Buffer = Box->SandboxRootNt.Buffer + lastSlash;
+    VaultRootRelative->Length =
+        Box->SandboxRootNt.Length - (USHORT)(lastSlash * sizeof(WCHAR));
+    VaultRootRelative->MaximumLength = VaultRootRelative->Length;
+    return TRUE;
+}
+
+static NTSTATUS
+Path_BuildVaultPhysicalPath(
+    _In_  PC_UNICODE_STRING SandboxFilePath,
+    _In_  PBOX_ENTRY Box,
+    _Out_ PUNICODE_STRING VaultPhysicalPath)
+{
+    UNICODE_STRING relPath;
+    UNICODE_STRING vaultRootRelative;
+    USHORT volumeEnd;
+    USHORT rootSkipChars;
+    USHORT suffixStart;
+    USHORT suffixChars;
+    USHORT totalChars;
+    USHORT off;
+    PWCHAR buf;
+
+    RtlZeroMemory(VaultPhysicalPath, sizeof(*VaultPhysicalPath));
+    if (!Path_GetVaultRootRelative(Box, &vaultRootRelative))
+        return STATUS_INVALID_PARAMETER;
+
+    volumeEnd = Path_GetVolumeEnd(SandboxFilePath);
+    if (volumeEnd == 0)
+        return STATUS_INVALID_PARAMETER;
+
+    relPath.Buffer = SandboxFilePath->Buffer + volumeEnd;
+    relPath.Length = SandboxFilePath->Length -
+        (USHORT)(volumeEnd * sizeof(WCHAR));
+    relPath.MaximumLength = relPath.Length;
+    if (!Path_StartsWith((PC_UNICODE_STRING)&relPath,
+        (PC_UNICODE_STRING)&Box->SandboxRootNt))
+        return STATUS_INVALID_PARAMETER;
+
+    rootSkipChars = (USHORT)(Box->SandboxRootNt.Length -
+        vaultRootRelative.Length) / sizeof(WCHAR);
+    suffixStart = volumeEnd + rootSkipChars;
+    suffixChars = (SandboxFilePath->Length / sizeof(WCHAR)) - suffixStart;
+    totalChars = (USHORT)((Box->MountPointNt.Length / sizeof(WCHAR)) +
+        suffixChars + 1);
+
+    buf = (PWCHAR)ExAllocatePoolWithTag(NonPagedPool,
+        totalChars * sizeof(WCHAR), SANDBOX_POOL_TAG);
+    if (!buf)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    off = 0;
+    RtlCopyMemory(buf + off, Box->MountPointNt.Buffer,
+        Box->MountPointNt.Length);
+    off += Box->MountPointNt.Length / sizeof(WCHAR);
+    RtlCopyMemory(buf + off, SandboxFilePath->Buffer + suffixStart,
+        suffixChars * sizeof(WCHAR));
+    off += suffixChars;
+    buf[off] = L'\0';
+
+    VaultPhysicalPath->Buffer = buf;
+    VaultPhysicalPath->Length = (USHORT)(off * sizeof(WCHAR));
+    VaultPhysicalPath->MaximumLength = (USHORT)(totalChars * sizeof(WCHAR));
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS
 Path_BuildRedirect(
     _In_  PC_UNICODE_STRING  OriginalPath,
@@ -761,10 +953,20 @@ SandboxFlt_PreCreate(
         FlagOn(Data->Iopb->IrpFlags, IRP_SYNCHRONOUS_PAGING_IO))
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
+    if (FLT_IS_REISSUED_IO(Data))
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
     /* ---- TIER 1 ---- */
     pid = HandleToULong(PsGetCurrentProcessId());
-    if (!PidBitmap_Test(pid))
+    if (!PidBitmap_Test(pid)) {
+        if (AccessControl_CheckCreatePath(Data, FltObjects, pid)) {
+            InterlockedIncrement(&g_Sandbox.TotalBlocked);
+            Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+            Data->IoStatus.Information = 0;
+            return FLT_PREOP_COMPLETE;
+        }
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
 
     /* ---- TIER 2: hash table lookup ---- */
     box = NULL;
@@ -780,6 +982,12 @@ SandboxFlt_PreCreate(
     }
     if (!box) {
         PidBitmap_OnRemove(pid);
+        if (AccessControl_CheckCreatePath(Data, FltObjects, pid)) {
+            InterlockedIncrement(&g_Sandbox.TotalBlocked);
+            Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+            Data->IoStatus.Information = 0;
+            return FLT_PREOP_COMPLETE;
+        }
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
@@ -819,6 +1027,22 @@ SandboxFlt_PreCreate(
     status = FltParseFileNameInformation(nameInfo);
     if (!NT_SUCCESS(status)) {
         FltReleaseFileNameInformation(nameInfo);
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    if (AccessControl_ShouldDeny((PC_UNICODE_STRING)&nameInfo->Name, pid)) {
+        FltReleaseFileNameInformation(nameInfo);
+        InterlockedIncrement(&g_Sandbox.TotalBlocked);
+        Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+        Data->IoStatus.Information = 0;
+        return FLT_PREOP_COMPLETE;
+    }
+
+    if (box->AccessControlEnabled && box->MountPointNt.Length != 0 &&
+        Path_StartsWithBoundary((PC_UNICODE_STRING)&nameInfo->Name,
+            (PC_UNICODE_STRING)&box->MountPointNt)) {
+        FltReleaseFileNameInformation(nameInfo);
+        InterlockedIncrement(&g_Sandbox.TotalPassThrough);
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
@@ -921,11 +1145,33 @@ SandboxFlt_PreCreate(
     if (isWrite) {
         parentKey = Path_ParentCacheKey((PC_UNICODE_STRING)&fullPath);
         if (!Cache_Contains(g_DirPathCache, DIR_PATH_CACHE_SIZE, parentKey)) {
-            if (Path_EnsureParentDir(FltObjects->Instance,
-                (PC_UNICODE_STRING)&fullPath,
-                (PC_UNICODE_STRING)&box->SandboxRootNt)) {
+            UNICODE_STRING ensurePath;
+            UNICODE_STRING ensureRoot;
+            PFLT_INSTANCE ensureInstance;
+            BOOLEAN ensurePathAllocated;
+            NTSTATUS ensureStatus;
+
+            ensurePath = fullPath;
+            ensureRoot = box->SandboxRootNt;
+            ensureInstance = FltObjects->Instance;
+            ensurePathAllocated = FALSE;
+
+            ensureStatus = Path_BuildVaultPhysicalPath(
+                (PC_UNICODE_STRING)&fullPath, box, &ensurePath);
+            if (NT_SUCCESS(ensureStatus)) {
+                (VOID)Path_GetVaultRootRelative(box, &ensureRoot);
+                ensureInstance = NULL;
+                ensurePathAllocated = TRUE;
+            }
+
+            if (Path_EnsureParentDir(ensureInstance,
+                (PC_UNICODE_STRING)&ensurePath,
+                (PC_UNICODE_STRING)&ensureRoot)) {
                 Cache_Add(g_DirPathCache, DIR_PATH_CACHE_SIZE, parentKey);
             }
+
+            if (ensurePathAllocated && ensurePath.Buffer)
+                ExFreePoolWithTag(ensurePath.Buffer, SANDBOX_POOL_TAG);
         }
     }
 
@@ -1008,7 +1254,7 @@ SandboxFlt_DirMergeContextCleanup(
     }
 }
 
-static PBOX_ENTRY
+PBOX_ENTRY
 Filter_GetCurrentBox(VOID)
 {
     ULONG pid;

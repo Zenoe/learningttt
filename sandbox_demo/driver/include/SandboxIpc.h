@@ -58,6 +58,27 @@
 #define IOCTL_SANDBOX_SET_WFP_POLICY CTL_CODE(FILE_DEVICE_UNKNOWN, \
     SANDBOX_IOCTL_BASE + 7, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+/* ============================================================
+ *  Crypto / vault IOCTLs
+ *
+ *  BASE+6 and BASE+7 are already used by QUERY_PROCESSES and WFP in this
+ *  codebase, so vault IOCTLs start at BASE+8 to preserve existing behavior.
+ * ============================================================ */
+
+#define IOCTL_SANDBOX_SET_CRYPTO_KEY CTL_CODE(FILE_DEVICE_UNKNOWN, \
+    SANDBOX_IOCTL_BASE + 8, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#define IOCTL_SANDBOX_CLEAR_CRYPTO_KEY CTL_CODE(FILE_DEVICE_UNKNOWN, \
+    SANDBOX_IOCTL_BASE + 9, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#define IOCTL_SANDBOX_SET_MOUNT_POINT CTL_CODE(FILE_DEVICE_UNKNOWN, \
+    SANDBOX_IOCTL_BASE + 10, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#define CRYPTO_BLOCK_SIZE  4096
+#define CRYPTO_TAG_SIZE    16
+#define CRYPTO_NONCE_SIZE  12
+#define CRYPTO_HEADER_SIZE 32   /* nonce(12) + tag(16) + blockIdx(4) */
+
 // ============================================================
 //  Structures
 // ============================================================
@@ -148,3 +169,16 @@ typedef struct _SANDBOX_WFP_POLICY_INFO {
     ULONG  VnicIp;                            // host byte order
     ULONG  _pad;
 } SANDBOX_WFP_POLICY_INFO, * PSANDBOX_WFP_POLICY_INFO;
+
+typedef struct _SANDBOX_CRYPTO_INFO {
+    WCHAR  BoxName[SANDBOX_MAX_BOX];
+    UCHAR  MasterKey[32];
+    UCHAR  HmacKey[32];
+    ULONG  BlockSize;                         // must be CRYPTO_BLOCK_SIZE
+    ULONG  Reserved;
+} SANDBOX_CRYPTO_INFO, * PSANDBOX_CRYPTO_INFO;
+
+typedef struct _SANDBOX_MOUNT_POINT_INFO {
+    WCHAR  BoxName[SANDBOX_MAX_BOX];
+    WCHAR  MountPointNt[SANDBOX_MAX_PATH];    // e.g. \Device\HarddiskVolume7
+} SANDBOX_MOUNT_POINT_INFO, * PSANDBOX_MOUNT_POINT_INFO;

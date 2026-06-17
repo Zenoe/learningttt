@@ -76,6 +76,10 @@ private:
     QComboBox*   m_exePath       = nullptr;
     QLineEdit*   m_boxName       = nullptr;
     QLineEdit*   m_fsRoot        = nullptr;
+    QLineEdit*   m_vaultDir      = nullptr;
+    QLineEdit*   m_vaultSizeMb   = nullptr;
+    QCheckBox*   m_chkPassphrase = nullptr;
+    QLineEdit*   m_passphrase    = nullptr;
     QLineEdit*   m_extraArgs     = nullptr;
     QCheckBox*   m_chkRestrictUI = nullptr;
     QCheckBox*   m_chkKillOnClose= nullptr;
