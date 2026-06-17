@@ -928,6 +928,63 @@ static BOOLEAN IsWriteIntent(_In_ PFLT_CALLBACK_DATA Data)
     return FALSE;
 }
 
+static BOOLEAN IsDirectoryCreate(_In_ PFLT_CALLBACK_DATA Data)
+{
+    ULONG options = Data->Iopb->Parameters.Create.Options & 0x00FFFFFF;
+    return (BOOLEAN)FlagOn(options, FILE_DIRECTORY_FILE);
+}
+
+static BOOLEAN
+Path_SandboxFileExists(
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_ PBOX_ENTRY Box,
+    _In_ PC_UNICODE_STRING SandboxPath)
+{
+    UNICODE_STRING openPath;
+    PFLT_INSTANCE instance;
+    BOOLEAN allocated;
+    OBJECT_ATTRIBUTES oa;
+    IO_STATUS_BLOCK iosb;
+    HANDLE h;
+    NTSTATUS status;
+
+    openPath = *SandboxPath;
+    instance = FltObjects->Instance;
+    allocated = FALSE;
+
+    if (NT_SUCCESS(Path_BuildVaultPhysicalPath(SandboxPath, Box, &openPath))) {
+        instance = NULL;
+        allocated = TRUE;
+    }
+
+    InitializeObjectAttributes(&oa, &openPath,
+        OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    status = FltCreateFile(
+        g_Sandbox.FilterHandle,
+        instance,
+        &h,
+        FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        &oa,
+        &iosb,
+        NULL,
+        FILE_ATTRIBUTE_NORMAL,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+        NULL,
+        0,
+        IO_IGNORE_SHARE_ACCESS_CHECK);
+
+    if (NT_SUCCESS(status))
+        FltClose(h);
+
+    if (allocated && openPath.Buffer)
+        ExFreePoolWithTag(openPath.Buffer, SANDBOX_POOL_TAG);
+
+    return (BOOLEAN)NT_SUCCESS(status);
+}
+
 // ============================================================
 //  SandboxFlt_PreCreate  —  THE HOT PATH
 // ============================================================
@@ -1114,9 +1171,24 @@ SandboxFlt_PreCreate(
     /* ---- Decide redirect ---- */
     writeKey = Path_WriteCacheKey((PC_UNICODE_STRING)&nameInfo->Name, box);
     doRedirect = isWrite;
-    if (!doRedirect && box->RedirectReads) {
+    if (!doRedirect && box->RedirectReads && !IsDirectoryCreate(Data)) {
         doRedirect = Cache_Contains(g_WritePathCache,
             WRITE_PATH_CACHE_SIZE, writeKey);
+        if (!doRedirect) {
+            UNICODE_STRING probePath;
+
+            RtlZeroMemory(&probePath, sizeof(probePath));
+            status = Path_BuildRedirect((PC_UNICODE_STRING)&nameInfo->Name,
+                box, &probePath);
+            if (NT_SUCCESS(status)) {
+                doRedirect = Path_SandboxFileExists(FltObjects, box,
+                    (PC_UNICODE_STRING)&probePath);
+                if (doRedirect)
+                    Cache_Add(g_WritePathCache, WRITE_PATH_CACHE_SIZE,
+                        writeKey);
+                ExFreePoolWithTag(probePath.Buffer, SANDBOX_POOL_TAG);
+            }
+        }
     }
 
     if (!doRedirect) {
@@ -1374,6 +1446,7 @@ DirMerge_OpenSandboxDirectory(
     IO_STATUS_BLOCK iosb;
     NTSTATUS status;
     BOOLEAN pathAllocated = FALSE;
+    PFLT_INSTANCE openInstance;
 
     *OutCtx = NULL;
 
@@ -1390,7 +1463,15 @@ DirMerge_OpenSandboxDirectory(
         status = Path_BuildRedirect((PC_UNICODE_STRING)&nameInfo->Name,
             Box, &sandboxPath);
         if (NT_SUCCESS(status)) {
+            UNICODE_STRING physicalPath;
+
             pathAllocated = TRUE;
+            RtlZeroMemory(&physicalPath, sizeof(physicalPath));
+            if (NT_SUCCESS(Path_BuildVaultPhysicalPath(
+                (PC_UNICODE_STRING)&sandboxPath, Box, &physicalPath))) {
+                ExFreePoolWithTag(sandboxPath.Buffer, SANDBOX_POOL_TAG);
+                sandboxPath = physicalPath;
+            }
         }
     }
     FltReleaseFileNameInformation(nameInfo);
@@ -1414,10 +1495,16 @@ DirMerge_OpenSandboxDirectory(
     // 3. Initialize attributes and open the sandbox directory
     InitializeObjectAttributes(&oa, &sandboxPath,
         OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+    openInstance = FltObjects->Instance;
+    if (Box->AccessControlEnabled && Box->MountPointNt.Length != 0 &&
+        Path_StartsWith((PC_UNICODE_STRING)&sandboxPath,
+            (PC_UNICODE_STRING)&Box->MountPointNt)) {
+        openInstance = NULL;
+    }
 
     // open sandbox directory by kernel privilege, retrieving the handle
     status = FltCreateFileEx(g_Sandbox.FilterHandle,
-        FltObjects->Instance,
+        openInstance,
         &ctx->SandboxHandle,
         &ctx->SandboxFileObject,
         FILE_LIST_DIRECTORY | SYNCHRONIZE,
@@ -1510,6 +1597,7 @@ SandboxFlt_PostDirectoryControl(
     BOOLEAN restartScan;
     BOOLEAN returnSingleEntry;
     NTSTATUS status;
+    IO_STATUS_BLOCK iosb;
 
 	// todo, completioncontext need clean or not? if the context is stored in stream handle context, it will be automatically released by the framework when the handle is closed,
     // so we don't need to manually free it here. However, if we allocated any additional resources in the context that are not automatically managed by the framework,
@@ -1574,16 +1662,20 @@ SandboxFlt_PostDirectoryControl(
     returnSingleEntry = (BOOLEAN)FlagOn(Data->Iopb->OperationFlags,
         SL_RETURN_SINGLE_ENTRY);
 
-    bytesReturned = 0;
-    status = FltQueryDirectoryFile(FltObjects->Instance,
-        ctx->SandboxFileObject,  // ← Uses the opened sandbox FileObject(in DirMerge_OpenSandboxDirectory)
+    RtlZeroMemory(&iosb, sizeof(iosb));
+    status = ZwQueryDirectoryFile(
+        ctx->SandboxHandle,
+        NULL,
+        NULL,
+        NULL,
+        &iosb,
         buffer,
         length,
         Data->Iopb->Parameters.DirectoryControl.QueryDirectory.FileInformationClass,
         returnSingleEntry,
         Data->Iopb->Parameters.DirectoryControl.QueryDirectory.FileName,
-        restartScan,
-        &bytesReturned);
+        restartScan);
+    bytesReturned = (ULONG)iosb.Information;
 
     ctx->SandboxStarted = TRUE;
     if (status == STATUS_NO_MORE_FILES || status == STATUS_NO_SUCH_FILE)
