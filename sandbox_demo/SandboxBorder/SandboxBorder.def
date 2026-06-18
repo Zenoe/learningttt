@@ -1,7 +1,0 @@
-; SandboxBorder.def
-; Detours helper export required by DetourCreateProcessWithDllEx.
-
-LIBRARY SandboxBorder
-
-EXPORTS
-    DetourFinishHelperProcess @1 NONAME

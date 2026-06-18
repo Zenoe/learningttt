@@ -23,18 +23,9 @@ find_library(DETOURS_LIBRARY
         "C:/vcpkg/installed/x64-windows/lib"
 )
 if (NOT DETOURS_INCLUDE_DIR OR NOT DETOURS_LIBRARY)
-    message(FATAL_ERROR "Microsoft Detours is required for SandboxBorder.dll")
+    message(FATAL_ERROR "Microsoft Detours not found")
 endif()
 
-# ---- SandboxBorder.dll (injected Show-in-folder broker, no Qt) ----
-add_library(SandboxBorder SHARED
-    SandboxBorder/SandboxBorder.cpp
-    SandboxBorder/SandboxBorder.h
-    SandboxBorder/SandboxBorder.def
-)
-target_compile_definitions(SandboxBorder PRIVATE SANDBOXBORDER_EXPORTS)
-target_include_directories(SandboxBorder PRIVATE ${DETOURS_INCLUDE_DIR})
-target_link_libraries(SandboxBorder PRIVATE shell32 ${DETOURS_LIBRARY})
 
 #set_target_properties(SandboxBorder PROPERTIES
 #    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
@@ -51,15 +42,12 @@ set(SOURCES
     src/ProcessMonitor.cpp
     src/DriverManager.cpp
     src/VaultManager.cpp
-    src/SandboxExplorer.cpp
-    src/SandboxEngine_Inject.cpp
     src/StringUtil.cpp
 )
 
 set(HEADERS
     include/MainWindow.h
     include/SandboxEngine.h
-    include/SandboxExplorer.h
     include/ProcessMonitor.h
     include/DriverManager.h
     include/VaultManager.h
@@ -89,7 +77,7 @@ target_link_libraries(SandboxDemo PRIVATE
 target_compile_options(SandboxDemo PRIVATE /W3 /wd4996)
 
 # Copy next to the main EXE automatically after build
-add_dependencies(SandboxDemo SandboxBorder)
+#add_dependencies(SandboxDemo SandboxBorder)
 
 # ---- Kernel driver is built separately with WDK ----
 # See driver/CMakeLists.txt and driver/SandboxFlt.inf

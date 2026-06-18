@@ -347,11 +347,6 @@ MainWindow::MainWindow(QWidget* parent)
         QMetaObject::invokeMethod(this, [this, text] { appendLog(text); },
             Qt::QueuedConnection);
     })
-    , m_explorer([this](const std::wstring& m) {
-        const QString text = QString::fromStdWString(m);
-        QMetaObject::invokeMethod(this, [this, text] { appendLog(text); },
-            Qt::QueuedConnection);
-    })
     , m_monitor(new ProcessMonitor(this))
     , m_statsTimer(new QTimer(this))
     , m_borderTimer(new QTimer(this))
@@ -393,10 +388,7 @@ MainWindow::MainWindow(QWidget* parent)
     // ── NEW: start broker pipe that sandboxed Chrome DLLs write to
     //         when the user clicks "Show in folder".
     //         m_fsRoot is populated by setupUi() above so we can read it now.
-    m_explorer.startPipeServer(m_driver, m_engine,
-                               m_fsRoot->text().toStdWString());
     appendLog("  [Explorer] Named-pipe broker started.");
-    appendLog("  [Explorer] Place SandboxBorder.dll next to this EXE for Show in folder support.");
 }
 
 MainWindow::~MainWindow()
@@ -404,7 +396,6 @@ MainWindow::~MainWindow()
     m_borderTimer->stop();
     m_statsTimer->stop();
     m_monitor->stopAll();
-    m_explorer.stopPipeServer();   // ← NEW: clean up pipe thread
     StopHostBorderHooks();
     for (auto& entry : g_hostBorders) {
         if (IsWindow(entry.overlay))
@@ -852,7 +843,6 @@ void MainWindow::onLaunchSandboxed()
     cfg.passphrase     = m_chkPassphrase->isChecked()
         ? m_passphrase->text().toStdWString()
         : std::wstring();
-    cfg.borderDllPath  = SandboxExplorer::defaultDllPath();
     cfg.restrictUI     = m_chkRestrictUI->isChecked() && !isChromium;
     cfg.killOnClose    = m_chkKillOnClose->isChecked();
     if (isChromium && m_chkRestrictUI->isChecked()) {
@@ -978,8 +968,6 @@ void MainWindow::onLaunchSandboxed()
             appendLog(QString("  [Broker] Shell hook injected by Detours for PID %1")
                 .arg(sp.pid));
         } else {
-            appendLog("  [!] SandboxBorder.dll not found — Show in folder broker unavailable.");
-            appendLog("      Build SandboxBorder.dll and place it next to this EXE.");
         }
     }
 
@@ -1129,9 +1117,6 @@ void MainWindow::unregisterDriverPids(SandboxedProcess& sp)
 // ── NEW: restart pipe server when the FS root field changes ─────────────────
 void MainWindow::onFsRootChanged()
 {
-    m_explorer.stopPipeServer();
-    m_explorer.startPipeServer(m_driver, m_engine,
-                               m_fsRoot->text().toStdWString());
     appendLog("  [Explorer] Pipe server restarted: " + m_fsRoot->text());
 }
 

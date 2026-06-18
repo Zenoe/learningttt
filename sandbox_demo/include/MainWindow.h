@@ -1,10 +1,6 @@
-﻿#pragma once
+#pragma once
 // ============================================================
 //  MainWindow.h  –  Qt6 GUI
-//  Changes vs original:
-//    • Added #include "SandboxExplorer.h"
-//    • Added m_explorer member
-//    • Added onFsRootChanged() slot
 // ============================================================
 #include <QMainWindow>
 #include <QTreeWidget>
@@ -21,7 +17,6 @@
 #include "SandboxEngine.h"
 #include "ProcessMonitor.h"
 #include "DriverManager.h"
-#include "SandboxExplorer.h"   // ← NEW
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -101,7 +96,6 @@ private:
     // ---- Engine / state ----
     SandboxEngine   m_engine;
     DriverManager   m_driver;
-    SandboxExplorer m_explorer;                                // ← NEW
     ProcessMonitor* m_monitor    = nullptr;
     QTimer*         m_statsTimer = nullptr;
     QTimer*         m_borderTimer = nullptr;
