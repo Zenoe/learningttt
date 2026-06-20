@@ -509,6 +509,9 @@ SandboxFlt_DispatchIoctl(
                     (mountLen + 1) * sizeof(WCHAR));
                 RtlInitUnicodeString(&box->MountPointNt,
                     box->MountPointBuf);
+                /* Do not trust a user supplied PID.  Bind vault access to the
+                 * process that actually issued SET_MOUNT_POINT. */
+                box->ControllerPid = IoGetRequestorProcessId(Irp);
                 box->AccessControlEnabled = TRUE;
                 status = STATUS_SUCCESS;
             }

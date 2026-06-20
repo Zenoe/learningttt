@@ -54,6 +54,7 @@ typedef struct _BOX_ENTRY {
     ULONG           CryptoBlockSize;
 
     BOOLEAN         AccessControlEnabled;
+    ULONG           ControllerPid;
     UNICODE_STRING  MountPointNt;
     WCHAR           MountPointBuf[SANDBOX_MAX_PATH];
 } BOX_ENTRY, * PBOX_ENTRY;

@@ -76,6 +76,7 @@ Box_Add(_In_ struct _SANDBOX_BOX_INFO* Info)
     box->CryptoEnabled = FALSE;
     box->CryptoBlockSize = CRYPTO_BLOCK_SIZE;
     box->AccessControlEnabled = FALSE;
+    box->ControllerPid = 0;
     box->CacheGeneration = (ULONG)InterlockedIncrement(&g_BoxGeneration);
     if (box->CacheGeneration == 0)
         box->CacheGeneration = (ULONG)InterlockedIncrement(&g_BoxGeneration);

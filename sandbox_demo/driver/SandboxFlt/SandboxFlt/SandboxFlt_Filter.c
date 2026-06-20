@@ -467,7 +467,10 @@ AccessControl_ShouldDeny(
 
         if (Path_StartsWithBoundary(FilePath,
             (PC_UNICODE_STRING)&box->MountPointNt)) {
-            if (callerBox != box)
+            /* The process which registered this vault is the trusted UI/broker.
+             * It must be able to enumerate the physical mount for the custom
+             * explorer, without being registered as a sandboxed process. */
+            if (callerBox != box && CallerPid != box->ControllerPid)
                 deny = TRUE;
             break;
         }
