@@ -18,6 +18,9 @@
 #include "ProcessMonitor.h"
 #include "DriverManager.h"
 
+class HookIpcServer;
+class SandboxFileExplorer;
+
 class MainWindow : public QMainWindow {
     Q_OBJECT
 public:
@@ -36,7 +39,10 @@ private slots:
     void onKillAll();
     void onPolicyChanged();
     void onStatsTimer();
-    void onFsRootChanged();                                    // ← NEW
+    void onFsRootChanged();
+    void onHookLogReceived(quint32 processId, quint32 threadId,
+                           const QString& message);
+    void onShowInFolderRequested(quint32 processId, const QString& path);
     void onProcessExited(DWORD pid, const QString& label, DWORD exitCode);
     void onStatusUpdate(const QString& summary);
 
@@ -99,6 +105,8 @@ private:
     ProcessMonitor* m_monitor    = nullptr;
     QTimer*         m_statsTimer = nullptr;
     QTimer*         m_borderTimer = nullptr;
+    HookIpcServer*  m_hookIpc = nullptr;
+    SandboxFileExplorer* m_fileExplorer = nullptr;
 
     std::vector<SandboxedProcess> m_normalProcs;
     std::vector<SandboxedProcess> m_sandboxProcs;

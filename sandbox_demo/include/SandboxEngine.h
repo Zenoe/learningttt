@@ -1,7 +1,7 @@
 #pragma once
 // ============================================================
 //  SandboxEngine.h
-//  (unchanged except: injectWhileSuspended() added)
+//  Sandboxed process creation and Detours payload injection.
 // ============================================================
 #pragma once
 #define WIN32_LEAN_AND_MEAN
@@ -71,17 +71,6 @@ public:
     SandboxedProcess launch(const SandboxConfig& cfg);
     void release(SandboxedProcess& sp);
     bool resume(SandboxedProcess& sp);
-
-    // Inject a DLL into a SUSPENDED process using thread-context hijack.
-    // Must be called BEFORE resume() while the process is still suspended.
-    // Works even when the Job has JOB_OBJECT_UILIMIT_HANDLES, because the
-    // process has not yet started and the UI restrictions are not enforced
-    // on memory operations against a suspended, not-yet-scheduled thread.
-    //
-    // hProcess / hThread: from SandboxedProcess (PROCESS_ALL_ACCESS from CreateProcess)
-    // dllPath:            full Win32 path to the DLL
-    bool injectWhileSuspended(const SandboxedProcess& sp,
-                               const std::wstring& dllPath);
 
     static bool isAlive(DWORD pid);
     static bool isAlive(const SandboxedProcess& sp);

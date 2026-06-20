@@ -35,9 +35,42 @@ endif()
 #   cmake -DCMAKE_PREFIX_PATH="C:/Qt/6.10.0/msvc2022_64" ..
 find_package(Qt6 REQUIRED COMPONENTS Core Widgets)
 
+add_library(HookDll SHARED
+    hookdll/dllmain.cpp
+    hookdll/Hooks.cpp
+    hookdll/Hooks.h
+    hookdll/HookLogger.cpp
+    hookdll/HookLogger.h
+    hookdll/PipeClient.cpp
+    hookdll/PipeClient.h
+    hookdll/HookDll.def
+    shared/HookIpcProtocol.h
+)
+
+target_include_directories(HookDll PRIVATE
+    hookdll
+    shared
+    ${DETOURS_INCLUDE_DIR}
+)
+
+target_link_libraries(HookDll PRIVATE
+    ${DETOURS_LIBRARY}
+    shell32
+    ole32
+    user32
+)
+
+target_compile_options(HookDll PRIVATE /W3 /wd4996)
+set_target_properties(HookDll PROPERTIES
+    OUTPUT_NAME "HookDll"
+    PREFIX ""
+)
+
 set(SOURCES
     src/main.cpp
     src/MainWindow.cpp
+    src/HookIpcServer.cpp
+    src/SandboxFileExplorer.cpp
     src/SandboxEngine.cpp
     src/ProcessMonitor.cpp
     src/DriverManager.cpp
@@ -47,6 +80,8 @@ set(SOURCES
 
 set(HEADERS
     include/MainWindow.h
+    include/HookIpcServer.h
+    include/SandboxFileExplorer.h
     include/SandboxEngine.h
     include/ProcessMonitor.h
     include/DriverManager.h
@@ -56,9 +91,11 @@ set(HEADERS
 )
 
 add_executable(SandboxDemo WIN32 ${SOURCES} ${HEADERS})
+add_dependencies(SandboxDemo HookDll)
 
 target_include_directories(SandboxDemo PRIVATE
     include
+    shared
     driver/include          # for SandboxIpc.h
     ${DETOURS_INCLUDE_DIR}
 )
@@ -75,6 +112,13 @@ target_link_libraries(SandboxDemo PRIVATE
 )
 
 target_compile_options(SandboxDemo PRIVATE /W3 /wd4996)
+
+add_custom_command(TARGET SandboxDemo POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:HookDll>
+            $<TARGET_FILE_DIR:SandboxDemo>
+    COMMENT "Copying HookDll.dll next to SandboxDemo.exe"
+)
 
 # Copy next to the main EXE automatically after build
 #add_dependencies(SandboxDemo SandboxBorder)

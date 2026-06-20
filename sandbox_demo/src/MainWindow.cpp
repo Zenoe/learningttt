@@ -1,16 +1,13 @@
 // ============================================================
 //  MainWindow.cpp  —  Full Qt6 GUI with driver panel
 //
-//  Changes vs original:
-//    1. m_explorer added to constructor initialiser list
-//    2. m_explorer.startPipeServer() called in constructor body
-//    3. m_explorer.stopPipeServer() called in destructor
-//    4. onLaunchSandboxed: injectWhileSuspended() called BEFORE resume
-//    5. onFsRootChanged: restarts pipe server when path changes
-//    6. connect(m_fsRoot editingFinished → onFsRootChanged) in setupUi
+//  Includes the host-side HookDll IPC broker and custom file explorer.
 // ============================================================
 #include "MainWindow.h"
+#include "HookIpcServer.h"
+#include "SandboxFileExplorer.h"
 #include <QApplication>
+#include <QCoreApplication>
 #include <QFileDialog>
 #include <QHBoxLayout>
 #include <QVBoxLayout>
@@ -22,6 +19,7 @@
 #include <QFrame>
 #include <QScrollBar>
 #include <QDir>
+#include <QFileInfo>
 #include <QHeaderView>
 #include <QTreeWidgetItemIterator>
 #include <QMetaObject>
@@ -332,11 +330,6 @@ static void PrefixHostWindowTitle(HWND hwnd, const std::wstring& boxName)
 // ============================================================
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
-    // 
-     //, m_engine([this](const std::wstring& m) { appendLog(QString::fromStdWString(m)); })
-     //, m_driver([this](const std::wstring& m) { appendLog(QString::fromStdWString(m)); })
-     //, m_explorer([this](const std::wstring& m) { appendLog(QString::fromStdWString(m)); })
-
     , m_engine([this](const std::wstring& m) {
         const QString text = QString::fromStdWString(m);
         QMetaObject::invokeMethod(this, [this, text] { appendLog(text); },
@@ -369,6 +362,17 @@ MainWindow::MainWindow(QWidget* parent)
 
     setupUi();
 
+    m_fileExplorer = new SandboxFileExplorer(this);
+    m_hookIpc = new HookIpcServer(this);
+    connect(m_hookIpc, &HookIpcServer::hookLogReceived,
+            this, &MainWindow::onHookLogReceived, Qt::QueuedConnection);
+    connect(m_hookIpc, &HookIpcServer::showInFolderRequested,
+            this, &MainWindow::onShowInFolderRequested, Qt::QueuedConnection);
+    connect(m_hookIpc, &HookIpcServer::serverError,
+            this, [this](const QString& error) {
+                appendLog(QStringLiteral("  [Hook IPC] ERROR: ") + error);
+            }, Qt::QueuedConnection);
+
     connect(m_monitor,    &ProcessMonitor::processExited, this, &MainWindow::onProcessExited);
     connect(m_monitor,    &ProcessMonitor::statusUpdate,  this, &MainWindow::onStatusUpdate);
     connect(m_statsTimer, &QTimer::timeout,               this, &MainWindow::onStatsTimer);
@@ -385,14 +389,15 @@ MainWindow::MainWindow(QWidget* parent)
     appendLog("Step 3: Watch the driver redirect file I/O in the Stats panel");
     updateDriverStatus();
 
-    // ── NEW: start broker pipe that sandboxed Chrome DLLs write to
-    //         when the user clicks "Show in folder".
-    //         m_fsRoot is populated by setupUi() above so we can read it now.
-    appendLog("  [Explorer] Named-pipe broker started.");
+    appendLog(m_hookIpc->isListening()
+        ? "  [Hook IPC] Named-pipe broker is listening."
+        : "  [Hook IPC] Failed to start named-pipe broker.");
 }
 
 MainWindow::~MainWindow()
 {
+    if (m_hookIpc)
+        m_hookIpc->stop();
     m_borderTimer->stop();
     m_statsTimer->stop();
     m_monitor->stopAll();
@@ -843,6 +848,21 @@ void MainWindow::onLaunchSandboxed()
     cfg.passphrase     = m_chkPassphrase->isChecked()
         ? m_passphrase->text().toStdWString()
         : std::wstring();
+    if (isChromium) {
+        if (!m_hookIpc || !m_hookIpc->isListening()) {
+            appendLog("! Hook IPC broker is not listening; sandboxed Chrome launch aborted.");
+            return;
+        }
+        const QString hookDll = QDir(QCoreApplication::applicationDirPath())
+                                    .filePath(QStringLiteral("HookDll.dll"));
+        if (!QFileInfo::exists(hookDll)) {
+            appendLog("! HookDll.dll not found next to SandboxDemo.exe: " + hookDll);
+            appendLog("  Sandboxed Chrome launch aborted because Explorer suppression would be unavailable.");
+            return;
+        }
+        cfg.borderDllPath = QDir::toNativeSeparators(hookDll).toStdWString();
+        appendLog("  [HookDll] Detours payload: " + QDir::toNativeSeparators(hookDll));
+    }
     cfg.restrictUI     = m_chkRestrictUI->isChecked() && !isChromium;
     cfg.killOnClose    = m_chkKillOnClose->isChecked();
     if (isChromium && m_chkRestrictUI->isChecked()) {
@@ -958,17 +978,9 @@ void MainWindow::onLaunchSandboxed()
             .arg(QString::fromStdWString(DriverManager::formatIpv4(vnicIp))));
     }
 
-    // ── Inject the Show-in-folder shell broker BEFORE resume.
-    // sp.suspended is still true here — resume() has not been called yet.
-    // Must happen at this exact point: after addProcess() (so the driver
-    // knows the PID) but before ResumeThread (so Job UI restrictions are
-    // not yet enforced and VirtualAllocEx / SetThreadContext work freely).
-    {
-        if (!cfg.borderDllPath.empty()) {
-            appendLog(QString("  [Broker] Shell hook injected by Detours for PID %1")
-                .arg(sp.pid));
-        } else {
-        }
+    if (!cfg.borderDllPath.empty()) {
+        appendLog(QString("  [HookDll] Detours injected payload into suspended PID %1")
+                      .arg(sp.pid));
     }
 
     if (!m_engine.resume(sp)) {
@@ -1114,10 +1126,27 @@ void MainWindow::unregisterDriverPids(SandboxedProcess& sp)
     }
 }
 
-// ── NEW: restart pipe server when the FS root field changes ─────────────────
 void MainWindow::onFsRootChanged()
 {
-    appendLog("  [Explorer] Pipe server restarted: " + m_fsRoot->text());
+    appendLog("  [Sandbox] Mount root changed: " + m_fsRoot->text());
+}
+
+void MainWindow::onHookLogReceived(quint32 processId, quint32 threadId,
+                                   const QString& message)
+{
+    appendLog(QStringLiteral("  [HookDll pid=%1 tid=%2] %3")
+                  .arg(processId)
+                  .arg(threadId)
+                  .arg(message));
+}
+
+void MainWindow::onShowInFolderRequested(quint32 processId, const QString& path)
+{
+    appendLog(QStringLiteral("  [HookDll pid=%1] Show in folder intercepted: %2")
+                  .arg(processId)
+                  .arg(QDir::toNativeSeparators(path)));
+    if (m_fileExplorer)
+        m_fileExplorer->showForPath(path);
 }
 
 bool MainWindow::isSandboxWindow(HWND hwnd, std::wstring* boxName) const

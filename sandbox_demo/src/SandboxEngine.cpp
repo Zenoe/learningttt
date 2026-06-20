@@ -706,6 +706,8 @@ bool SandboxEngine::spawnInJob(const SandboxConfig& cfg,
         // Inject sandbox variables
         envBlock += L"SANDBOX_ROOT=" + out.fsRoot + L'\0';
         envBlock += L"SANDBOX_BOX=" + cfg.boxName + L'\0';
+        envBlock += L"SANDBOX_DOWNLOADS=" + out.fsRoot +
+                    L"\\drive\\Downloads" + L'\0';
         if (!cfg.borderDllPath.empty())
             envBlock += L"SANDBOX_BORDER_ACTIVE=1\0";
         envBlock += L'\0';  // double-null terminator
