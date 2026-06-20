@@ -166,6 +166,10 @@ bool signalShowInFolder(const std::wstring& path)
         return true;
 
     const std::wstring target = path.empty() ? g_downloadsLower : path;
+    // Chrome is normally the foreground process at this point.  Permit the
+    // IPC receiver to activate the custom explorer in response to this user
+    // action; otherwise Windows may leave it behind the SandboxDemo window.
+    AllowSetForegroundWindow(ASFW_ANY);
     const bool sent = !target.empty() && pipeclient::sendShowInFolder(target);
     g_showMessageSent = sent;
     hooklog::write(L"[ipc] ShowInFolder sent=%d path=%s", sent ? 1 : 0,

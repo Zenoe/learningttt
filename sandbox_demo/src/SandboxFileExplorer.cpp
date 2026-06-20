@@ -15,6 +15,16 @@
 #include <QUrl>
 #include <QVBoxLayout>
 
+#ifdef Q_OS_WIN
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 SandboxFileExplorer::SandboxFileExplorer(QWidget* parent)
     : QWidget(parent, Qt::Window)
 {
@@ -80,6 +90,27 @@ void SandboxFileExplorer::showForPath(const QString& selectedPath)
     showNormal();
     raise();
     activateWindow();
+
+#ifdef Q_OS_WIN
+    const HWND window = reinterpret_cast<HWND>(winId());
+    SetWindowPos(window, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    BringWindowToTop(window);
+    SetForegroundWindow(window);
+    SetActiveWindow(window);
+
+    // Use TOPMOST only to cross the foreground/z-order boundary.  Demote the
+    // explorer immediately afterwards so it does not stay above unrelated apps.
+    QTimer::singleShot(100, this, [this, window] {
+        if (!IsWindow(window))
+            return;
+        SetWindowPos(window, HWND_NOTOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        BringWindowToTop(window);
+        raise();
+        activateWindow();
+    });
+#endif
 }
 
 void SandboxFileExplorer::navigateTo(const QString& directory,
