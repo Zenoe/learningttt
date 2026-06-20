@@ -7,6 +7,7 @@
 #include "HookIpcServer.h"
 #include "SandboxFileExplorer.h"
 #include <QApplication>
+#include <QByteArray>
 #include <QCoreApplication>
 #include <QFileDialog>
 #include <QHBoxLayout>
@@ -23,15 +24,31 @@
 #include <QHeaderView>
 #include <QTreeWidgetItemIterator>
 #include <QMetaObject>
+#include <QStandardPaths>
 #include <algorithm>
 #include <functional>
 #include <unordered_map>
+#if __has_include(<detours/detours.h>)
+#include <detours/detours.h>
+#elif __has_include(<detours.h>)
+#include <detours.h>
+#else
+#error Microsoft Detours headers are required to build SandboxDemo
+#endif
 
 // ---- Helpers -----------------------------------------------
 static QLabel* makeLabel(const QString& t) {
     auto* l = new QLabel(t);
     l->setStyleSheet("color:#8899aa;");
     return l;
+}
+
+static bool isChromiumExecutable(const QString& path)
+{
+    const QString lower = QFileInfo(path).fileName().toLower();
+    return lower.contains(QStringLiteral("chrome")) ||
+           lower.contains(QStringLiteral("msedge")) ||
+           lower.contains(QStringLiteral("brave"));
 }
 
 static QLineEdit* makeEdit(const QString& ph, const QFont& f) {
@@ -782,17 +799,86 @@ void MainWindow::onLaunchNormal()
     STARTUPINFOW si{}; si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
     std::wstring cmd = L"\"" + exe.toStdWString() + L"\"";
-    if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr,
-                       FALSE, CREATE_NEW_CONSOLE, nullptr, nullptr, &si, &pi)) {
+    const QString extraArguments = m_extraArgs->text().trimmed();
+    if (!extraArguments.isEmpty())
+        cmd += L" " + extraArguments.toStdWString();
+
+    const bool isChromium = isChromiumExecutable(exe);
+    BOOL launched = FALSE;
+    DWORD launchError = ERROR_SUCCESS;
+    if (isChromium) {
+        if (!m_hookIpc || !m_hookIpc->isListening()) {
+            appendLog("! Hook IPC broker is not listening; normal Chrome launch aborted.");
+            return;
+        }
+
+        const QString hookDll = QDir(QCoreApplication::applicationDirPath())
+                                    .filePath(QStringLiteral("HookDll.dll"));
+        const QByteArray hookDllA = QDir::toNativeSeparators(hookDll).toLocal8Bit();
+        if (!QFileInfo::exists(hookDll) || hookDllA.isEmpty() ||
+            GetFileAttributesA(hookDllA.constData()) == INVALID_FILE_ATTRIBUTES) {
+            appendLog("! HookDll.dll not found or its path is not ANSI-safe: " + hookDll);
+            return;
+        }
+
+        const QString profile = QDir(QDir::tempPath()).filePath(
+            QStringLiteral("SandboxDemo/NormalChrome/p%1"));
+        if (!QDir().mkpath(profile)) {
+            appendLog("! Failed to create isolated normal Chrome profile: " + profile);
+            return;
+        }
+        cmd += L" --user-data-dir=\"" +
+               QDir::toNativeSeparators(profile).toStdWString() + L"\"";
+        cmd += L" --no-first-run --no-default-browser-check";
+
+        QString downloads = QStandardPaths::writableLocation(
+            QStandardPaths::DownloadLocation);
+        if (downloads.isEmpty())
+            downloads = QDir::home().filePath(QStringLiteral("Downloads"));
+        const std::wstring downloadsW =
+            QDir::toNativeSeparators(downloads).toStdWString();
+
+        const bool hadPreviousDownloads =
+            qEnvironmentVariableIsSet("SANDBOX_DOWNLOADS");
+        const std::wstring previousDownloads =
+            qEnvironmentVariable("SANDBOX_DOWNLOADS").toStdWString();
+        SetEnvironmentVariableW(L"SANDBOX_DOWNLOADS", downloadsW.c_str());
+
+        const std::wstring executable = QDir::toNativeSeparators(exe).toStdWString();
+        launched = DetourCreateProcessWithDllExW(
+            executable.c_str(), cmd.data(), nullptr, nullptr, FALSE,
+            CREATE_NEW_CONSOLE, nullptr, nullptr, &si, &pi,
+            hookDllA.constData(), nullptr);
+        launchError = GetLastError();
+
+        if (hadPreviousDownloads)
+            SetEnvironmentVariableW(L"SANDBOX_DOWNLOADS", previousDownloads.c_str());
+        else
+            SetEnvironmentVariableW(L"SANDBOX_DOWNLOADS", nullptr);
+
+        appendLog("  [HookDll] Detours payload: " +
+                  QDir::toNativeSeparators(hookDll));
+        appendLog("  [Chrome] Isolated normal profile: " +
+                  QDir::toNativeSeparators(profile));
+    } else {
+        launched = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr,
+                                  FALSE, CREATE_NEW_CONSOLE,
+                                  nullptr, nullptr, &si, &pi);
+        launchError = GetLastError();
+    }
+
+    if (launched) {
         SandboxedProcess sp;
         sp.pid = pi.dwProcessId; sp.hProcess = pi.hProcess;
         sp.hThread = pi.hThread; sp.boxName = L"(normal)"; sp.valid = true;
         addProcessRow(sp, false);
         m_normalProcs.push_back(sp);
         m_monitor->track(sp, QString("Normal PID %1").arg(sp.pid));
-        appendLog(QString("  PID %1 running (no sandbox)").arg(sp.pid));
+        appendLog(QString("  PID %1 running (no sandbox%2)")
+                      .arg(sp.pid)
+                      .arg(isChromium ? ", HookDll injected" : ""));
     } else {
-        appendLog(QString("! CreateProcess failed: %1").arg(GetLastError()));
+        appendLog(QString("! CreateProcess failed: %1").arg(launchError));
     }
 }
 
@@ -800,10 +886,7 @@ void MainWindow::onLaunchSandboxed()
 {
     QString exe = m_exePath->currentText().trimmed();
     if (exe.isEmpty()) { appendLog("! No executable."); return; }
-    QString exeLower = exe.toLower();
-    const bool isChromium = exeLower.contains("chrome") ||
-        exeLower.contains("msedge") ||
-        exeLower.contains("brave");
+    const bool isChromium = isChromiumExecutable(exe);
 
     //const QString exeName = QFileInfo(exe).fileName().toLower();
     //const bool isConsoleShell = exeName == "cmd.exe" ||
