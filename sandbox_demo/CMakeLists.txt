@@ -64,11 +64,16 @@ target_compile_options(HookDll PRIVATE /W3 /wd4996)
 set_target_properties(HookDll PROPERTIES
     OUTPUT_NAME "HookDll"
     PREFIX ""
+    # HookDll is injected into Chrome, whose DLL search path is unrelated to
+    # SandboxDemo.exe. Keep the CRT inside HookDll so Debug builds do not rely
+    # on MSVCP140D/VCRUNTIME140D/ucrtbased being discoverable by Chrome.
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
 )
 
 set(SOURCES
     src/main.cpp
     src/MainWindow.cpp
+    src/DetourProcessLauncher.cpp
     src/HookIpcServer.cpp
     src/SandboxFileExplorer.cpp
     src/SandboxEngine.cpp
@@ -80,6 +85,7 @@ set(SOURCES
 
 set(HEADERS
     include/MainWindow.h
+    include/DetourProcessLauncher.h
     include/HookIpcServer.h
     include/SandboxFileExplorer.h
     include/SandboxEngine.h

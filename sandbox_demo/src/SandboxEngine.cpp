@@ -5,6 +5,7 @@
 //  explain exactly which Sandboxie technique each block maps to.
 // ============================================================
 #include "SandboxEngine.h"
+#include "DetourProcessLauncher.h"
 #include <bcrypt.h>
 #include <psapi.h>
 #include <sstream>
@@ -745,7 +746,8 @@ bool SandboxEngine::spawnInJob(const SandboxConfig& cfg,
                 cfg.borderDllPath);
             return false;
         }
-        ok = DetourCreateProcessWithDllExW(
+        bool usedInteractiveToken = false;
+        ok = DetourCreateProcessWithDllForInteractiveUser(
             cfg.executablePath.c_str(),
             cmdLine.data(),
             nullptr,              // process SA
@@ -757,7 +759,10 @@ bool SandboxEngine::spawnInJob(const SandboxConfig& cfg,
             &si,
             &pi,
             dllPathA.c_str(),
-            nullptr);
+            &usedInteractiveToken);
+        if (usedInteractiveToken) {
+            log(L"[+] Elevated host: Chrome created with interactive medium-integrity token");
+        }
         if (!ok) {
             log(L"[!] DetourCreateProcessWithDllExW failed: " +
                 std::to_wstring(GetLastError()) +

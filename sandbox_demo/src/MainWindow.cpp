@@ -4,6 +4,7 @@
 //  Includes the host-side HookDll IPC broker and custom file explorer.
 // ============================================================
 #include "MainWindow.h"
+#include "DetourProcessLauncher.h"
 #include "HookIpcServer.h"
 #include "SandboxFileExplorer.h"
 #include <QApplication>
@@ -28,13 +29,6 @@
 #include <algorithm>
 #include <functional>
 #include <unordered_map>
-#if __has_include(<detours/detours.h>)
-#include <detours/detours.h>
-#elif __has_include(<detours.h>)
-#include <detours.h>
-#else
-#error Microsoft Detours headers are required to build SandboxDemo
-#endif
 
 // ---- Helpers -----------------------------------------------
 static QLabel* makeLabel(const QString& t) {
@@ -845,10 +839,11 @@ void MainWindow::onLaunchNormal()
         SetEnvironmentVariableW(L"SANDBOX_DOWNLOADS", downloadsW.c_str());
 
         const std::wstring executable = QDir::toNativeSeparators(exe).toStdWString();
-        launched = DetourCreateProcessWithDllExW(
+        bool usedInteractiveToken = false;
+        launched = DetourCreateProcessWithDllForInteractiveUser(
             executable.c_str(), cmd.data(), nullptr, nullptr, FALSE,
             CREATE_NEW_CONSOLE, nullptr, nullptr, &si, &pi,
-            hookDllA.constData(), nullptr);
+            hookDllA.constData(), &usedInteractiveToken);
         launchError = GetLastError();
 
         if (hadPreviousDownloads)
@@ -858,6 +853,9 @@ void MainWindow::onLaunchNormal()
 
         appendLog("  [HookDll] Detours payload: " +
                   QDir::toNativeSeparators(hookDll));
+        if (usedInteractiveToken) {
+            appendLog("  [Chrome] Elevated host: launched with interactive medium-integrity token.");
+        }
         appendLog("  [Chrome] Isolated normal profile: " +
                   QDir::toNativeSeparators(profile));
     } else {

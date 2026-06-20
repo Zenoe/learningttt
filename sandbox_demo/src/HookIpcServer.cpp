@@ -6,6 +6,47 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <sddl.h>
+
+#include <string>
+#include <vector>
+
+namespace {
+
+bool createPipeSecurityDescriptor(PSECURITY_DESCRIPTOR& descriptor)
+{
+    descriptor = nullptr;
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        return false;
+
+    DWORD bytes = 0;
+    GetTokenInformation(token, TokenUser, nullptr, 0, &bytes);
+    std::vector<BYTE> storage(bytes);
+    const bool gotUser = bytes != 0 &&
+        GetTokenInformation(token, TokenUser, storage.data(), bytes, &bytes);
+    CloseHandle(token);
+    if (!gotUser)
+        return false;
+
+    const auto* tokenUser = reinterpret_cast<const TOKEN_USER*>(storage.data());
+    LPWSTR sidText = nullptr;
+    if (!ConvertSidToStringSidW(tokenUser->User.Sid, &sidText))
+        return false;
+
+    // Same user and SYSTEM get full access. The explicit medium mandatory
+    // label permits a medium-integrity Chrome browser to write to a pipe owned
+    // by an elevated SandboxDemo process.
+    const std::wstring sddl =
+        L"D:P(A;;GA;;;" + std::wstring(sidText) +
+        L")(A;;GA;;;SY)S:(ML;;NW;;;ME)";
+    LocalFree(sidText);
+
+    return ConvertStringSecurityDescriptorToSecurityDescriptorW(
+               sddl.c_str(), SDDL_REVISION_1, &descriptor, nullptr) != FALSE;
+}
+
+} // namespace
 
 HookIpcServer::HookIpcServer(QObject* parent)
     : QObject(parent)
@@ -18,6 +59,17 @@ HookIpcServer::HookIpcServer(QObject* parent)
         return;
     }
 
+    PSECURITY_DESCRIPTOR securityDescriptor = nullptr;
+    if (!createPipeSecurityDescriptor(securityDescriptor)) {
+        emit serverError(QStringLiteral(
+            "Hook IPC security descriptor creation failed (GLE=%1)")
+                             .arg(GetLastError()));
+        return;
+    }
+    SECURITY_ATTRIBUTES securityAttributes{};
+    securityAttributes.nLength = sizeof(securityAttributes);
+    securityAttributes.lpSecurityDescriptor = securityDescriptor;
+
     HANDLE pipe = CreateNamedPipeW(
         hookipc::kPipeName,
         PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
@@ -26,7 +78,8 @@ HookIpcServer::HookIpcServer(QObject* parent)
         sizeof(hookipc::Message),
         sizeof(hookipc::Message),
         0,
-        nullptr);
+        &securityAttributes);
+    LocalFree(securityDescriptor);
     if (pipe == INVALID_HANDLE_VALUE) {
         emit serverError(QStringLiteral("Hook IPC pipe creation failed (GLE=%1)")
                              .arg(GetLastError()));
