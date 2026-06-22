@@ -20,11 +20,6 @@
 using LogCallback = std::function<void(const std::wstring&)>;
 #endif
 
-struct DerivedKeys {
-    std::array<uint8_t, 32> masterKey{};
-    std::array<uint8_t, 32> hmacKey{};
-};
-
 struct SandboxedProcess {
     DWORD  pid          = 0;
     HANDLE hProcess     = nullptr;
@@ -36,13 +31,11 @@ struct SandboxedProcess {
     std::wstring vaultFilePath;
     std::wstring vaultMountPoint;
     std::wstring mountPointNt;
-    std::array<uint8_t, 32> masterKey{};
-    std::array<uint8_t, 32> hmacKey{};
+    std::wstring bitLockerRecoveryPassword;
     std::vector<DWORD> driverPids;
     bool   wfpEnabled   = false;
     ULONG  wfpVnicIp    = 0;
     bool   vaultMounted  = false;
-    bool   cryptoKeysValid = false;
     bool   valid        = false;
     bool   suspended    = false;
 };
@@ -75,10 +68,6 @@ public:
     static bool isAlive(DWORD pid);
     static bool isAlive(const SandboxedProcess& sp);
     static std::wstring describeJob(HANDLE hJob);
-    static DerivedKeys deriveKeys(const std::wstring& boxName,
-                                  const std::vector<uint8_t>& salt,
-                                  const std::wstring& passphrase);
-
 private:
     LogCallback m_log;
     VaultManager m_vault;

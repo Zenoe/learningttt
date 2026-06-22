@@ -114,10 +114,14 @@ target_link_libraries(SandboxDemo PRIVATE
     advapi32                # SCM / registry APIs used by DriverManager
     virtdisk
     bcrypt
+    crypt32
+    ole32
+    oleaut32
+    wbemuuid
     ${DETOURS_LIBRARY}
 )
 
-target_compile_options(SandboxDemo PRIVATE /W3 /wd4996)
+target_compile_options(SandboxDemo PRIVATE /W3 /wd4996 /EHsc)
 
 add_custom_command(TARGET SandboxDemo POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different

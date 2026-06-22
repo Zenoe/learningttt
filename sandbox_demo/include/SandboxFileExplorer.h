@@ -13,6 +13,7 @@ public:
     explicit SandboxFileExplorer(QWidget* parent = nullptr);
 
     void showForPath(const QString& selectedPath);
+    void releasePath(const QString& rootPath);
 
 private slots:
     void onActivated(const QModelIndex& index);

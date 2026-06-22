@@ -113,6 +113,26 @@ void SandboxFileExplorer::showForPath(const QString& selectedPath)
 #endif
 }
 
+void SandboxFileExplorer::releasePath(const QString& rootPath)
+{
+    QString root = QDir::cleanPath(QFileInfo(rootPath).absoluteFilePath());
+    QString current = QDir::cleanPath(m_currentDirectory);
+    QString prefix = root;
+    if (!prefix.endsWith(QDir::separator()))
+        prefix += QDir::separator();
+    if (current.compare(root, Qt::CaseInsensitive) != 0 &&
+        !current.startsWith(prefix, Qt::CaseInsensitive)) {
+        return;
+    }
+
+    hide();
+    m_view->setRootIndex(QModelIndex());
+    m_model->setRootPath(QString());
+    m_address->clear();
+    m_currentDirectory.clear();
+    m_selectedPath.clear();
+}
+
 void SandboxFileExplorer::navigateTo(const QString& directory,
                                      const QString& selectedPath)
 {

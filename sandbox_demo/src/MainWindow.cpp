@@ -11,6 +11,7 @@
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QFileDialog>
+#include <QEventLoop>
 #include <QHBoxLayout>
 #include <QVBoxLayout>
 #include <QGridLayout>
@@ -25,6 +26,7 @@
 #include <QHeaderView>
 #include <QTreeWidgetItemIterator>
 #include <QMetaObject>
+#include <QMessageBox>
 #include <QStandardPaths>
 #include <algorithm>
 #include <functional>
@@ -532,7 +534,7 @@ void MainWindow::setupUi()
     m_vaultSizeMb = makeEdit("512", mono);
     m_vaultSizeMb->setText("512");
     m_vaultSizeMb->setFixedWidth(100);
-    m_chkPassphrase = new QCheckBox("Use passphrase");
+    m_chkPassphrase = new QCheckBox("Use BitLocker passphrase");
     m_chkPassphrase->setStyleSheet("QCheckBox{color:#aab;}"
         "QCheckBox::indicator:checked{background:#0af;}");
     m_passphrase = makeEdit("(optional)", mono);
@@ -926,9 +928,6 @@ void MainWindow::onLaunchSandboxed()
     cfg.vaultDir       = vaultDir.toStdWString();
     cfg.mountDir       = mountDir.toStdWString();
     cfg.vaultSizeMB    = vaultSizeMb;
-    cfg.passphrase     = m_chkPassphrase->isChecked()
-        ? m_passphrase->text().toStdWString()
-        : std::wstring();
     if (isChromium) {
         if (!m_hookIpc || !m_hookIpc->isListening()) {
             appendLog("! Hook IPC broker is not listening; sandboxed Chrome launch aborted.");
@@ -951,10 +950,34 @@ void MainWindow::onLaunchSandboxed()
         appendLog("  [Chrome] Using --no-sandbox because the outer sandbox owns containment.");
     }
 
+    cfg.passphrase = m_chkPassphrase->isChecked()
+        ? m_passphrase->text().toStdWString()
+        : std::wstring();
     SandboxedProcess sp = m_engine.launch(cfg);
+    SecureZeroMemory(cfg.passphrase.data(),
+        cfg.passphrase.size() * sizeof(wchar_t));
+    cfg.passphrase.clear();
     if (!sp.valid) {
         appendLog("! Process launch failed.");
         return;
+    }
+
+    if (!sp.bitLockerRecoveryPassword.empty()) {
+        QMessageBox recoveryBox(QMessageBox::Warning,
+            "BitLocker recovery password",
+            "A new BitLocker vault was created. Save its recovery password "
+            "offline before continuing.",
+            QMessageBox::Ok,
+            this);
+        recoveryBox.setInformativeText(
+            "Open ‘Show Details’, copy the 48-digit password, and keep it "
+            "separate from the .vault file. It will not be logged or shown again.");
+        recoveryBox.setDetailedText(
+            QString::fromStdWString(sp.bitLockerRecoveryPassword));
+        recoveryBox.exec();
+        SecureZeroMemory(sp.bitLockerRecoveryPassword.data(),
+            sp.bitLockerRecoveryPassword.size() * sizeof(wchar_t));
+        sp.bitLockerRecoveryPassword.clear();
     }
 
     // ---- Register the mounted vault root and crypto context with the driver. ----
@@ -978,10 +1001,8 @@ void MainWindow::onLaunchSandboxed()
             if (!sp.mountPointNt.empty())
                 driverOk = m_driver.setMountPoint(uniqueBox.toStdWString(),
                                                   sp.mountPointNt);
-            if (driverOk && sp.cryptoKeysValid)
-                driverOk = m_driver.setCryptoKey(uniqueBox.toStdWString(),
-                                                 sp.masterKey,
-                                                 sp.hmacKey);
+            // Vault contents are protected by BitLocker.  The minifilter keeps
+            // access control/redirection only; do not layer custom file crypto.
         }
 
         if (!driverOk) {
@@ -1192,6 +1213,12 @@ void MainWindow::syncDriverPids(SandboxedProcess& sp)
 void MainWindow::unregisterDriverPids(SandboxedProcess& sp)
 {
     unregisterWfp(sp);
+    const bool lastInBox = !hasOtherSandboxInBox(sp.boxName, sp.pid);
+    if (lastInBox && m_fileExplorer && !sp.vaultMountPoint.empty()) {
+        m_fileExplorer->releasePath(
+            QString::fromStdWString(sp.vaultMountPoint));
+        QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    }
     if (!m_driver.isLoaded())
         return;
 
@@ -1201,7 +1228,7 @@ void MainWindow::unregisterDriverPids(SandboxedProcess& sp)
             m_driver.removeProcess(pid);
     }
 
-    if (!hasOtherSandboxInBox(sp.boxName, sp.pid)) {
+    if (lastInBox) {
         m_driver.clearCryptoKey(sp.boxName);
         m_driver.removeBox(sp.boxName);
     }

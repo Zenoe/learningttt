@@ -6,7 +6,6 @@
 // ============================================================
 #include "SandboxEngine.h"
 #include "DetourProcessLauncher.h"
-#include <bcrypt.h>
 #include <psapi.h>
 #include <sstream>
 #include <filesystem>
@@ -49,41 +48,6 @@ static std::wstring queryNtDeviceForMountPoint(const std::wstring& mountPoint)
         return {};
 
     return deviceName;
-}
-
-static std::vector<uint8_t> bytesFromWide(const std::wstring& text)
-{
-    const auto* p = reinterpret_cast<const uint8_t*>(text.data());
-    return std::vector<uint8_t>(p, p + text.size() * sizeof(wchar_t));
-}
-
-static std::wstring machineBoundSecret()
-{
-    wchar_t value[256]{};
-    DWORD cb = sizeof(value);
-    DWORD type = 0;
-    HKEY key = nullptr;
-
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
-        L"SOFTWARE\\Microsoft\\Cryptography",
-        0,
-        KEY_QUERY_VALUE | KEY_WOW64_64KEY,
-        &key) == ERROR_SUCCESS) {
-        if (RegQueryValueExW(key, L"MachineGuid", nullptr, &type,
-            reinterpret_cast<LPBYTE>(value), &cb) == ERROR_SUCCESS &&
-            type == REG_SZ && value[0] != L'\0') {
-            RegCloseKey(key);
-            return L"machine:" + std::wstring(value);
-        }
-        RegCloseKey(key);
-    }
-
-    wchar_t computerName[MAX_COMPUTERNAME_LENGTH + 1]{};
-    DWORD len = MAX_COMPUTERNAME_LENGTH + 1;
-    if (GetComputerNameW(computerName, &len) && len > 0)
-        return L"machine:" + std::wstring(computerName, len);
-
-    return L"machine:fallback";
 }
 
 static bool isChromiumFamilyPath(std::wstring path)
@@ -244,45 +208,26 @@ SandboxedProcess SandboxEngine::launch(const SandboxConfig& cfg)
             return result;
         }
 
-        std::vector<uint8_t> saltBytes(salt.begin(), salt.end());
-        DerivedKeys keys = deriveKeys(cfg.boxName, saltBytes, cfg.passphrase);
-        if (std::all_of(keys.masterKey.begin(), keys.masterKey.end(),
-                [](uint8_t v) { return v == 0; }) ||
-            std::all_of(keys.hmacKey.begin(), keys.hmacKey.end(),
-                [](uint8_t v) { return v == 0; })) {
-            log(L"[!] Failed to derive vault keys.");
-            SecureZeroMemory(salt.data(), salt.size());
-            SecureZeroMemory(saltBytes.data(), saltBytes.size());
-            if (result.hJob) CloseHandle(result.hJob);
-            if (result.hNamespaceDir) ClosePrivateNamespace(result.hNamespaceDir, 0);
-            return result;
-        }
-        result.masterKey = keys.masterKey;
-        result.hmacKey = keys.hmacKey;
-        result.cryptoKeysValid = true;
-
         VaultManager::VaultConfig vaultCfg;
         vaultCfg.vaultFilePath = vaultFilePath;
         vaultCfg.mountPoint = (fs::path(cfg.mountDir) / cfg.boxName).wstring();
+        vaultCfg.boxName = cfg.boxName;
+        vaultCfg.passphrase = cfg.passphrase;
         vaultCfg.sizeMB = cfg.vaultSizeMB;
         vaultCfg.salt = salt;
-        vaultCfg.masterKey = keys.masterKey;
-        vaultCfg.hmacKey = keys.hmacKey;
 
         result.vaultFilePath = vaultCfg.vaultFilePath;
         result.vaultMountPoint = vaultCfg.mountPoint;
         result.fsRoot = m_vault.createAndMount(vaultCfg, m_log);
-        SecureZeroMemory(&vaultCfg.masterKey, sizeof(vaultCfg.masterKey));
-        SecureZeroMemory(&vaultCfg.hmacKey, sizeof(vaultCfg.hmacKey));
+        result.bitLockerRecoveryPassword =
+            m_vault.takePendingRecoveryPassword(vaultCfg.vaultFilePath);
+        SecureZeroMemory(vaultCfg.passphrase.data(),
+            vaultCfg.passphrase.size() * sizeof(wchar_t));
         SecureZeroMemory(&vaultCfg.salt, sizeof(vaultCfg.salt));
         SecureZeroMemory(salt.data(), salt.size());
-        SecureZeroMemory(saltBytes.data(), saltBytes.size());
 
         if (result.fsRoot.empty()) {
             log(L"[!] Failed to create or mount vault.");
-            SecureZeroMemory(result.masterKey.data(), result.masterKey.size());
-            SecureZeroMemory(result.hmacKey.data(), result.hmacKey.size());
-            result.cryptoKeysValid = false;
             if (result.hJob) CloseHandle(result.hJob);
             if (result.hNamespaceDir) ClosePrivateNamespace(result.hNamespaceDir, 0);
             return result;
@@ -294,9 +239,6 @@ SandboxedProcess SandboxEngine::launch(const SandboxConfig& cfg)
             log(L"[!] Failed to resolve vault mount NT device path.");
             m_vault.unmount(result.vaultFilePath, m_log);
             result.vaultMounted = false;
-            SecureZeroMemory(result.masterKey.data(), result.masterKey.size());
-            SecureZeroMemory(result.hmacKey.data(), result.hmacKey.size());
-            result.cryptoKeysValid = false;
             if (result.hJob) CloseHandle(result.hJob);
             if (result.hNamespaceDir) ClosePrivateNamespace(result.hNamespaceDir, 0);
             return result;
@@ -328,11 +270,6 @@ SandboxedProcess SandboxEngine::launch(const SandboxConfig& cfg)
         if (result.vaultMounted) {
             m_vault.unmount(result.vaultFilePath, m_log);
             result.vaultMounted = false;
-        }
-        if (result.cryptoKeysValid) {
-            SecureZeroMemory(result.masterKey.data(), result.masterKey.size());
-            SecureZeroMemory(result.hmacKey.data(), result.hmacKey.size());
-            result.cryptoKeysValid = false;
         }
         return result;
     }
@@ -369,11 +306,6 @@ void SandboxEngine::release(SandboxedProcess& sp)
     if (sp.vaultMounted) {
         m_vault.unmount(sp.vaultFilePath, m_log);
         sp.vaultMounted = false;
-    }
-    if (sp.cryptoKeysValid) {
-        SecureZeroMemory(sp.masterKey.data(), sp.masterKey.size());
-        SecureZeroMemory(sp.hmacKey.data(), sp.hmacKey.size());
-        sp.cryptoKeysValid = false;
     }
     sp.valid = false;
     sp.suspended = false;
@@ -422,53 +354,6 @@ bool SandboxEngine::isAlive(const SandboxedProcess& sp)
     }
 
     return isAlive(sp.pid);
-}
-
-DerivedKeys SandboxEngine::deriveKeys(const std::wstring& boxName,
-    const std::vector<uint8_t>& salt,
-    const std::wstring& passphrase)
-{
-    DerivedKeys keys{};
-    UCHAR derived[64]{};
-    BCRYPT_ALG_HANDLE alg = nullptr;
-    NTSTATUS status;
-    std::wstring material = passphrase.empty()
-        ? machineBoundSecret()
-        : L"passphrase:" + passphrase;
-    material += L":" + boxName;
-    std::vector<uint8_t> password = bytesFromWide(material);
-
-    status = BCryptOpenAlgorithmProvider(
-        &alg,
-        BCRYPT_SHA256_ALGORITHM,
-        nullptr,
-        BCRYPT_ALG_HANDLE_HMAC_FLAG);
-    if (status < 0) {
-        SecureZeroMemory(password.data(), password.size());
-        return keys;
-    }
-
-    status = BCryptDeriveKeyPBKDF2(
-        alg,
-        password.data(),
-        (ULONG)password.size(),
-        const_cast<PUCHAR>(salt.data()),
-        (ULONG)salt.size(),
-        150000,
-        derived,
-        sizeof(derived),
-        0);
-    BCryptCloseAlgorithmProvider(alg, 0);
-    SecureZeroMemory(password.data(), password.size());
-    if (status < 0) {
-        SecureZeroMemory(derived, sizeof(derived));
-        return keys;
-    }
-
-    memcpy(keys.masterKey.data(), derived, keys.masterKey.size());
-    memcpy(keys.hmacKey.data(), derived + keys.masterKey.size(), keys.hmacKey.size());
-    SecureZeroMemory(derived, sizeof(derived));
-    return keys;
 }
 
 // ------------------------------------------------------------

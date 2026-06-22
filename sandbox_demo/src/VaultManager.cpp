@@ -1,12 +1,17 @@
 #include "VaultManager.h"
 
 #include <bcrypt.h>
+#include <wincrypt.h>
+#include <wbemidl.h>
 #include <virtdisk.h>
 #include <winioctl.h>
+#include <combaseapi.h>
 #include <filesystem>
 #include <fstream>
 #include <cstdlib>
+#include <iomanip>
 #include <sstream>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -22,6 +27,345 @@ static const GUID kVirtualStorageVendorMicrosoft = {
     0xec984aec, 0xa0f9, 0x47e9,
     { 0x90, 0x1f, 0x71, 0x41, 0x5a, 0x66, 0x34, 0x5b }
 };
+
+namespace {
+
+class ComScope {
+public:
+    ComScope()
+    {
+        m_result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        m_uninitialize = SUCCEEDED(m_result);
+        if (m_result == RPC_E_CHANGED_MODE)
+            m_result = S_OK;
+    }
+
+    ~ComScope()
+    {
+        if (m_uninitialize)
+            CoUninitialize();
+    }
+
+    HRESULT result() const { return m_result; }
+
+private:
+    HRESULT m_result = E_FAIL;
+    bool m_uninitialize = false;
+};
+
+static bool sameVolumeName(std::wstring left, std::wstring right)
+{
+    while (!left.empty() && (left.back() == L'\\' || left.back() == L'/'))
+        left.pop_back();
+    while (!right.empty() && (right.back() == L'\\' || right.back() == L'/'))
+        right.pop_back();
+    return _wcsicmp(left.c_str(), right.c_str()) == 0;
+}
+
+static ULONG variantToUlong(const VARIANT& value)
+{
+    if (value.vt == VT_UI4) return value.ulVal;
+    if (value.vt == VT_I4) return static_cast<ULONG>(value.lVal);
+    if (value.vt == VT_UI2) return value.uiVal;
+    if (value.vt == VT_I2) return static_cast<ULONG>(value.iVal);
+    return ULONG_MAX;
+}
+
+class BitLockerWmi {
+public:
+    ~BitLockerWmi()
+    {
+        if (m_services) m_services->Release();
+        if (m_locator) m_locator->Release();
+    }
+
+    bool connect(LogCallback log)
+    {
+        if (FAILED(m_com.result())) {
+            logError(log, L"CoInitializeEx", m_com.result());
+            return false;
+        }
+
+        HRESULT hr = CoInitializeSecurity(nullptr, -1, nullptr, nullptr,
+            RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE,
+            nullptr, EOAC_NONE, nullptr);
+        if (FAILED(hr) && hr != RPC_E_TOO_LATE) {
+            logError(log, L"CoInitializeSecurity", hr);
+            return false;
+        }
+
+        hr = CoCreateInstance(CLSID_WbemLocator, nullptr,
+            CLSCTX_INPROC_SERVER, IID_IWbemLocator,
+            reinterpret_cast<void**>(&m_locator));
+        if (FAILED(hr)) {
+            logError(log, L"CoCreateInstance(IWbemLocator)", hr);
+            return false;
+        }
+
+        BSTR ns = SysAllocString(
+            L"ROOT\\CIMV2\\Security\\MicrosoftVolumeEncryption");
+        if (!ns)
+            return false;
+        hr = m_locator->ConnectServer(ns, nullptr, nullptr, nullptr,
+            0, nullptr, nullptr, &m_services);
+        SysFreeString(ns);
+        if (FAILED(hr)) {
+            logError(log, L"ConnectServer(BitLocker)", hr);
+            return false;
+        }
+
+        hr = CoSetProxyBlanket(m_services, RPC_C_AUTHN_WINNT,
+            RPC_C_AUTHZ_NONE, nullptr, RPC_C_AUTHN_LEVEL_CALL,
+            RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE);
+        if (FAILED(hr)) {
+            logError(log, L"CoSetProxyBlanket", hr);
+            return false;
+        }
+        return true;
+    }
+
+    bool findVolume(const std::wstring& volumeName,
+                    std::wstring& objectPath,
+                    LogCallback log)
+    {
+        BSTR language = SysAllocString(L"WQL");
+        BSTR query = SysAllocString(L"SELECT * FROM Win32_EncryptableVolume");
+        if (!language || !query) {
+            if (language) SysFreeString(language);
+            if (query) SysFreeString(query);
+            return false;
+        }
+
+        IEnumWbemClassObject* enumerator = nullptr;
+        HRESULT hr = m_services->ExecQuery(language, query,
+            WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+            nullptr, &enumerator);
+        SysFreeString(language);
+        SysFreeString(query);
+        if (FAILED(hr)) {
+            logError(log, L"ExecQuery(Win32_EncryptableVolume)", hr);
+            return false;
+        }
+
+        bool found = false;
+        for (;;) {
+            IWbemClassObject* item = nullptr;
+            ULONG returned = 0;
+            hr = enumerator->Next(5000, 1, &item, &returned);
+            if (FAILED(hr) || returned == 0)
+                break;
+
+            VARIANT device{};
+            VariantInit(&device);
+            if (SUCCEEDED(item->Get(L"DeviceID", 0, &device, nullptr, nullptr)) &&
+                device.vt == VT_BSTR && device.bstrVal &&
+                sameVolumeName(device.bstrVal, volumeName)) {
+                VARIANT path{};
+                VariantInit(&path);
+                if (SUCCEEDED(item->Get(L"__PATH", 0, &path, nullptr, nullptr)) &&
+                    path.vt == VT_BSTR && path.bstrVal) {
+                    objectPath.assign(path.bstrVal, SysStringLen(path.bstrVal));
+                    found = true;
+                }
+                VariantClear(&path);
+            }
+            VariantClear(&device);
+            item->Release();
+            if (found)
+                break;
+        }
+        enumerator->Release();
+
+        if (!found && log)
+            log(L"[BitLocker] volume is not exposed by the WMI provider.");
+        return found;
+    }
+
+    bool invoke(const std::wstring& objectPath,
+                const wchar_t* method,
+                const std::vector<std::pair<std::wstring, VARIANT>>& inputs,
+                IWbemClassObject** output,
+                ULONG& returnValue,
+                LogCallback log)
+    {
+        IWbemClassObject* klass = nullptr;
+        IWbemClassObject* inDefinition = nullptr;
+        IWbemClassObject* inInstance = nullptr;
+        IWbemClassObject* outInstance = nullptr;
+        BSTR className = SysAllocString(L"Win32_EncryptableVolume");
+        BSTR methodName = SysAllocString(method);
+        BSTR path = SysAllocStringLen(objectPath.data(),
+            static_cast<UINT>(objectPath.size()));
+        if (!className || !methodName || !path)
+            goto Cleanup;
+
+        {
+            HRESULT hr = m_services->GetObject(className, 0, nullptr,
+                &klass, nullptr);
+            if (FAILED(hr)) {
+                logError(log, L"GetObject(Win32_EncryptableVolume)", hr);
+                goto Cleanup;
+            }
+            hr = klass->GetMethod(methodName, 0, &inDefinition, nullptr);
+            if (FAILED(hr)) {
+                logError(log, std::wstring(L"GetMethod(") + method + L")", hr);
+                goto Cleanup;
+            }
+            if (inDefinition) {
+                hr = inDefinition->SpawnInstance(0, &inInstance);
+                if (FAILED(hr)) {
+                    logError(log, L"SpawnInstance", hr);
+                    goto Cleanup;
+                }
+                for (const auto& input : inputs) {
+                    hr = inInstance->Put(input.first.c_str(), 0,
+                        const_cast<VARIANT*>(&input.second), 0);
+                    if (FAILED(hr)) {
+                        logError(log, std::wstring(L"Put(") + input.first + L")", hr);
+                        goto Cleanup;
+                    }
+                }
+            }
+
+            hr = m_services->ExecMethod(path, methodName, 0, nullptr,
+                inInstance, &outInstance, nullptr);
+            if (FAILED(hr)) {
+                logError(log, std::wstring(L"ExecMethod(") + method + L")", hr);
+                goto Cleanup;
+            }
+        }
+
+        {
+            VARIANT result{};
+            VariantInit(&result);
+            HRESULT hr = outInstance->Get(L"ReturnValue", 0, &result,
+                nullptr, nullptr);
+            if (FAILED(hr)) {
+                VariantClear(&result);
+                goto Cleanup;
+            }
+            returnValue = variantToUlong(result);
+            VariantClear(&result);
+        }
+
+        if (output) {
+            *output = outInstance;
+            outInstance = nullptr;
+        }
+        if (outInstance) outInstance->Release();
+        if (inInstance) inInstance->Release();
+        if (inDefinition) inDefinition->Release();
+        if (klass) klass->Release();
+        SysFreeString(path);
+        SysFreeString(methodName);
+        SysFreeString(className);
+        return true;
+
+    Cleanup:
+        if (outInstance) outInstance->Release();
+        if (inInstance) inInstance->Release();
+        if (inDefinition) inDefinition->Release();
+        if (klass) klass->Release();
+        if (path) SysFreeString(path);
+        if (methodName) SysFreeString(methodName);
+        if (className) SysFreeString(className);
+        return false;
+    }
+
+private:
+    static void logError(LogCallback log, const std::wstring& operation,
+                         HRESULT hr)
+    {
+        if (log) {
+            std::wostringstream line;
+            line << L"[BitLocker] " << operation << L" failed: 0x"
+                 << std::hex << std::uppercase << static_cast<ULONG>(hr);
+            log(line.str());
+        }
+    }
+
+    ComScope m_com;
+    IWbemLocator* m_locator = nullptr;
+    IWbemServices* m_services = nullptr;
+};
+
+static VARIANT makeStringVariant(const std::wstring& value)
+{
+    VARIANT result{};
+    VariantInit(&result);
+    result.vt = VT_BSTR;
+    result.bstrVal = SysAllocStringLen(value.data(),
+        static_cast<UINT>(value.size()));
+    return result;
+}
+
+static VARIANT makeUlongVariant(ULONG value)
+{
+    VARIANT result{};
+    VariantInit(&result);
+    // The BitLocker WMI provider declares these as CIM uint32, but older
+    // Win10 providers require the Automation representation VT_I4.
+    result.vt = VT_I4;
+    result.lVal = static_cast<LONG>(value);
+    return result;
+}
+
+static VARIANT makeBoolVariant(bool value)
+{
+    VARIANT result{};
+    VariantInit(&result);
+    result.vt = VT_BOOL;
+    result.boolVal = value ? VARIANT_TRUE : VARIANT_FALSE;
+    return result;
+}
+
+static void clearInputs(std::vector<std::pair<std::wstring, VARIANT>>& inputs)
+{
+    for (auto& input : inputs)
+        VariantClear(&input.second);
+    inputs.clear();
+}
+
+static bool getOutputUlong(IWbemClassObject* output, const wchar_t* name,
+                           ULONG& value)
+{
+    VARIANT item{};
+    VariantInit(&item);
+    HRESULT hr = output->Get(name, 0, &item, nullptr, nullptr);
+    if (SUCCEEDED(hr))
+        value = variantToUlong(item);
+    VariantClear(&item);
+    return SUCCEEDED(hr) && value != ULONG_MAX;
+}
+
+static bool getOutputString(IWbemClassObject* output, const wchar_t* name,
+                            std::wstring& value)
+{
+    VARIANT item{};
+    VariantInit(&item);
+    HRESULT hr = output->Get(name, 0, &item, nullptr, nullptr);
+    if (SUCCEEDED(hr) && item.vt == VT_BSTR && item.bstrVal)
+        value.assign(item.bstrVal, SysStringLen(item.bstrVal));
+    else
+        hr = E_FAIL;
+    VariantClear(&item);
+    return SUCCEEDED(hr);
+}
+
+} // namespace
+
+static const GUID kVaultBitLockerMetadataGuid = {
+    0xb74ec186, 0x0638, 0x4c39,
+    { 0x8d, 0x1a, 0x5c, 0x68, 0xc5, 0xeb, 0x45, 0x71 }
+};
+
+struct VaultBitLockerMetadata {
+    ULONG magic;
+    ULONG version;
+};
+
+static constexpr ULONG kVaultBitLockerMagic = 0x4b4c4253; // "SBLK"
+static constexpr ULONG kVaultBitLockerVersion = 1;
 
 static bool vaultFileExistsNonEmpty(const std::wstring& path)
 {
@@ -185,16 +529,120 @@ static bool findVolumeForDisk(unsigned long diskNumber,
     return found;
 }
 
+static bool sha256PathName(const std::wstring& text, std::wstring& hex)
+{
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    DWORD objectSize = 0;
+    DWORD resultSize = 0;
+    std::vector<UCHAR> object;
+    UCHAR digest[32]{};
+
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&algorithm,
+        BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+    if (status < 0)
+        return false;
+    status = BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
+        reinterpret_cast<PUCHAR>(&objectSize), sizeof(objectSize),
+        &resultSize, 0);
+    if (status >= 0) {
+        object.resize(objectSize);
+        status = BCryptCreateHash(algorithm, &hash, object.data(),
+            objectSize, nullptr, 0, 0);
+    }
+    if (status >= 0) {
+        status = BCryptHashData(hash,
+            reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(text.data())),
+            static_cast<ULONG>(text.size() * sizeof(wchar_t)), 0);
+    }
+    if (status >= 0)
+        status = BCryptFinishHash(hash, digest, sizeof(digest), 0);
+    if (hash) BCryptDestroyHash(hash);
+    BCryptCloseAlgorithmProvider(algorithm, 0);
+    SecureZeroMemory(object.data(), object.size());
+    if (status < 0) {
+        SecureZeroMemory(digest, sizeof(digest));
+        return false;
+    }
+
+    static const wchar_t chars[] = L"0123456789abcdef";
+    hex.clear();
+    hex.reserve(sizeof(digest) * 2);
+    for (UCHAR value : digest) {
+        hex.push_back(chars[value >> 4]);
+        hex.push_back(chars[value & 0x0f]);
+    }
+    SecureZeroMemory(digest, sizeof(digest));
+    return true;
+}
+
+static std::wstring bytesToHex(const UCHAR* bytes, size_t length)
+{
+    static const wchar_t chars[] = L"0123456789abcdef";
+    std::wstring result;
+    result.reserve(length * 2);
+    for (size_t i = 0; i < length; ++i) {
+        result.push_back(chars[bytes[i] >> 4]);
+        result.push_back(chars[bytes[i] & 0x0f]);
+    }
+    return result;
+}
+
+static bool generateBitLockerRecoveryPassword(std::wstring& password)
+{
+    USHORT values[8]{};
+    NTSTATUS status = BCryptGenRandom(nullptr,
+        reinterpret_cast<PUCHAR>(values), sizeof(values),
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (status < 0)
+        return false;
+
+    std::wostringstream text;
+    text << std::setfill(L'0');
+    for (size_t i = 0; i < ARRAYSIZE(values); ++i) {
+        if (i != 0)
+            text << L'-';
+        // Each BitLocker recovery-password block is a 16-bit value encoded
+        // as a six-digit decimal number divisible by 11.
+        text << std::setw(6) << (static_cast<ULONG>(values[i]) * 11u);
+    }
+    SecureZeroMemory(values, sizeof(values));
+    password = text.str();
+    return true;
+}
+
+static void logBitLockerCode(LogCallback log, const wchar_t* operation,
+                             ULONG code)
+{
+    if (!log)
+        return;
+    std::wostringstream line;
+    line << L"[BitLocker] " << operation << L" failed: 0x"
+         << std::hex << std::uppercase << code;
+    log(line.str());
+}
+
 VaultManager::~VaultManager()
 {
     for (auto& item : m_attachedVaults) {
         if (item.second.handle && item.second.handle != INVALID_HANDLE_VALUE) {
+            if (!item.second.mountPoint.empty()) {
+                std::wstring mount = withTrailingBackslash(
+                    item.second.mountPoint);
+                DeleteVolumeMountPointW(mount.c_str());
+            }
+            lockBitLocker(item.second.volumeName, nullptr);
             DetachVirtualDisk(item.second.handle, DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
             CloseHandle(item.second.handle);
         }
     }
     m_attachedVaults.clear();
     m_saltCache.clear();
+    for (auto& item : m_pendingRecoveryPasswords) {
+        SecureZeroMemory(item.second.data(),
+            item.second.size() * sizeof(wchar_t));
+    }
+    m_pendingRecoveryPasswords.clear();
 }
 
 std::wstring VaultManager::createAndMount(const VaultConfig& cfg, LogCallback log)
@@ -206,21 +654,83 @@ std::wstring VaultManager::createAndMount(const VaultConfig& cfg, LogCallback lo
     if (!createVhdx(cfg, log))
         return {};
 
+    auto removeIncompleteVault = [&]() {
+        if (detachVhdx(cfg.vaultFilePath, log)) {
+            if (!DeleteFileW(cfg.vaultFilePath.c_str())) {
+                DWORD err = GetLastError();
+                if (err != ERROR_FILE_NOT_FOUND) {
+                    logLine(log, L"[Vault] failed to remove incomplete vault: " +
+                        std::to_wstring(err));
+                }
+            }
+        }
+    };
+
     std::wstring physicalDrive;
-    if (!attachVhdx(cfg.vaultFilePath, physicalDrive, log))
+    if (!attachVhdx(cfg.vaultFilePath, physicalDrive, log)) {
+        removeIncompleteVault();
         return {};
+    }
 
     if (!formatAttachedDisk(physicalDrive, cfg.mountPoint, log)) {
-        detachVhdx(cfg.vaultFilePath, log);
+        removeIncompleteVault();
+        return {};
+    }
+
+    unsigned long diskNumber = 0;
+    std::wstring volumeName;
+    if (!parsePhysicalDriveNumber(physicalDrive, diskNumber)) {
+        removeIncompleteVault();
+        return {};
+    }
+    for (int i = 0; i < 50 && volumeName.empty(); ++i) {
+        findVolumeForDisk(diskNumber, volumeName, log);
+        if (volumeName.empty()) Sleep(100);
+    }
+    if (volumeName.empty()) {
+        removeIncompleteVault();
+        return {};
+    }
+
+    std::wstring bitLockerPassphrase;
+    std::wstring recoveryPassword;
+    if (!resolveBitLockerPassphrase(cfg, true, bitLockerPassphrase, log) ||
+        !enableBitLocker(volumeName, bitLockerPassphrase, true,
+            recoveryPassword, log)) {
+        SecureZeroMemory(bitLockerPassphrase.data(),
+            bitLockerPassphrase.size() * sizeof(wchar_t));
+        removeIncompleteVault();
+        return {};
+    }
+    SecureZeroMemory(bitLockerPassphrase.data(),
+        bitLockerPassphrase.size() * sizeof(wchar_t));
+
+    const std::wstring key = normalizePath(cfg.vaultFilePath);
+    auto attached = m_attachedVaults.find(key);
+    if (attached == m_attachedVaults.end() ||
+        !writeBitLockerMetadata(attached->second.handle, log)) {
+        SecureZeroMemory(recoveryPassword.data(),
+            recoveryPassword.size() * sizeof(wchar_t));
+        removeIncompleteVault();
+        return {};
+    }
+
+    if (!assignMountPoint(physicalDrive, cfg.mountPoint, log)) {
+        SecureZeroMemory(recoveryPassword.data(),
+            recoveryPassword.size() * sizeof(wchar_t));
+        removeIncompleteVault();
         return {};
     }
 
     {
-        const std::wstring key = normalizePath(cfg.vaultFilePath);
         auto existing = m_attachedVaults.find(key);
-        if (existing != m_attachedVaults.end())
+        if (existing != m_attachedVaults.end()) {
             existing->second.mountPoint = cfg.mountPoint;
+            existing->second.volumeName = volumeName;
+        }
     }
+
+    m_pendingRecoveryPasswords[key] = std::move(recoveryPassword);
 
     logLine(log, L"[Vault] created and mounted at " + cfg.mountPoint);
     return cfg.mountPoint;
@@ -231,6 +741,26 @@ std::wstring VaultManager::mount(const VaultConfig& cfg, LogCallback log)
     const std::wstring key = normalizePath(cfg.vaultFilePath);
     auto existing = m_attachedVaults.find(key);
     if (existing != m_attachedVaults.end()) {
+        wchar_t mountedVolume[MAX_PATH]{};
+        std::wstring currentMount = withTrailingBackslash(
+            existing->second.mountPoint.empty()
+                ? cfg.mountPoint
+                : existing->second.mountPoint);
+        if (!GetVolumeNameForVolumeMountPointW(currentMount.c_str(),
+            mountedVolume, ARRAYSIZE(mountedVolume))) {
+            std::wstring bitLockerPassphrase;
+            bool restored = resolveBitLockerPassphrase(cfg, false,
+                bitLockerPassphrase, log) &&
+                unlockBitLocker(existing->second.volumeName,
+                    bitLockerPassphrase, log) &&
+                assignMountPoint(existing->second.physicalDrive,
+                    cfg.mountPoint, log);
+            SecureZeroMemory(bitLockerPassphrase.data(),
+                bitLockerPassphrase.size() * sizeof(wchar_t));
+            if (!restored)
+                return {};
+            existing->second.mountPoint = cfg.mountPoint;
+        }
         existing->second.refCount++;
         if (existing->second.mountPoint.empty())
             existing->second.mountPoint = cfg.mountPoint;
@@ -241,18 +771,40 @@ std::wstring VaultManager::mount(const VaultConfig& cfg, LogCallback log)
             : existing->second.mountPoint;
     }
 
+    if (!readBitLockerMetadata(cfg.vaultFilePath, log))
+        return {};
+
     std::wstring physicalDrive;
     if (!attachVhdx(cfg.vaultFilePath, physicalDrive, log))
         return {};
 
-    if (!assignMountPoint(physicalDrive, cfg.mountPoint, log)) {
+    unsigned long diskNumber = 0;
+    std::wstring volumeName;
+    if (!parsePhysicalDriveNumber(physicalDrive, diskNumber)) {
+        detachVhdx(cfg.vaultFilePath, log);
+        return {};
+    }
+    for (int i = 0; i < 50 && volumeName.empty(); ++i) {
+        findVolumeForDisk(diskNumber, volumeName, log);
+        if (volumeName.empty()) Sleep(100);
+    }
+
+    std::wstring bitLockerPassphrase;
+    bool unlocked = !volumeName.empty() &&
+        resolveBitLockerPassphrase(cfg, false, bitLockerPassphrase, log) &&
+        unlockBitLocker(volumeName, bitLockerPassphrase, log);
+    SecureZeroMemory(bitLockerPassphrase.data(),
+        bitLockerPassphrase.size() * sizeof(wchar_t));
+    if (!unlocked || !assignMountPoint(physicalDrive, cfg.mountPoint, log)) {
         detachVhdx(cfg.vaultFilePath, log);
         return {};
     }
 
     existing = m_attachedVaults.find(key);
-    if (existing != m_attachedVaults.end())
+    if (existing != m_attachedVaults.end()) {
         existing->second.mountPoint = cfg.mountPoint;
+        existing->second.volumeName = volumeName;
+    }
 
     logLine(log, L"[Vault] mounted at " + cfg.mountPoint);
     return cfg.mountPoint;
@@ -342,6 +894,380 @@ bool VaultManager::loadOrCreateSalt(const std::wstring& vaultFilePath,
     }
 
     m_saltCache[key] = salt;
+    return true;
+}
+
+std::wstring VaultManager::takePendingRecoveryPassword(
+    const std::wstring& vaultFilePath)
+{
+    const std::wstring key = normalizePath(vaultFilePath);
+    auto it = m_pendingRecoveryPasswords.find(key);
+    if (it == m_pendingRecoveryPasswords.end())
+        return {};
+    std::wstring result = std::move(it->second);
+    m_pendingRecoveryPasswords.erase(it);
+    return result;
+}
+
+bool VaultManager::resolveBitLockerPassphrase(const VaultConfig& cfg,
+                                              bool createAutomaticSecret,
+                                              std::wstring& passphrase,
+                                              LogCallback log) const
+{
+    UCHAR secret[32]{};
+
+    if (!cfg.passphrase.empty()) {
+        std::wstring material = L"SandboxDemo BitLocker:" +
+            cfg.boxName + L":" + cfg.passphrase;
+        BCRYPT_ALG_HANDLE algorithm = nullptr;
+        NTSTATUS status = BCryptOpenAlgorithmProvider(&algorithm,
+            BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
+        if (status >= 0) {
+            status = BCryptDeriveKeyPBKDF2(algorithm,
+                reinterpret_cast<PUCHAR>(material.data()),
+                static_cast<ULONG>(material.size() * sizeof(wchar_t)),
+                const_cast<PUCHAR>(cfg.salt.data()),
+                static_cast<ULONG>(cfg.salt.size()),
+                150000, secret, sizeof(secret), 0);
+            BCryptCloseAlgorithmProvider(algorithm, 0);
+        }
+        SecureZeroMemory(material.data(), material.size() * sizeof(wchar_t));
+        if (status < 0) {
+            logLine(log, L"[BitLocker] PBKDF2 key derivation failed.");
+            return false;
+        }
+        passphrase = bytesToHex(secret, sizeof(secret));
+        SecureZeroMemory(secret, sizeof(secret));
+        return true;
+    }
+
+    wchar_t localAppData[MAX_PATH]{};
+    DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData,
+        ARRAYSIZE(localAppData));
+    if (length == 0 || length >= ARRAYSIZE(localAppData)) {
+        logLine(log, L"[BitLocker] LOCALAPPDATA is unavailable for key storage.");
+        return false;
+    }
+
+    std::wstring keyName;
+    if (!sha256PathName(normalizePath(cfg.vaultFilePath), keyName)) {
+        logLine(log, L"[BitLocker] failed to derive automatic key filename.");
+        return false;
+    }
+    fs::path keyDirectory = fs::path(localAppData) /
+        L"SandboxDemo" / L"BitLockerKeys";
+    fs::path keyPath = keyDirectory / (keyName + L".dpapi");
+    std::vector<BYTE> protectedBytes;
+
+    std::ifstream input(keyPath, std::ios::binary | std::ios::ate);
+    if (input) {
+        std::streamsize size = input.tellg();
+        if (size <= 0 || size > 4096) {
+            logLine(log, L"[BitLocker] automatic key file is invalid.");
+            return false;
+        }
+        protectedBytes.resize(static_cast<size_t>(size));
+        input.seekg(0, std::ios::beg);
+        if (!input.read(reinterpret_cast<char*>(protectedBytes.data()), size)) {
+            SecureZeroMemory(protectedBytes.data(), protectedBytes.size());
+            return false;
+        }
+
+        static const BYTE entropyBytes[] =
+            "SandboxDemo BitLocker automatic key v1";
+        DATA_BLOB encrypted{};
+        encrypted.pbData = protectedBytes.data();
+        encrypted.cbData = static_cast<DWORD>(protectedBytes.size());
+        DATA_BLOB entropy{};
+        entropy.pbData = const_cast<BYTE*>(entropyBytes);
+        entropy.cbData = sizeof(entropyBytes);
+        DATA_BLOB clear{};
+        BOOL ok = CryptUnprotectData(&encrypted, nullptr, &entropy,
+            nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &clear);
+        SecureZeroMemory(protectedBytes.data(), protectedBytes.size());
+        if (!ok || clear.cbData != sizeof(secret)) {
+            if (clear.pbData) {
+                SecureZeroMemory(clear.pbData, clear.cbData);
+                LocalFree(clear.pbData);
+            }
+            logLine(log, L"[BitLocker] DPAPI could not unlock the automatic key.");
+            return false;
+        }
+        memcpy(secret, clear.pbData, sizeof(secret));
+        SecureZeroMemory(clear.pbData, clear.cbData);
+        LocalFree(clear.pbData);
+    }
+    else {
+        if (!createAutomaticSecret) {
+            logLine(log, L"[BitLocker] automatic key is missing; use the recovery password.");
+            return false;
+        }
+
+        NTSTATUS status = BCryptGenRandom(nullptr, secret, sizeof(secret),
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        if (status < 0)
+            return false;
+
+        static const BYTE entropyBytes[] =
+            "SandboxDemo BitLocker automatic key v1";
+        DATA_BLOB clear{};
+        clear.pbData = secret;
+        clear.cbData = sizeof(secret);
+        DATA_BLOB entropy{};
+        entropy.pbData = const_cast<BYTE*>(entropyBytes);
+        entropy.cbData = sizeof(entropyBytes);
+        DATA_BLOB encrypted{};
+        if (!CryptProtectData(&clear, L"SandboxDemo BitLocker key",
+            &entropy, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN,
+            &encrypted)) {
+            SecureZeroMemory(secret, sizeof(secret));
+            return false;
+        }
+
+        std::error_code ec;
+        fs::create_directories(keyDirectory, ec);
+        fs::path temporary = keyPath;
+        temporary += L".tmp";
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        bool written = output && output.write(
+            reinterpret_cast<const char*>(encrypted.pbData),
+            encrypted.cbData).good();
+        output.close();
+        SecureZeroMemory(encrypted.pbData, encrypted.cbData);
+        LocalFree(encrypted.pbData);
+        if (!written || !MoveFileExW(temporary.c_str(), keyPath.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            DeleteFileW(temporary.c_str());
+            SecureZeroMemory(secret, sizeof(secret));
+            logLine(log, L"[BitLocker] failed to persist the DPAPI key.");
+            return false;
+        }
+        logLine(log, L"[BitLocker] created a DPAPI-protected automatic key.");
+    }
+
+    passphrase = bytesToHex(secret, sizeof(secret));
+    SecureZeroMemory(secret, sizeof(secret));
+    return true;
+}
+
+bool VaultManager::enableBitLocker(const std::wstring& volumeName,
+                                   const std::wstring& passphrase,
+                                   bool usedSpaceOnly,
+                                   std::wstring& recoveryPassword,
+                                   LogCallback log) const
+{
+    BitLockerWmi wmi;
+    std::wstring objectPath;
+    if (!wmi.connect(log) || !wmi.findVolume(volumeName, objectPath, log))
+        return false;
+
+    ULONG code = ULONG_MAX;
+    ULONG conversionStatus = ULONG_MAX;
+    IWbemClassObject* output = nullptr;
+    if (!wmi.invoke(objectPath, L"GetConversionStatus", {}, &output,
+        code, log) || code != ERROR_SUCCESS ||
+        !getOutputUlong(output, L"ConversionStatus", conversionStatus)) {
+        if (output) output->Release();
+        if (code != ERROR_SUCCESS) logBitLockerCode(log, L"GetConversionStatus", code);
+        return false;
+    }
+    output->Release();
+
+    if (conversionStatus != 0) {
+        logLine(log, L"[BitLocker] volume protection already exists.");
+        return unlockBitLocker(volumeName, passphrase, log);
+    }
+
+    std::vector<std::pair<std::wstring, VARIANT>> inputs;
+    inputs.emplace_back(L"FriendlyName",
+        makeStringVariant(L"SandboxDemo automatic protector"));
+    inputs.emplace_back(L"PassPhrase", makeStringVariant(passphrase));
+    output = nullptr;
+    bool invoked = wmi.invoke(objectPath, L"ProtectKeyWithPassPhrase",
+        inputs, &output, code, log);
+    clearInputs(inputs);
+    if (!invoked || code != ERROR_SUCCESS) {
+        if (output) output->Release();
+        logBitLockerCode(log, L"ProtectKeyWithPassPhrase", code);
+        return false;
+    }
+    output->Release();
+
+    if (!generateBitLockerRecoveryPassword(recoveryPassword)) {
+        logLine(log, L"[BitLocker] failed to generate a recovery password.");
+        return false;
+    }
+
+    inputs.emplace_back(L"FriendlyName",
+        makeStringVariant(L"SandboxDemo recovery password"));
+    inputs.emplace_back(L"NumericalPassword",
+        makeStringVariant(recoveryPassword));
+    output = nullptr;
+    invoked = wmi.invoke(objectPath, L"ProtectKeyWithNumericalPassword",
+        inputs, &output, code, log);
+    clearInputs(inputs);
+    std::wstring recoveryProtector;
+    if (!invoked || code != ERROR_SUCCESS ||
+        !getOutputString(output, L"VolumeKeyProtectorID", recoveryProtector)) {
+        if (output) output->Release();
+        logBitLockerCode(log, L"ProtectKeyWithNumericalPassword", code);
+        SecureZeroMemory(recoveryPassword.data(),
+            recoveryPassword.size() * sizeof(wchar_t));
+        recoveryPassword.clear();
+        return false;
+    }
+    output->Release();
+
+    inputs.emplace_back(L"VolumeKeyProtectorID",
+        makeStringVariant(recoveryProtector));
+    output = nullptr;
+    invoked = wmi.invoke(objectPath, L"GetKeyProtectorNumericalPassword",
+        inputs, &output, code, log);
+    clearInputs(inputs);
+    std::wstring confirmedRecoveryPassword;
+    if (!invoked || code != ERROR_SUCCESS ||
+        !getOutputString(output, L"NumericalPassword",
+            confirmedRecoveryPassword)) {
+        if (output) output->Release();
+        logBitLockerCode(log, L"GetKeyProtectorNumericalPassword", code);
+        SecureZeroMemory(recoveryPassword.data(),
+            recoveryPassword.size() * sizeof(wchar_t));
+        recoveryPassword.clear();
+        return false;
+    }
+    output->Release();
+    SecureZeroMemory(recoveryPassword.data(),
+        recoveryPassword.size() * sizeof(wchar_t));
+    recoveryPassword = std::move(confirmedRecoveryPassword);
+
+    inputs.emplace_back(L"EncryptionMethod", makeUlongVariant(7));
+    inputs.emplace_back(L"EncryptionFlags",
+        makeUlongVariant(usedSpaceOnly ? 1u : 0u));
+    invoked = wmi.invoke(objectPath, L"Encrypt", inputs, nullptr, code, log);
+    clearInputs(inputs);
+    if (!invoked || code != ERROR_SUCCESS) {
+        if (invoked)
+            logBitLockerCode(log, L"Encrypt(XTS-AES-256)", code);
+        SecureZeroMemory(recoveryPassword.data(),
+            recoveryPassword.size() * sizeof(wchar_t));
+        recoveryPassword.clear();
+        return false;
+    }
+
+    if (!unlockBitLocker(volumeName, passphrase, log)) {
+        SecureZeroMemory(recoveryPassword.data(),
+            recoveryPassword.size() * sizeof(wchar_t));
+        recoveryPassword.clear();
+        return false;
+    }
+
+    logLine(log, L"[BitLocker] XTS-AES-256 protection enabled.");
+    return true;
+}
+
+bool VaultManager::unlockBitLocker(const std::wstring& volumeName,
+                                   const std::wstring& passphrase,
+                                   LogCallback log) const
+{
+    BitLockerWmi wmi;
+    std::wstring objectPath;
+    if (!wmi.connect(log) || !wmi.findVolume(volumeName, objectPath, log))
+        return false;
+
+    ULONG code = ULONG_MAX;
+    ULONG lockStatus = ULONG_MAX;
+    IWbemClassObject* output = nullptr;
+    if (!wmi.invoke(objectPath, L"GetLockStatus", {}, &output, code, log) ||
+        code != ERROR_SUCCESS ||
+        !getOutputUlong(output, L"LockStatus", lockStatus)) {
+        if (output) output->Release();
+        logBitLockerCode(log, L"GetLockStatus", code);
+        return false;
+    }
+    output->Release();
+
+    std::vector<std::pair<std::wstring, VARIANT>> inputs;
+    if (lockStatus != 0) {
+        inputs.emplace_back(L"PassPhrase", makeStringVariant(passphrase));
+        bool invoked = wmi.invoke(objectPath, L"UnlockWithPassPhrase",
+            inputs, nullptr, code, log);
+        clearInputs(inputs);
+        if (!invoked || code != ERROR_SUCCESS) {
+            logBitLockerCode(log, L"UnlockWithPassPhrase", code);
+            return false;
+        }
+        logLine(log, L"[BitLocker] volume unlocked.");
+    }
+
+    ULONG conversionStatus = ULONG_MAX;
+    output = nullptr;
+    if (!wmi.invoke(objectPath, L"GetConversionStatus", {}, &output,
+        code, log) || code != ERROR_SUCCESS ||
+        !getOutputUlong(output, L"ConversionStatus", conversionStatus)) {
+        if (output) output->Release();
+        logBitLockerCode(log, L"GetConversionStatus", code);
+        return false;
+    }
+    output->Release();
+
+    if (conversionStatus == 4) {
+        if (!wmi.invoke(objectPath, L"ResumeConversion", {}, nullptr,
+            code, log) || code != ERROR_SUCCESS) {
+            logBitLockerCode(log, L"ResumeConversion", code);
+            return false;
+        }
+        conversionStatus = 2;
+    }
+    if (conversionStatus != 1 && conversionStatus != 2) {
+        logLine(log, L"[BitLocker] volume is not in an encrypted state.");
+        return false;
+    }
+
+    ULONG protectionStatus = ULONG_MAX;
+    output = nullptr;
+    if (!wmi.invoke(objectPath, L"GetProtectionStatus", {}, &output,
+        code, log) || code != ERROR_SUCCESS ||
+        !getOutputUlong(output, L"ProtectionStatus", protectionStatus)) {
+        if (output) output->Release();
+        logBitLockerCode(log, L"GetProtectionStatus", code);
+        return false;
+    }
+    output->Release();
+    if (protectionStatus != 1) {
+        // Win10 reports ProtectionStatus=Unprotected while initial
+        // encryption is still converting the volume, even though the
+        // passphrase and recovery protectors were added successfully.
+        if (conversionStatus == 2) {
+            logLine(log, L"[BitLocker] encryption is in progress; key "
+                L"protectors are configured.");
+            return true;
+        }
+        logLine(log, L"[BitLocker] key protectors are not enabled.");
+        return false;
+    }
+    return true;
+}
+
+bool VaultManager::lockBitLocker(const std::wstring& volumeName,
+                                 LogCallback log) const
+{
+    if (volumeName.empty())
+        return true;
+    BitLockerWmi wmi;
+    std::wstring objectPath;
+    if (!wmi.connect(log) || !wmi.findVolume(volumeName, objectPath, log))
+        return false;
+
+    ULONG code = ULONG_MAX;
+    std::vector<std::pair<std::wstring, VARIANT>> inputs;
+    inputs.emplace_back(L"ForceDismount", makeBoolVariant(false));
+    bool invoked = wmi.invoke(objectPath, L"Lock", inputs, nullptr, code, log);
+    clearInputs(inputs);
+    if (!invoked || code != ERROR_SUCCESS) {
+        logBitLockerCode(log, L"Lock", code);
+        return false;
+    }
+    logLine(log, L"[BitLocker] volume locked.");
     return true;
 }
 
@@ -522,6 +1448,54 @@ bool VaultManager::writeSaltMetadata(HANDLE virtualDisk,
     return true;
 }
 
+bool VaultManager::readBitLockerMetadata(const std::wstring& vaultFilePath,
+                                         LogCallback log) const
+{
+    VIRTUAL_STORAGE_TYPE storageType{};
+    storageType.DeviceId = VIRTUAL_STORAGE_TYPE_DEVICE_VHDX;
+    storageType.VendorId = kVirtualStorageVendorMicrosoft;
+    OPEN_VIRTUAL_DISK_PARAMETERS openParams{};
+    openParams.Version = OPEN_VIRTUAL_DISK_VERSION_1;
+
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    DWORD err = OpenVirtualDisk(&storageType, vaultFilePath.c_str(),
+        VIRTUAL_DISK_ACCESS_GET_INFO | VIRTUAL_DISK_ACCESS_METAOPS,
+        OPEN_VIRTUAL_DISK_FLAG_NONE, &openParams, &handle);
+    if (err != ERROR_SUCCESS)
+        return false;
+
+    VaultBitLockerMetadata metadata{};
+    ULONG size = sizeof(metadata);
+    err = GetVirtualDiskMetadata(handle, &kVaultBitLockerMetadataGuid,
+        &size, &metadata);
+    CloseHandle(handle);
+    bool valid = err == ERROR_SUCCESS && size == sizeof(metadata) &&
+        metadata.magic == kVaultBitLockerMagic &&
+        metadata.version == kVaultBitLockerVersion;
+    if (!valid) {
+        logLine(log, L"[BitLocker] legacy vault detected; refusing in-place "
+            L"encryption. Export it with the old crypto driver, then create "
+            L"a new BitLocker vault.");
+    }
+    return valid;
+}
+
+bool VaultManager::writeBitLockerMetadata(HANDLE virtualDisk,
+                                          LogCallback log) const
+{
+    VaultBitLockerMetadata metadata{};
+    metadata.magic = kVaultBitLockerMagic;
+    metadata.version = kVaultBitLockerVersion;
+    DWORD err = SetVirtualDiskMetadata(virtualDisk,
+        &kVaultBitLockerMetadataGuid, sizeof(metadata), &metadata);
+    if (err != ERROR_SUCCESS) {
+        logLine(log, L"[BitLocker] failed to commit vault format marker: " +
+            std::to_wstring(err));
+        return false;
+    }
+    return true;
+}
+
 bool VaultManager::attachVhdx(const std::wstring& vaultFilePath,
                               std::wstring& outPhysicalDrive,
                               LogCallback log)
@@ -613,14 +1587,36 @@ bool VaultManager::detachVhdx(const std::wstring& vaultFilePath, LogCallback log
         return true;
     }
 
-    DWORD err = DetachVirtualDisk(it->second.handle, DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
-    CloseHandle(it->second.handle);
-    m_attachedVaults.erase(it);
+    if (!it->second.mountPoint.empty()) {
+        std::wstring mount = withTrailingBackslash(it->second.mountPoint);
+        if (!DeleteVolumeMountPointW(mount.c_str())) {
+            DWORD mountErr = GetLastError();
+            if (mountErr != ERROR_FILE_NOT_FOUND &&
+                mountErr != ERROR_PATH_NOT_FOUND &&
+                mountErr != ERROR_INVALID_PARAMETER) {
+                logLine(log, L"[Vault] DeleteVolumeMountPoint failed: " +
+                    std::to_wstring(mountErr));
+                return false;
+            }
+        }
+    }
+
+    if (!it->second.volumeName.empty() &&
+        !lockBitLocker(it->second.volumeName, log)) {
+        logLine(log, L"[Vault] volume still has open handles; detach deferred.");
+        return false;
+    }
+
+    DWORD err = DetachVirtualDisk(it->second.handle,
+        DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
 
     if (err != ERROR_SUCCESS) {
         logLine(log, L"[Vault] DetachVirtualDisk failed: " + std::to_wstring(err));
         return false;
     }
+
+    CloseHandle(it->second.handle);
+    m_attachedVaults.erase(it);
 
     logLine(log, L"[Vault] unmounted " + vaultFilePath);
     return true;
@@ -650,7 +1646,7 @@ bool VaultManager::formatAttachedDisk(const std::wstring& physicalDrive,
     if (!runDiskPart(script.str(), log))
         return false;
 
-    return assignMountPoint(physicalDrive, mountPoint, log);
+    return true;
 }
 
 bool VaultManager::assignMountPoint(const std::wstring& physicalDrive,
