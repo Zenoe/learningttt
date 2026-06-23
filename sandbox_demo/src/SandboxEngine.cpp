@@ -280,6 +280,68 @@ SandboxedProcess SandboxEngine::launch(const SandboxConfig& cfg)
     return result;
 }
 
+SandboxedProcess SandboxEngine::createBoxSession(const SandboxConfig& cfg,
+                                                 const std::wstring& fsRoot)
+{
+    SandboxedProcess result;
+    result.boxName = cfg.boxName;
+    result.fsRoot = fsRoot;
+
+    if (cfg.boxName.empty() || fsRoot.empty()) {
+        log(L"[!] createBoxSession requires a box name and FS root.");
+        return result;
+    }
+
+    result.hNamespaceDir = createPrivateNamespace(cfg.boxName);
+    if (result.hNamespaceDir) {
+        log(L"[+] Private NT namespace created for passive box: \\Sandbox\\" +
+            cfg.boxName);
+    }
+
+    result.hJob = createJobObject(cfg);
+    if (!result.hJob) {
+        if (result.hNamespaceDir) {
+            ClosePrivateNamespace(result.hNamespaceDir, 0);
+            result.hNamespaceDir = nullptr;
+        }
+        log(L"[!] Failed to create passive box Job Object.");
+        return result;
+    }
+
+    result.valid = true;
+    log(L"[+] Passive box session ready: " + cfg.boxName);
+    return result;
+}
+
+SandboxedProcess SandboxEngine::launchInExistingBox(const SandboxConfig& cfg,
+                                                    HANDLE existingJob,
+                                                    const std::wstring& fsRoot)
+{
+    SandboxedProcess result;
+    result.boxName = cfg.boxName;
+    result.fsRoot = fsRoot;
+
+    if (!existingJob || fsRoot.empty()) {
+        log(L"[!] launchInExistingBox requires an existing job and FS root.");
+        return result;
+    }
+
+    log(L"[SandboxEngine] === Launching inside existing box: " +
+        cfg.boxName + L" ===");
+
+    if (!spawnInJob(cfg, existingJob, nullptr, result)) {
+        log(L"[!] Failed to spawn process inside existing sandbox.");
+        return result;
+    }
+
+    result.hJob = nullptr;       // Borrowed job handle; owner remains box root.
+    result.valid = true;
+    log(L"[+] Process " + std::to_wstring(result.pid) +
+        L" created suspended inside existing sandbox box \"" +
+        cfg.boxName + L"\"");
+    return result;
+}
+
 // ------------------------------------------------------------
 //  Public: release()
 // ------------------------------------------------------------
@@ -526,14 +588,21 @@ HANDLE SandboxEngine::createJobObject(const SandboxConfig& cfg)
     }
 
     // -- UI restrictions (mirrors Sandboxie's UIPI enforcement) --
+    JOBOBJECT_BASIC_UI_RESTRICTIONS uir{};
+    if (cfg.isolateClipboard) {
+        uir.UIRestrictionsClass |=
+            JOB_OBJECT_UILIMIT_READCLIPBOARD |
+            JOB_OBJECT_UILIMIT_WRITECLIPBOARD;
+    }
     if (cfg.restrictUI) {
-        JOBOBJECT_BASIC_UI_RESTRICTIONS uir{};
-        uir.UIRestrictionsClass =
-            JOB_OBJECT_UILIMIT_HANDLES |   // no cross-job USER handles
-            JOB_OBJECT_UILIMIT_GLOBALATOMS |   // no global atom table
+        uir.UIRestrictionsClass |=
+            JOB_OBJECT_UILIMIT_HANDLES |       // no cross-job USER handles
+            JOB_OBJECT_UILIMIT_GLOBALATOMS |   // no global atom table / DDE
             JOB_OBJECT_UILIMIT_EXITWINDOWS |   // no ExitWindowsEx
             JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS;   // no SystemParametersInfo
+    }
 
+    if (uir.UIRestrictionsClass != 0) {
         if (!SetInformationJobObject(hJob,
             JobObjectBasicUIRestrictions,
             &uir, sizeof(uir))) {
@@ -796,6 +865,10 @@ std::wstring SandboxEngine::describeJob(HANDLE hJob)
             ss << L" NoGlobalAtoms";
         if (uir.UIRestrictionsClass & JOB_OBJECT_UILIMIT_EXITWINDOWS)
             ss << L" NoExitWindows";
+        if (uir.UIRestrictionsClass & JOB_OBJECT_UILIMIT_READCLIPBOARD)
+            ss << L" NoReadClipboard";
+        if (uir.UIRestrictionsClass & JOB_OBJECT_UILIMIT_WRITECLIPBOARD)
+            ss << L" NoWriteClipboard";
     }
     return ss.str();
 }

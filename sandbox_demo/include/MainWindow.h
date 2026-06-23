@@ -35,6 +35,7 @@ private slots:
     void onUnloadDriver();
     void onLaunchNormal();
     void onLaunchSandboxed();
+    void onOpenBoxExplorer();
     void onKillSelected();
     void onKillAll();
     void onPolicyChanged();
@@ -43,6 +44,7 @@ private slots:
     void onHookLogReceived(quint32 processId, quint32 threadId,
                            const QString& message);
     void onShowInFolderRequested(quint32 processId, const QString& path);
+    void onOpenSandboxFileRequested(const QString& path);
     void onProcessExited(DWORD pid, const QString& label, DWORD exitCode);
     void onStatusUpdate(const QString& summary);
 
@@ -58,6 +60,11 @@ private:
     bool isSandboxWindow(HWND hwnd, std::wstring* boxName = nullptr) const;
     bool hasOtherSandboxInBox(const std::wstring& boxName, DWORD exceptPid) const;
     void unregisterWfp(SandboxedProcess& sp);
+    SandboxedProcess* findSandboxForPath(const QString& path);
+    SandboxedProcess* findPassiveBox(const QString& boxName);
+    QString boxDriveRoot(const SandboxedProcess& sp) const;
+    QString chooseViewerExecutable(const QString& filePath) const;
+    bool openConfiguredBoxVaultInExplorer();
 
     // ---- Driver panel ----
     QLineEdit*   m_sysPath      = nullptr;
@@ -91,6 +98,7 @@ private:
     QPushButton* m_btnBrowse     = nullptr;
     QPushButton* m_btnNormal     = nullptr;
     QPushButton* m_btnSandboxed  = nullptr;
+    QPushButton* m_btnOpenExplorer = nullptr;
     QPushButton* m_btnKillSel    = nullptr;
     QPushButton* m_btnKillAll    = nullptr;
 
@@ -102,6 +110,7 @@ private:
     // ---- Engine / state ----
     SandboxEngine   m_engine;
     DriverManager   m_driver;
+    VaultManager    m_explorerVault;
     ProcessMonitor* m_monitor    = nullptr;
     QTimer*         m_statsTimer = nullptr;
     QTimer*         m_borderTimer = nullptr;
@@ -110,4 +119,6 @@ private:
 
     std::vector<SandboxedProcess> m_normalProcs;
     std::vector<SandboxedProcess> m_sandboxProcs;
+    std::vector<SandboxedProcess> m_passiveBoxSessions;
+    std::vector<std::wstring> m_explorerMountedVaults;
 };

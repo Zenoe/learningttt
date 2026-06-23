@@ -6,6 +6,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
+set(CMAKE_AUTOUIC_SEARCH_PATHS
+    ${CMAKE_CURRENT_SOURCE_DIR}/ui
+)
 
 set(DETOURS_ROOT "C:/vcpkg/installed/x64-windows" CACHE PATH "Microsoft Detours install root")
 find_path(DETOURS_INCLUDE_DIR
@@ -81,6 +84,7 @@ set(SOURCES
     src/DriverManager.cpp
     src/VaultManager.cpp
     src/StringUtil.cpp
+    ui/SandboxFileExplorer.ui
 )
 
 set(HEADERS
@@ -117,6 +121,7 @@ target_link_libraries(SandboxDemo PRIVATE
     crypt32
     ole32
     oleaut32
+    shlwapi
     wbemuuid
     ${DETOURS_LIBRARY}
 )

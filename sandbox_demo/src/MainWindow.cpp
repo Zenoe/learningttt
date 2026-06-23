@@ -29,8 +29,10 @@
 #include <QMessageBox>
 #include <QStandardPaths>
 #include <algorithm>
+#include <filesystem>
 #include <functional>
 #include <unordered_map>
+#include <shlwapi.h>
 
 // ---- Helpers -----------------------------------------------
 static QLabel* makeLabel(const QString& t) {
@@ -45,6 +47,62 @@ static bool isChromiumExecutable(const QString& path)
     return lower.contains(QStringLiteral("chrome")) ||
            lower.contains(QStringLiteral("msedge")) ||
            lower.contains(QStringLiteral("brave"));
+}
+
+static bool isConsoleExecutable(const QString& path)
+{
+    const QString name = QFileInfo(path).fileName().toLower();
+    return name == QStringLiteral("cmd.exe") ||
+           name == QStringLiteral("powershell.exe") ||
+           name == QStringLiteral("pwsh.exe");
+}
+
+static QString cleanAbsolutePath(const QString& path)
+{
+    return QDir::cleanPath(QFileInfo(path).absoluteFilePath()).replace('/', '\\');
+}
+
+static bool pathIsSameOrChildOf(const QString& path, const QString& root)
+{
+    if (path.isEmpty() || root.isEmpty())
+        return false;
+    QString candidate = cleanAbsolutePath(path);
+    QString cleanRoot = cleanAbsolutePath(root);
+    if (!cleanRoot.endsWith('\\'))
+        cleanRoot += '\\';
+    return candidate.compare(cleanRoot.left(cleanRoot.size() - 1),
+                             Qt::CaseInsensitive) == 0 ||
+           candidate.startsWith(cleanRoot, Qt::CaseInsensitive);
+}
+
+static std::wstring withTrailingSlash(std::wstring path)
+{
+    if (!path.empty() && path.back() != L'\\' && path.back() != L'/')
+        path.push_back(L'\\');
+    return path;
+}
+
+static std::wstring queryNtDeviceForMountPoint(const std::wstring& mountPoint)
+{
+    wchar_t volumeName[MAX_PATH]{};
+    const std::wstring mount = withTrailingSlash(mountPoint);
+    if (!GetVolumeNameForVolumeMountPointW(mount.c_str(),
+                                           volumeName,
+                                           MAX_PATH)) {
+        return {};
+    }
+
+    std::wstring dosName(volumeName);
+    if (dosName.rfind(L"\\\\?\\", 0) == 0)
+        dosName.erase(0, 4);
+    while (!dosName.empty() && dosName.back() == L'\\')
+        dosName.pop_back();
+
+    wchar_t deviceName[1024]{};
+    if (!QueryDosDeviceW(dosName.c_str(), deviceName, 1024))
+        return {};
+
+    return deviceName;
 }
 
 static QLineEdit* makeEdit(const QString& ph, const QFont& f) {
@@ -376,6 +434,8 @@ MainWindow::MainWindow(QWidget* parent)
     setupUi();
 
     m_fileExplorer = new SandboxFileExplorer(this);
+    connect(m_fileExplorer, &SandboxFileExplorer::openRequested,
+            this, &MainWindow::onOpenSandboxFileRequested);
     m_hookIpc = new HookIpcServer(this);
     connect(m_hookIpc, &HookIpcServer::hookLogReceived,
             this, &MainWindow::onHookLogReceived, Qt::QueuedConnection);
@@ -421,10 +481,21 @@ MainWindow::~MainWindow()
     }
     g_hostBorders.clear();
     for (auto& sp : m_sandboxProcs) {
+        if (sp.valid && !sp.hJob && sp.hProcess)
+            TerminateProcess(sp.hProcess, 0);
         unregisterDriverPids(sp);
         m_engine.release(sp);
     }
+    for (auto& sp : m_passiveBoxSessions) {
+        if (m_driver.isLoaded()) {
+            m_driver.clearCryptoKey(sp.boxName);
+            m_driver.removeBox(sp.boxName);
+        }
+        m_engine.release(sp);
+    }
     for (auto& sp : m_normalProcs)  m_engine.release(sp);
+    for (const std::wstring& vaultPath : m_explorerMountedVaults)
+        m_explorerVault.unmount(vaultPath, nullptr);
 }
 
 // ============================================================
@@ -522,6 +593,8 @@ void MainWindow::setupUi()
     "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
     "C:\\Windows\\notepad.exe",
     "C:\\Users\\admin\\AppData\\Local\\Chromium\\Application\\chrome.exe",
+    "C:\\Program Files\\Microsoft Office\\root\\Office16\\WINWORD.EXE",
+    "C:\\Program Files\\Microsoft Office\\root\\Office16\\EXCEL.EXE",
     "C:\\Windows\\System32\\cmd.exe"
      });
 
@@ -605,12 +678,14 @@ void MainWindow::setupUi()
     // Launch buttons
     m_btnNormal    = makeBtn("▶  Launch Normal", "#1a4a88");
     m_btnSandboxed = makeBtn("⬡  Launch Sandboxed", "#0a6634");
+    m_btnOpenExplorer = makeBtn("▣  Open Box Explorer", "#335577");
     m_btnKillSel   = makeBtn("✕  Kill Selected", "#773300");
     m_btnKillAll   = makeBtn("✕✕ Kill All",      "#550011");
 
     auto* launchRow = new QHBoxLayout;
     launchRow->addWidget(m_btnNormal);
     launchRow->addWidget(m_btnSandboxed);
+    launchRow->addWidget(m_btnOpenExplorer);
     launchRow->addStretch();
     launchRow->addWidget(m_btnKillSel);
     launchRow->addWidget(m_btnKillAll);
@@ -680,6 +755,7 @@ void MainWindow::setupUi()
     connect(m_btnBrowse,    &QPushButton::clicked, this, &MainWindow::onBrowseExe);
     connect(m_btnNormal,    &QPushButton::clicked, this, &MainWindow::onLaunchNormal);
     connect(m_btnSandboxed, &QPushButton::clicked, this, &MainWindow::onLaunchSandboxed);
+    connect(m_btnOpenExplorer, &QPushButton::clicked, this, &MainWindow::onOpenBoxExplorer);
     connect(m_btnKillSel,   &QPushButton::clicked, this, &MainWindow::onKillSelected);
     connect(m_btnKillAll,   &QPushButton::clicked, this, &MainWindow::onKillAll);
     connect(m_cmbPolicy,    QOverload<int>::of(&QComboBox::currentIndexChanged),
@@ -950,19 +1026,36 @@ void MainWindow::onLaunchSandboxed()
         appendLog("  [Chrome] Using --no-sandbox because the outer sandbox owns containment.");
     }
 
-    cfg.passphrase = m_chkPassphrase->isChecked()
-        ? m_passphrase->text().toStdWString()
-        : std::wstring();
-    SandboxedProcess sp = m_engine.launch(cfg);
-    SecureZeroMemory(cfg.passphrase.data(),
-        cfg.passphrase.size() * sizeof(wchar_t));
-    cfg.passphrase.clear();
+    SandboxedProcess* passiveBox = findPassiveBox(uniqueBox);
+    const bool reusePassiveBox = passiveBox && passiveBox->valid &&
+        passiveBox->hJob && !passiveBox->fsRoot.empty();
+
+    SandboxedProcess sp;
+    if (reusePassiveBox) {
+        appendLog("  [Explorer] Reusing mounted passive box session.");
+        cfg.useVault = false;
+        sp = m_engine.launchInExistingBox(cfg,
+                                          passiveBox->hJob,
+                                          passiveBox->fsRoot);
+        sp.vaultFilePath = passiveBox->vaultFilePath;
+        sp.vaultMountPoint = passiveBox->vaultMountPoint;
+        sp.mountPointNt = passiveBox->mountPointNt;
+    }
+    else {
+        cfg.passphrase = m_chkPassphrase->isChecked()
+            ? m_passphrase->text().toStdWString()
+            : std::wstring();
+        sp = m_engine.launch(cfg);
+        SecureZeroMemory(cfg.passphrase.data(),
+            cfg.passphrase.size() * sizeof(wchar_t));
+        cfg.passphrase.clear();
+    }
     if (!sp.valid) {
         appendLog("! Process launch failed.");
         return;
     }
 
-    if (!sp.bitLockerRecoveryPassword.empty()) {
+    if (!reusePassiveBox && !sp.bitLockerRecoveryPassword.empty()) {
         QMessageBox recoveryBox(QMessageBox::Warning,
             "BitLocker recovery password",
             "A new BitLocker vault was created. Save its recovery password "
@@ -982,7 +1075,15 @@ void MainWindow::onLaunchSandboxed()
 
     // ---- Register the mounted vault root and crypto context with the driver. ----
     bool driverOk = false;
-    if (m_driver.isLoaded()) {
+    if (reusePassiveBox) {
+        driverOk = m_driver.isLoaded();
+        if (!driverOk) {
+            appendLog("! Passive box is open but SandboxFlt driver is not loaded; terminating suspended process.");
+            m_engine.release(sp);
+            return;
+        }
+    }
+    else if (m_driver.isLoaded()) {
         QString sandboxRoot = QString::fromStdWString(sp.fsRoot + L"\\drive");
         QString sandboxVolRelative = sandboxRoot;
         if (sandboxVolRelative.length() >= 2 && sandboxVolRelative[1] == ':')
@@ -1117,6 +1218,214 @@ void MainWindow::onLaunchSandboxed()
                          .arg(uniqueBox).arg(sp.pid));
 }
 
+void MainWindow::onOpenBoxExplorer()
+{
+    SandboxedProcess* target = nullptr;
+
+    if (auto* item = m_processTree->currentItem()) {
+        if (item->data(0, Qt::UserRole + 1).toBool()) {
+            const QString selectedBox = item->text(1);
+            for (auto& sp : m_sandboxProcs) {
+                if (!sp.valid)
+                    continue;
+                if (QString::fromStdWString(sp.boxName)
+                        .compare(selectedBox, Qt::CaseInsensitive) == 0) {
+                    target = &sp;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!target) {
+        QString configuredBox = m_boxName->text().trimmed();
+        if (configuredBox.isEmpty())
+            configuredBox = QStringLiteral("Box00");
+        for (auto& sp : m_sandboxProcs) {
+            if (!sp.valid)
+                continue;
+            if (QString::fromStdWString(sp.boxName)
+                    .compare(configuredBox, Qt::CaseInsensitive) == 0) {
+                target = &sp;
+                break;
+            }
+        }
+    }
+
+    if (!target) {
+        int activeCount = 0;
+        for (auto& sp : m_sandboxProcs) {
+            if (!sp.valid)
+                continue;
+            target = &sp;
+            ++activeCount;
+        }
+        if (activeCount > 1) {
+            appendLog("! Select a sandbox process row before opening Box Explorer.");
+            return;
+        }
+    }
+
+    if (!target) {
+        QString configuredBox = m_boxName->text().trimmed();
+        if (configuredBox.isEmpty())
+            configuredBox = QStringLiteral("Box00");
+        if (auto* passive = findPassiveBox(configuredBox)) {
+            target = passive;
+        }
+    }
+
+    if (!target) {
+        openConfiguredBoxVaultInExplorer();
+        return;
+    }
+
+    const QString root = boxDriveRoot(*target);
+    if (!QDir(root).exists()) {
+        appendLog("! Box Explorer root not found: " + QDir::toNativeSeparators(root));
+        return;
+    }
+
+    appendLog(QString("  [Explorer] Opening box '%1': %2")
+                  .arg(QString::fromStdWString(target->boxName),
+                       QDir::toNativeSeparators(root)));
+    if (m_fileExplorer) {
+        m_fileExplorer->showForPath(root,
+            QString::fromStdWString(target->boxName),
+            root);
+    }
+}
+
+bool MainWindow::openConfiguredBoxVaultInExplorer()
+{
+    QString boxName = m_boxName->text().trimmed();
+    if (boxName.isEmpty())
+        boxName = QStringLiteral("Box00");
+
+    if (auto* passive = findPassiveBox(boxName)) {
+        const QString root = boxDriveRoot(*passive);
+        if (m_fileExplorer)
+            m_fileExplorer->showForPath(root, boxName, root);
+        return true;
+    }
+
+    QString vaultDir = m_vaultDir->text().trimmed();
+    if (vaultDir.isEmpty())
+        vaultDir = QStringLiteral("C:\\SandboxBoxes");
+
+    QString mountDir = m_fsRoot->text().trimmed();
+    if (mountDir.isEmpty())
+        mountDir = QStringLiteral("C:\\SandboxMounts");
+
+    const QString vaultPath = QDir(vaultDir).filePath(boxName + QStringLiteral(".vault"));
+    if (!QFileInfo::exists(vaultPath)) {
+        appendLog("! Box vault not found: " + QDir::toNativeSeparators(vaultPath));
+        return false;
+    }
+
+    if (!m_driver.isLoaded()) {
+        appendLog("! Opening files from a default box requires the SandboxFlt driver to be loaded.");
+        appendLog("  Load the driver first so viewer PIDs can be registered before resume.");
+        return false;
+    }
+
+    if (!DriverManager::isElevated()) {
+        appendLog("! Opening a box vault directly requires Administrator privileges.");
+        appendLog("  AttachVirtualDisk and BitLocker unlock cannot run from a non-elevated process.");
+        return false;
+    }
+
+    VaultManager::VaultConfig cfg;
+    cfg.boxName = boxName.toStdWString();
+    cfg.vaultFilePath = QDir::toNativeSeparators(vaultPath).toStdWString();
+    cfg.mountPoint = QDir::toNativeSeparators(
+        QDir(mountDir).filePath(boxName)).toStdWString();
+    cfg.passphrase = m_chkPassphrase->isChecked()
+        ? m_passphrase->text().toStdWString()
+        : std::wstring();
+
+    appendLog(QString("  [Explorer] Mounting box vault '%1': %2")
+                  .arg(boxName, QDir::toNativeSeparators(vaultPath)));
+    const std::wstring mounted = m_explorerVault.mount(cfg,
+        [this](const std::wstring& message) {
+            appendLog(QString::fromStdWString(message));
+        });
+    SecureZeroMemory(cfg.passphrase.data(),
+        cfg.passphrase.size() * sizeof(wchar_t));
+    cfg.passphrase.clear();
+
+    if (mounted.empty()) {
+        appendLog("! Failed to mount box vault for browsing.");
+        return false;
+    }
+
+    const QString driveRoot = QDir::toNativeSeparators(
+        QDir(QString::fromStdWString(mounted)).filePath(QStringLiteral("drive")));
+    const QString explorerRoot = QDir(driveRoot).exists()
+        ? driveRoot
+        : QDir::toNativeSeparators(QString::fromStdWString(mounted));
+
+    SandboxConfig sessionCfg;
+    sessionCfg.boxName = boxName.toStdWString();
+    sessionCfg.restrictUI = true;
+    sessionCfg.isolateClipboard = true;
+    sessionCfg.killOnClose = false;
+    SandboxedProcess session =
+        m_engine.createBoxSession(sessionCfg, mounted);
+    if (!session.valid) {
+        appendLog("! Failed to create passive box job for mounted vault.");
+        m_explorerVault.unmount(cfg.vaultFilePath, nullptr);
+        return false;
+    }
+    session.vaultFilePath = cfg.vaultFilePath;
+    session.vaultMountPoint = mounted;
+    session.mountPointNt = queryNtDeviceForMountPoint(mounted);
+    if (session.mountPointNt.empty()) {
+        appendLog("! Failed to resolve vault mount NT device path.");
+        m_engine.release(session);
+        m_explorerVault.unmount(cfg.vaultFilePath, nullptr);
+        return false;
+    }
+
+    QString sandboxRoot = QDir::toNativeSeparators(explorerRoot);
+    QString sandboxVolRelative = sandboxRoot;
+    if (sandboxVolRelative.length() >= 2 && sandboxVolRelative[1] == ':')
+        sandboxVolRelative = sandboxVolRelative.mid(2);
+    sandboxVolRelative = sandboxVolRelative.replace('/', '\\');
+    if (!sandboxVolRelative.startsWith('\\'))
+        sandboxVolRelative.prepend('\\');
+
+    bool driverOk = m_driver.addBox(session.boxName,
+                                    sandboxVolRelative.toStdWString(),
+                                    L"\\");
+    if (driverOk) {
+        const int pol = m_cmbPolicy->currentIndex();
+        m_driver.setPolicy(session.boxName,
+                           (SANDBOX_WRITE_POLICY)pol,
+                           true,
+                           false);
+        driverOk = m_driver.setMountPoint(session.boxName,
+                                          session.mountPointNt);
+    }
+    if (!driverOk) {
+        appendLog("! Failed to register passive box with SandboxFlt driver.");
+        m_driver.clearCryptoKey(session.boxName);
+        m_driver.removeBox(session.boxName);
+        m_engine.release(session);
+        m_explorerVault.unmount(cfg.vaultFilePath, nullptr);
+        return false;
+    }
+
+    m_explorerMountedVaults.push_back(cfg.vaultFilePath);
+    m_passiveBoxSessions.push_back(session);
+
+    appendLog(QString("  [Explorer] Opening mounted vault '%1': %2")
+                  .arg(boxName, explorerRoot));
+    if (m_fileExplorer)
+        m_fileExplorer->showForPath(explorerRoot, boxName, explorerRoot);
+    return true;
+}
+
 void MainWindow::onKillSelected()
 {
     auto* item = m_processTree->currentItem();
@@ -1127,6 +1436,8 @@ void MainWindow::onKillSelected()
 
     for (auto& sp : m_sandboxProcs) {
         if (sp.pid == pid && sp.valid) {
+            if (!sp.hJob && sp.hProcess)
+                TerminateProcess(sp.hProcess, 0);
             unregisterDriverPids(sp);
             m_engine.release(sp);
             item->setText(4, item->text(4) + " [killed]");
@@ -1150,11 +1461,26 @@ void MainWindow::onKillAll()
     m_monitor->stopAll();
     for (auto& sp : m_sandboxProcs) {
         if (sp.valid) {
+            if (!sp.hJob && sp.hProcess)
+                TerminateProcess(sp.hProcess, 0);
             unregisterDriverPids(sp);
             m_engine.release(sp);
         }
     }
     m_sandboxProcs.clear();
+    for (auto& sp : m_passiveBoxSessions) {
+        if (sp.valid) {
+            if (m_driver.isLoaded()) {
+                m_driver.clearCryptoKey(sp.boxName);
+                m_driver.removeBox(sp.boxName);
+            }
+            m_engine.release(sp);
+        }
+    }
+    m_passiveBoxSessions.clear();
+    for (const std::wstring& vaultPath : m_explorerMountedVaults)
+        m_explorerVault.unmount(vaultPath, nullptr);
+    m_explorerMountedVaults.clear();
     for (auto& sp : m_normalProcs) {
         if (sp.hProcess) {
             TerminateProcess(sp.hProcess, 0);
@@ -1172,6 +1498,10 @@ void MainWindow::onPolicyChanged()
     if (!m_driver.isLoaded()) return;
     int pol = m_cmbPolicy->currentIndex();
     for (auto& sp : m_sandboxProcs) {
+        if (sp.valid)
+            m_driver.setPolicy(sp.boxName, (SANDBOX_WRITE_POLICY)pol, true, false);
+    }
+    for (auto& sp : m_passiveBoxSessions) {
         if (sp.valid)
             m_driver.setPolicy(sp.boxName, (SANDBOX_WRITE_POLICY)pol, true, false);
     }
@@ -1197,6 +1527,10 @@ bool MainWindow::hasOtherSandboxInBox(const std::wstring& boxName,
         if (other.pid == exceptPid)
             continue;
         if (other.boxName == boxName)
+            return true;
+    }
+    for (const auto& other : m_passiveBoxSessions) {
+        if (other.valid && other.boxName == boxName)
             return true;
     }
     return false;
@@ -1239,6 +1573,109 @@ void MainWindow::onFsRootChanged()
     appendLog("  [Sandbox] Mount root changed: " + m_fsRoot->text());
 }
 
+SandboxedProcess* MainWindow::findSandboxForPath(const QString& path)
+{
+    for (auto& sp : m_sandboxProcs) {
+        if (!sp.valid || sp.fsRoot.empty())
+            continue;
+
+        const QString fsRoot = QString::fromStdWString(sp.fsRoot);
+        if (pathIsSameOrChildOf(path, fsRoot) ||
+            pathIsSameOrChildOf(path, boxDriveRoot(sp))) {
+            return &sp;
+        }
+    }
+    for (auto& sp : m_passiveBoxSessions) {
+        if (!sp.valid || sp.fsRoot.empty())
+            continue;
+
+        const QString fsRoot = QString::fromStdWString(sp.fsRoot);
+        if (pathIsSameOrChildOf(path, fsRoot) ||
+            pathIsSameOrChildOf(path, boxDriveRoot(sp))) {
+            return &sp;
+        }
+    }
+    return nullptr;
+}
+
+SandboxedProcess* MainWindow::findPassiveBox(const QString& boxName)
+{
+    for (auto& sp : m_passiveBoxSessions) {
+        if (!sp.valid)
+            continue;
+        if (QString::fromStdWString(sp.boxName)
+                .compare(boxName, Qt::CaseInsensitive) == 0) {
+            return &sp;
+        }
+    }
+    return nullptr;
+}
+
+QString MainWindow::boxDriveRoot(const SandboxedProcess& sp) const
+{
+    const QString fsRoot = QString::fromStdWString(sp.fsRoot);
+    const QString driveRoot = QDir(fsRoot).filePath(QStringLiteral("drive"));
+    return QDir(driveRoot).exists() ? QDir::toNativeSeparators(driveRoot)
+                                    : QDir::toNativeSeparators(fsRoot);
+}
+
+QString MainWindow::chooseViewerExecutable(const QString& filePath) const
+{
+    auto usableViewer = [](const QString& path) {
+        const QFileInfo info(path);
+        const QString name = info.fileName().toLower();
+        return info.exists() && info.isFile() &&
+               !isConsoleExecutable(info.absoluteFilePath()) &&
+               name != QStringLiteral("explorer.exe");
+    };
+
+    const QString suffix = QFileInfo(filePath).suffix();
+    if (!suffix.isEmpty()) {
+        const std::wstring association = L"." + suffix.toStdWString();
+        DWORD chars = 0;
+        HRESULT hr = AssocQueryStringW(
+            ASSOCF_VERIFY | ASSOCF_NOTRUNCATE,
+            ASSOCSTR_EXECUTABLE,
+            association.c_str(),
+            L"open",
+            nullptr,
+            &chars);
+        if (hr == S_FALSE && chars > 1) {
+            std::wstring buffer(chars, L'\0');
+            hr = AssocQueryStringW(
+                ASSOCF_VERIFY | ASSOCF_NOTRUNCATE,
+                ASSOCSTR_EXECUTABLE,
+                association.c_str(),
+                L"open",
+                buffer.data(),
+                &chars);
+            if (SUCCEEDED(hr)) {
+                while (!buffer.empty() && buffer.back() == L'\0')
+                    buffer.pop_back();
+                const QString associated =
+                    QDir::toNativeSeparators(QString::fromStdWString(buffer));
+                if (usableViewer(associated))
+                    return associated;
+            }
+        }
+    }
+
+    const QString configured =
+        QDir::toNativeSeparators(m_exePath->currentText().trimmed());
+    if (usableViewer(configured))
+        return configured;
+
+    wchar_t systemDirectory[MAX_PATH]{};
+    if (GetSystemDirectoryW(systemDirectory, MAX_PATH)) {
+        const QString notepad = QDir(QString::fromWCharArray(systemDirectory))
+            .filePath(QStringLiteral("notepad.exe"));
+        if (usableViewer(notepad))
+            return QDir::toNativeSeparators(notepad);
+    }
+
+    return {};
+}
+
 void MainWindow::onHookLogReceived(quint32 processId, quint32 threadId,
                                    const QString& message)
 {
@@ -1253,8 +1690,113 @@ void MainWindow::onShowInFolderRequested(quint32 processId, const QString& path)
     appendLog(QStringLiteral("  [HookDll pid=%1] Show in folder intercepted: %2")
                   .arg(processId)
                   .arg(QDir::toNativeSeparators(path)));
-    if (m_fileExplorer)
-        m_fileExplorer->showForPath(path);
+    SandboxedProcess* sp = findSandboxForPath(path);
+    if (!sp) {
+        appendLog("  [Explorer] Request ignored: path is not under an active box.");
+        return;
+    }
+    if (m_fileExplorer) {
+        m_fileExplorer->showForPath(path,
+            QString::fromStdWString(sp->boxName),
+            boxDriveRoot(*sp));
+    }
+}
+
+void MainWindow::onOpenSandboxFileRequested(const QString& path)
+{
+    const QFileInfo fileInfo(path);
+    if (!fileInfo.exists() || !fileInfo.isFile()) {
+        appendLog("! Open blocked: selected item is not a file.");
+        return;
+    }
+
+    SandboxedProcess* owner = findSandboxForPath(fileInfo.absoluteFilePath());
+    if (!owner || !owner->valid || !owner->hJob) {
+        appendLog("! Open blocked: file is not under an active sandbox job.");
+        return;
+    }
+    if (!m_driver.isLoaded()) {
+        appendLog("! Open blocked: SandboxFlt driver must be loaded so the viewer PID can be registered before resume.");
+        return;
+    }
+
+    const QString viewer = chooseViewerExecutable(fileInfo.absoluteFilePath());
+    if (viewer.isEmpty()) {
+        appendLog("! Open blocked: no safe viewer executable was found.");
+        return;
+    }
+
+    SandboxConfig cfg;
+    cfg.boxName = owner->boxName;
+    cfg.executablePath = viewer.toStdWString();
+    cfg.commandLine = L"\"" + QDir::toNativeSeparators(fileInfo.absoluteFilePath()).toStdWString() + L"\"";
+    cfg.useVault = false;
+    cfg.restrictUI = false;
+    cfg.isolateClipboard = true;
+    cfg.killOnClose = false;
+
+    if (isChromiumExecutable(viewer)) {
+        const QString hookDll = QDir(QCoreApplication::applicationDirPath())
+            .filePath(QStringLiteral("HookDll.dll"));
+        if (QFileInfo::exists(hookDll)) {
+            cfg.borderDllPath = QDir::toNativeSeparators(hookDll).toStdWString();
+        }
+    }
+
+    appendLog(QString("  [Explorer] Open inside box '%1': %2")
+                  .arg(QString::fromStdWString(owner->boxName),
+                       QDir::toNativeSeparators(fileInfo.absoluteFilePath())));
+    appendLog(QString("  [Explorer] Viewer: %1")
+                  .arg(QDir::toNativeSeparators(viewer)));
+
+    SandboxedProcess viewerProcess =
+        m_engine.launchInExistingBox(cfg, owner->hJob, owner->fsRoot);
+    if (!viewerProcess.valid) {
+        appendLog("! Open failed: viewer process was not created.");
+        return;
+    }
+
+    bool registered = m_driver.addProcess(viewerProcess.pid, owner->boxName);
+    const bool pidRegistered = registered;
+    if (registered && owner->wfpEnabled) {
+        registered = m_driver.setWfpPolicy(viewerProcess.pid,
+                                           owner->boxName,
+                                           owner->wfpVnicIp,
+                                           true);
+    }
+    if (!registered) {
+        appendLog("! Open failed: viewer PID registration failed; terminating suspended viewer.");
+        if (pidRegistered)
+            m_driver.removeProcess(viewerProcess.pid);
+        if (viewerProcess.hProcess)
+            TerminateProcess(viewerProcess.hProcess, 1);
+        if (viewerProcess.hThread)
+            CloseHandle(viewerProcess.hThread);
+        if (viewerProcess.hProcess)
+            CloseHandle(viewerProcess.hProcess);
+        return;
+    }
+
+    if (!m_engine.resume(viewerProcess)) {
+        appendLog("! Open failed: viewer process could not be resumed.");
+        m_driver.removeProcess(viewerProcess.pid);
+        if (viewerProcess.hProcess)
+            TerminateProcess(viewerProcess.hProcess, 1);
+        if (viewerProcess.hThread)
+            CloseHandle(viewerProcess.hThread);
+        if (viewerProcess.hProcess)
+            CloseHandle(viewerProcess.hProcess);
+        return;
+    }
+
+    if (viewerProcess.hThread)
+        CloseHandle(viewerProcess.hThread);
+    if (viewerProcess.hProcess)
+        CloseHandle(viewerProcess.hProcess);
+
+    SANDBOX_PROCESS_LIST processes{};
+    if (m_driver.queryProcesses(processes))
+        refreshProcessTreeFromDriver(processes);
 }
 
 bool MainWindow::isSandboxWindow(HWND hwnd, std::wstring* boxName) const
@@ -1283,16 +1825,31 @@ bool MainWindow::isSandboxWindow(HWND hwnd, std::wstring* boxName) const
         return false;
 
     bool matched = false;
-    for (const auto& sp : m_sandboxProcs) {
+    auto matchJob = [&](const SandboxedProcess& sp) {
         if (!sp.valid || !sp.hJob)
-            continue;
+            return false;
 
         BOOL inJob = FALSE;
         if (IsProcessInJob(proc, sp.hJob, &inJob) && inJob) {
             if (boxName)
                 *boxName = sp.boxName;
+            return true;
+        }
+        return false;
+    };
+
+    for (const auto& sp : m_sandboxProcs) {
+        if (matchJob(sp)) {
             matched = true;
             break;
+        }
+    }
+    if (!matched) {
+        for (const auto& sp : m_passiveBoxSessions) {
+            if (matchJob(sp)) {
+                matched = true;
+                break;
+            }
         }
     }
 

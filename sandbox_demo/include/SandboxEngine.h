@@ -52,6 +52,7 @@ struct SandboxConfig {
     std::wstring passphrase;
     std::wstring borderDllPath;   // path to injected shell broker; empty = skip
     bool restrictUI     = true;
+    bool isolateClipboard = true;
     bool killOnClose    = true;
     bool inheritConsole = false;
 };
@@ -62,6 +63,11 @@ public:
     ~SandboxEngine();
 
     SandboxedProcess launch(const SandboxConfig& cfg);
+    SandboxedProcess createBoxSession(const SandboxConfig& cfg,
+                                      const std::wstring& fsRoot);
+    SandboxedProcess launchInExistingBox(const SandboxConfig& cfg,
+                                         HANDLE existingJob,
+                                         const std::wstring& fsRoot);
     void release(SandboxedProcess& sp);
     bool resume(SandboxedProcess& sp);
 
