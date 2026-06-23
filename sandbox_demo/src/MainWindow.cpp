@@ -1004,20 +1004,23 @@ void MainWindow::onLaunchSandboxed()
     cfg.vaultDir       = vaultDir.toStdWString();
     cfg.mountDir       = mountDir.toStdWString();
     cfg.vaultSizeMB    = vaultSizeMb;
-    if (isChromium) {
-        if (!m_hookIpc || !m_hookIpc->isListening()) {
-            appendLog("! Hook IPC broker is not listening; sandboxed Chrome launch aborted.");
-            return;
-        }
-        const QString hookDll = QDir(QCoreApplication::applicationDirPath())
-                                    .filePath(QStringLiteral("HookDll.dll"));
-        if (!QFileInfo::exists(hookDll)) {
-            appendLog("! HookDll.dll not found next to SandboxDemo.exe: " + hookDll);
+    const QString hookDll = QDir(QCoreApplication::applicationDirPath())
+                                .filePath(QStringLiteral("HookDll.dll"));
+    const bool hookReady = m_hookIpc && m_hookIpc->isListening() &&
+                           QFileInfo::exists(hookDll);
+    if (hookReady) {
+        cfg.borderDllPath = QDir::toNativeSeparators(hookDll).toStdWString();
+        appendLog("  [HookDll] Detours payload: " + QDir::toNativeSeparators(hookDll));
+        appendLog("  [Clipboard] Text clipboard is virtualized inside this box.");
+    } else {
+        if (isChromium) {
+            appendLog(!m_hookIpc || !m_hookIpc->isListening()
+                ? "! Hook IPC broker is not listening; sandboxed Chrome launch aborted."
+                : "! HookDll.dll not found next to SandboxDemo.exe: " + hookDll);
             appendLog("  Sandboxed Chrome launch aborted because Explorer suppression would be unavailable.");
             return;
         }
-        cfg.borderDllPath = QDir::toNativeSeparators(hookDll).toStdWString();
-        appendLog("  [HookDll] Detours payload: " + QDir::toNativeSeparators(hookDll));
+        appendLog("  [Clipboard] HookDll unavailable; text clipboard remains blocked by job limits.");
     }
     cfg.restrictUI     = m_chkRestrictUI->isChecked() && !isChromium;
     cfg.killOnClose    = m_chkKillOnClose->isChecked();
@@ -1735,12 +1738,10 @@ void MainWindow::onOpenSandboxFileRequested(const QString& path)
     cfg.isolateClipboard = true;
     cfg.killOnClose = false;
 
-    if (isChromiumExecutable(viewer)) {
-        const QString hookDll = QDir(QCoreApplication::applicationDirPath())
-            .filePath(QStringLiteral("HookDll.dll"));
-        if (QFileInfo::exists(hookDll)) {
-            cfg.borderDllPath = QDir::toNativeSeparators(hookDll).toStdWString();
-        }
+    const QString hookDll = QDir(QCoreApplication::applicationDirPath())
+        .filePath(QStringLiteral("HookDll.dll"));
+    if (m_hookIpc && m_hookIpc->isListening() && QFileInfo::exists(hookDll)) {
+        cfg.borderDllPath = QDir::toNativeSeparators(hookDll).toStdWString();
     }
 
     appendLog(QString("  [Explorer] Open inside box '%1': %2")
@@ -1748,6 +1749,8 @@ void MainWindow::onOpenSandboxFileRequested(const QString& path)
                        QDir::toNativeSeparators(fileInfo.absoluteFilePath())));
     appendLog(QString("  [Explorer] Viewer: %1")
                   .arg(QDir::toNativeSeparators(viewer)));
+    if (!cfg.borderDllPath.empty())
+        appendLog("  [Clipboard] Viewer text clipboard is virtualized inside this box.");
 
     SandboxedProcess viewerProcess =
         m_engine.launchInExistingBox(cfg, owner->hJob, owner->fsRoot);

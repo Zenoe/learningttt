@@ -715,7 +715,7 @@ bool SandboxEngine::spawnInJob(const SandboxConfig& cfg,
             dllPathA.c_str(),
             &usedInteractiveToken);
         if (usedInteractiveToken) {
-            log(L"[+] Elevated host: Chrome created with interactive medium-integrity token");
+            log(L"[+] Elevated host: process created with interactive medium-integrity token");
         }
         if (!ok) {
             log(L"[!] DetourCreateProcessWithDllExW failed: " +

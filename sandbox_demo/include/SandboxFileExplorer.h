@@ -7,6 +7,7 @@
 
 class QFileSystemModel;
 class QAbstractItemView;
+class QKeyEvent;
 class QModelIndex;
 class QPoint;
 
@@ -28,6 +29,9 @@ public:
 signals:
     void openRequested(const QString& filePath);
     void statusMessageRequested(const QString& message);
+
+protected:
+    void keyPressEvent(QKeyEvent* event) override;
 
 private slots:
     void onDirectorySelected(const QModelIndex& current,
@@ -60,6 +64,7 @@ private:
     void deleteSelection(const QStringList& paths);
 
     QAbstractItemView* activeContentView() const;
+    QAbstractItemView* focusedFileView() const;
     QStringList selectedPaths(QAbstractItemView* view) const;
     QString pathForIndex(const QModelIndex& index, bool directoryModel) const;
     QString currentDirectory() const;

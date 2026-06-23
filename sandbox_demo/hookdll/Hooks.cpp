@@ -23,6 +23,7 @@
 
 #include <cwctype>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -36,16 +37,36 @@ using CreateProcessWFn = BOOL (WINAPI*)(LPCWSTR, LPWSTR,
                                          LPSECURITY_ATTRIBUTES, BOOL, DWORD,
                                          LPVOID, LPCWSTR, LPSTARTUPINFOW,
                                          LPPROCESS_INFORMATION);
+using OpenClipboardFn = BOOL (WINAPI*)(HWND);
+using CloseClipboardFn = BOOL (WINAPI*)();
+using EmptyClipboardFn = BOOL (WINAPI*)();
+using SetClipboardDataFn = HANDLE (WINAPI*)(UINT, HANDLE);
+using GetClipboardDataFn = HANDLE (WINAPI*)(UINT);
+using IsClipboardFormatAvailableFn = BOOL (WINAPI*)(UINT);
+using CountClipboardFormatsFn = int (WINAPI*)();
+using EnumClipboardFormatsFn = UINT (WINAPI*)(UINT);
+using GetPriorityClipboardFormatFn = int (WINAPI*)(UINT*, int);
 
 SHOpenFn g_originalSHOpen = nullptr;
 ShellExecuteWFn g_originalShellExecuteW = nullptr;
 ShellExecuteExWFn g_originalShellExecuteExW = nullptr;
 CreateProcessWFn g_originalCreateProcessW = nullptr;
+OpenClipboardFn g_originalOpenClipboard = nullptr;
+CloseClipboardFn g_originalCloseClipboard = nullptr;
+EmptyClipboardFn g_originalEmptyClipboard = nullptr;
+SetClipboardDataFn g_originalSetClipboardData = nullptr;
+GetClipboardDataFn g_originalGetClipboardData = nullptr;
+IsClipboardFormatAvailableFn g_originalIsClipboardFormatAvailable = nullptr;
+CountClipboardFormatsFn g_originalCountClipboardFormats = nullptr;
+EnumClipboardFormatsFn g_originalEnumClipboardFormats = nullptr;
+GetPriorityClipboardFormatFn g_originalGetPriorityClipboardFormat = nullptr;
 bool g_installed = false;
 std::wstring g_downloadsLower;
+std::vector<HGLOBAL> g_localClipboardHandles;
 
 thread_local int g_hookDepth = 0;
 thread_local bool g_showMessageSent = false;
+thread_local bool g_clipboardOpen = false;
 
 struct HookScope {
     HookScope()
@@ -175,6 +196,204 @@ bool signalShowInFolder(const std::wstring& path)
     hooklog::write(L"[ipc] ShowInFolder sent=%d path=%s", sent ? 1 : 0,
                    target.empty() ? L"<unknown>" : target.c_str());
     return sent;
+}
+
+bool textClipboardFormat(UINT format)
+{
+    return format == CF_UNICODETEXT || format == CF_TEXT;
+}
+
+std::wstring wideFromClipboardHandle(UINT format, HANDLE data)
+{
+    if (!data)
+        return {};
+
+    void* locked = GlobalLock(data);
+    if (!locked)
+        return {};
+
+    std::wstring result;
+    if (format == CF_UNICODETEXT) {
+        const wchar_t* text = static_cast<const wchar_t*>(locked);
+        if (text)
+            result = text;
+    } else if (format == CF_TEXT) {
+        const char* text = static_cast<const char*>(locked);
+        if (text) {
+            const int needed = MultiByteToWideChar(CP_ACP, 0, text, -1,
+                                                   nullptr, 0);
+            if (needed > 0) {
+                result.resize(static_cast<std::size_t>(needed - 1));
+                MultiByteToWideChar(CP_ACP, 0, text, -1,
+                                    result.data(), needed);
+            }
+        }
+    }
+
+    GlobalUnlock(data);
+    return result;
+}
+
+HANDLE clipboardHandleFromWide(UINT format, const std::wstring& text)
+{
+    if (format == CF_UNICODETEXT) {
+        const SIZE_T bytes = (text.size() + 1) * sizeof(wchar_t);
+        HGLOBAL handle = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if (!handle)
+            return nullptr;
+        void* locked = GlobalLock(handle);
+        if (!locked) {
+            GlobalFree(handle);
+            return nullptr;
+        }
+        memcpy(locked, text.c_str(), bytes);
+        GlobalUnlock(handle);
+        g_localClipboardHandles.push_back(handle);
+        return handle;
+    }
+
+    if (format == CF_TEXT) {
+        const int needed = WideCharToMultiByte(CP_ACP, 0, text.c_str(), -1,
+                                               nullptr, 0, nullptr, nullptr);
+        if (needed <= 0)
+            return nullptr;
+        HGLOBAL handle = GlobalAlloc(GMEM_MOVEABLE, needed);
+        if (!handle)
+            return nullptr;
+        void* locked = GlobalLock(handle);
+        if (!locked) {
+            GlobalFree(handle);
+            return nullptr;
+        }
+        WideCharToMultiByte(CP_ACP, 0, text.c_str(), -1,
+                            static_cast<char*>(locked), needed,
+                            nullptr, nullptr);
+        GlobalUnlock(handle);
+        g_localClipboardHandles.push_back(handle);
+        return handle;
+    }
+
+    return nullptr;
+}
+
+BOOL WINAPI hookedOpenClipboard(HWND)
+{
+    HookScope scope;
+    g_clipboardOpen = true;
+    hooklog::write(L"[clipboard] OpenClipboard -> TRUE (box-local)");
+    return TRUE;
+}
+
+BOOL WINAPI hookedCloseClipboard()
+{
+    HookScope scope;
+    g_clipboardOpen = false;
+    hooklog::write(L"[clipboard] CloseClipboard -> TRUE (box-local)");
+    return TRUE;
+}
+
+BOOL WINAPI hookedEmptyClipboard()
+{
+    HookScope scope;
+    const bool ok = pipeclient::setClipboardText(L"");
+    hooklog::write(L"[clipboard] EmptyClipboard -> %d (box-local)",
+                   ok ? 1 : 0);
+    return ok ? TRUE : FALSE;
+}
+
+HANDLE WINAPI hookedSetClipboardData(UINT format, HANDLE data)
+{
+    HookScope scope;
+    if (!textClipboardFormat(format)) {
+        hooklog::write(L"[clipboard] SetClipboardData(format=%u) blocked", format);
+        SetLastError(ERROR_ACCESS_DENIED);
+        return nullptr;
+    }
+
+    const std::wstring text = wideFromClipboardHandle(format, data);
+    const bool ok = pipeclient::setClipboardText(text);
+    hooklog::write(L"[clipboard] SetClipboardData(format=%u, chars=%llu) -> %d",
+                   format,
+                   static_cast<unsigned long long>(text.size()),
+                   ok ? 1 : 0);
+    if (!ok) {
+        SetLastError(ERROR_PIPE_NOT_CONNECTED);
+        return nullptr;
+    }
+    return data;
+}
+
+HANDLE WINAPI hookedGetClipboardData(UINT format)
+{
+    HookScope scope;
+    if (!textClipboardFormat(format)) {
+        hooklog::write(L"[clipboard] GetClipboardData(format=%u) blocked", format);
+        SetLastError(ERROR_ACCESS_DENIED);
+        return nullptr;
+    }
+
+    std::wstring text;
+    if (!pipeclient::getClipboardText(text)) {
+        SetLastError(ERROR_PIPE_NOT_CONNECTED);
+        return nullptr;
+    }
+
+    HANDLE handle = clipboardHandleFromWide(format, text);
+    hooklog::write(L"[clipboard] GetClipboardData(format=%u, chars=%llu) -> 0x%p",
+                   format,
+                   static_cast<unsigned long long>(text.size()),
+                   handle);
+    if (!handle)
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+    return handle;
+}
+
+BOOL WINAPI hookedIsClipboardFormatAvailable(UINT format)
+{
+    HookScope scope;
+    const BOOL available =
+        textClipboardFormat(format) && pipeclient::hasClipboardText()
+            ? TRUE
+            : FALSE;
+    hooklog::write(L"[clipboard] IsClipboardFormatAvailable(%u) -> %d",
+                   format, available);
+    return available;
+}
+
+int WINAPI hookedCountClipboardFormats()
+{
+    HookScope scope;
+    const int count = pipeclient::hasClipboardText() ? 2 : 0;
+    hooklog::write(L"[clipboard] CountClipboardFormats -> %d", count);
+    return count;
+}
+
+UINT WINAPI hookedEnumClipboardFormats(UINT format)
+{
+    HookScope scope;
+    if (!pipeclient::hasClipboardText())
+        return 0;
+    if (format == 0)
+        return CF_UNICODETEXT;
+    if (format == CF_UNICODETEXT)
+        return CF_TEXT;
+    return 0;
+}
+
+int WINAPI hookedGetPriorityClipboardFormat(UINT* formats, int count)
+{
+    HookScope scope;
+    if (!formats || count <= 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return -1;
+    }
+    if (!pipeclient::hasClipboardText())
+        return 0;
+    for (int i = 0; i < count; ++i) {
+        if (textClipboardFormat(formats[i]))
+            return static_cast<int>(formats[i]);
+    }
+    return 0;
 }
 
 HRESULT WINAPI hookedSHOpenFolderAndSelectItems(
@@ -341,6 +560,28 @@ bool install()
             L"ShellExecuteExW");
     resolve(L"kernel32.dll", "CreateProcessW", g_originalCreateProcessW,
             L"CreateProcessW");
+    resolve(L"user32.dll", "OpenClipboard", g_originalOpenClipboard,
+            L"OpenClipboard");
+    resolve(L"user32.dll", "CloseClipboard", g_originalCloseClipboard,
+            L"CloseClipboard");
+    resolve(L"user32.dll", "EmptyClipboard", g_originalEmptyClipboard,
+            L"EmptyClipboard");
+    resolve(L"user32.dll", "SetClipboardData", g_originalSetClipboardData,
+            L"SetClipboardData");
+    resolve(L"user32.dll", "GetClipboardData", g_originalGetClipboardData,
+            L"GetClipboardData");
+    resolve(L"user32.dll", "IsClipboardFormatAvailable",
+            g_originalIsClipboardFormatAvailable,
+            L"IsClipboardFormatAvailable");
+    resolve(L"user32.dll", "CountClipboardFormats",
+            g_originalCountClipboardFormats,
+            L"CountClipboardFormats");
+    resolve(L"user32.dll", "EnumClipboardFormats",
+            g_originalEnumClipboardFormats,
+            L"EnumClipboardFormats");
+    resolve(L"user32.dll", "GetPriorityClipboardFormat",
+            g_originalGetPriorityClipboardFormat,
+            L"GetPriorityClipboardFormat");
 
     LONG result = DetourTransactionBegin();
     hooklog::write(L"[setup] DetourTransactionBegin -> %ld", result);
@@ -354,6 +595,23 @@ bool install()
     attach(g_originalShellExecuteW, hookedShellExecuteW, L"ShellExecuteW");
     attach(g_originalShellExecuteExW, hookedShellExecuteExW, L"ShellExecuteExW");
     attach(g_originalCreateProcessW, hookedCreateProcessW, L"CreateProcessW");
+    attach(g_originalOpenClipboard, hookedOpenClipboard, L"OpenClipboard");
+    attach(g_originalCloseClipboard, hookedCloseClipboard, L"CloseClipboard");
+    attach(g_originalEmptyClipboard, hookedEmptyClipboard, L"EmptyClipboard");
+    attach(g_originalSetClipboardData, hookedSetClipboardData, L"SetClipboardData");
+    attach(g_originalGetClipboardData, hookedGetClipboardData, L"GetClipboardData");
+    attach(g_originalIsClipboardFormatAvailable,
+           hookedIsClipboardFormatAvailable,
+           L"IsClipboardFormatAvailable");
+    attach(g_originalCountClipboardFormats,
+           hookedCountClipboardFormats,
+           L"CountClipboardFormats");
+    attach(g_originalEnumClipboardFormats,
+           hookedEnumClipboardFormats,
+           L"EnumClipboardFormats");
+    attach(g_originalGetPriorityClipboardFormat,
+           hookedGetPriorityClipboardFormat,
+           L"GetPriorityClipboardFormat");
 
     result = DetourTransactionCommit();
     hooklog::write(L"[setup] DetourTransactionCommit -> %ld", result);
@@ -377,9 +635,30 @@ void remove()
     detach(g_originalShellExecuteW, hookedShellExecuteW, L"ShellExecuteW");
     detach(g_originalShellExecuteExW, hookedShellExecuteExW, L"ShellExecuteExW");
     detach(g_originalCreateProcessW, hookedCreateProcessW, L"CreateProcessW");
+    detach(g_originalOpenClipboard, hookedOpenClipboard, L"OpenClipboard");
+    detach(g_originalCloseClipboard, hookedCloseClipboard, L"CloseClipboard");
+    detach(g_originalEmptyClipboard, hookedEmptyClipboard, L"EmptyClipboard");
+    detach(g_originalSetClipboardData, hookedSetClipboardData, L"SetClipboardData");
+    detach(g_originalGetClipboardData, hookedGetClipboardData, L"GetClipboardData");
+    detach(g_originalIsClipboardFormatAvailable,
+           hookedIsClipboardFormatAvailable,
+           L"IsClipboardFormatAvailable");
+    detach(g_originalCountClipboardFormats,
+           hookedCountClipboardFormats,
+           L"CountClipboardFormats");
+    detach(g_originalEnumClipboardFormats,
+           hookedEnumClipboardFormats,
+           L"EnumClipboardFormats");
+    detach(g_originalGetPriorityClipboardFormat,
+           hookedGetPriorityClipboardFormat,
+           L"GetPriorityClipboardFormat");
     const LONG result = DetourTransactionCommit();
     g_installed = false;
     hooklog::write(L"[lifecycle] hooks::remove end commit=%ld", result);
+
+    for (HGLOBAL handle : g_localClipboardHandles)
+        GlobalFree(handle);
+    g_localClipboardHandles.clear();
 }
 
 } // namespace hooks

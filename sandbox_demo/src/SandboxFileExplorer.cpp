@@ -12,6 +12,8 @@
 #include <QHeaderView>
 #include <QInputDialog>
 #include <QItemSelectionModel>
+#include <QKeyEvent>
+#include <QKeySequence>
 #include <QLineEdit>
 #include <QListView>
 #include <QMenu>
@@ -193,9 +195,17 @@ void SandboxFileExplorer::showForPath(const QString& selectedPath,
     if (!rootInfo.exists() || !rootInfo.isDir())
         return;
 
+    const QString previousRoot = m_boxRootCanonical;
+    const QString newRootCanonical = canonicalOrAbsolutePath(rootInfo.absoluteFilePath());
+    if (!previousRoot.isEmpty() &&
+        comparisonPath(previousRoot).compare(comparisonPath(newRootCanonical),
+                                             pathCaseSensitivity()) != 0) {
+        clearTransfer();
+    }
+
     m_boxName = boxName.trimmed().isEmpty() ? QStringLiteral("Box") : boxName.trimmed();
     m_boxRoot = rootInfo.absoluteFilePath();
-    m_boxRootCanonical = canonicalOrAbsolutePath(m_boxRoot);
+    m_boxRootCanonical = newRootCanonical;
     m_ui->boxTabs->setTabText(0, m_boxName);
 
     const QModelIndex root = m_directoryModel->setRootPath(m_boxRoot);
@@ -235,6 +245,39 @@ void SandboxFileExplorer::showForPath(const QString& selectedPath,
         activateWindow();
     });
 #endif
+}
+
+void SandboxFileExplorer::keyPressEvent(QKeyEvent* event)
+{
+    if (!event) {
+        QWidget::keyPressEvent(event);
+        return;
+    }
+
+    QAbstractItemView* view = focusedFileView();
+    const QStringList paths = selectedPaths(view);
+
+    if (event->matches(QKeySequence::Copy)) {
+        if (!paths.isEmpty())
+            copySelection(paths);
+        event->accept();
+        return;
+    }
+
+    if (event->matches(QKeySequence::Cut)) {
+        if (!paths.isEmpty())
+            cutSelection(paths);
+        event->accept();
+        return;
+    }
+
+    if (event->matches(QKeySequence::Paste)) {
+        pasteIntoCurrentDirectory();
+        event->accept();
+        return;
+    }
+
+    QWidget::keyPressEvent(event);
 }
 
 void SandboxFileExplorer::releasePath(const QString& rootPath)
@@ -459,17 +502,33 @@ void SandboxFileExplorer::openPath(const QString& path)
 
 void SandboxFileExplorer::cutSelection(const QStringList& paths)
 {
+    for (const QString& path : paths) {
+        if (!canModifyPath(path) || isReparsePoint(path)) {
+            showError(QStringLiteral("Cut blocked"),
+                      QStringLiteral("Only ordinary files and folders inside the current box can be cut."));
+            return;
+        }
+    }
+
     m_transferMode = TransferMode::Move;
     m_transferPaths = paths;
-    setStatus(QStringLiteral("%1 item(s) marked for move inside this box.")
+    setStatus(QStringLiteral("%1 item(s) placed on the box-local clipboard for move.")
                   .arg(paths.size()));
 }
 
 void SandboxFileExplorer::copySelection(const QStringList& paths)
 {
+    for (const QString& path : paths) {
+        if (!canUsePath(path) || isReparsePoint(path)) {
+            showError(QStringLiteral("Copy blocked"),
+                      QStringLiteral("Only ordinary files and folders inside the current box can be copied."));
+            return;
+        }
+    }
+
     m_transferMode = TransferMode::Copy;
     m_transferPaths = paths;
-    setStatus(QStringLiteral("%1 item(s) marked for copy inside this box.")
+    setStatus(QStringLiteral("%1 item(s) placed on the box-local clipboard for copy.")
                   .arg(paths.size()));
 }
 
@@ -681,6 +740,18 @@ QAbstractItemView* SandboxFileExplorer::activeContentView() const
     return m_ui->contentStack->currentWidget() == m_ui->tilesPage
         ? static_cast<QAbstractItemView*>(m_ui->tilesView)
         : static_cast<QAbstractItemView*>(m_ui->detailsView);
+}
+
+QAbstractItemView* SandboxFileExplorer::focusedFileView() const
+{
+    QWidget* focus = focusWidget();
+    if (focus == m_ui->directoryTree || m_ui->directoryTree->isAncestorOf(focus))
+        return m_ui->directoryTree;
+    if (focus == m_ui->detailsView || m_ui->detailsView->isAncestorOf(focus))
+        return m_ui->detailsView;
+    if (focus == m_ui->tilesView || m_ui->tilesView->isAncestorOf(focus))
+        return m_ui->tilesView;
+    return activeContentView();
 }
 
 QStringList SandboxFileExplorer::selectedPaths(QAbstractItemView* view) const

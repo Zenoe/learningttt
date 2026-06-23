@@ -9,6 +9,7 @@
 #include <sddl.h>
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -46,6 +47,28 @@ bool createPipeSecurityDescriptor(PSECURITY_DESCRIPTOR& descriptor)
                sddl.c_str(), SDDL_REVISION_1, &descriptor, nullptr) != FALSE;
 }
 
+void fillResponse(hookipc::Message& response,
+                  hookipc::MessageType type,
+                  const wchar_t* boxName,
+                  const std::wstring& text)
+{
+    response = {};
+    response.magic = hookipc::kMagic;
+    response.version = hookipc::kVersion;
+    response.type = static_cast<std::uint32_t>(type);
+    response.processId = GetCurrentProcessId();
+    response.threadId = GetCurrentThreadId();
+    if (boxName && boxName[0])
+        wcsncpy_s(response.boxName, boxName, hookipc::kMaxBox - 1);
+
+    const std::size_t length =
+        (std::min)(text.size(), static_cast<std::size_t>(hookipc::kMaxText - 1));
+    response.textLength = static_cast<std::uint32_t>(length);
+    if (length)
+        wmemcpy(response.text, text.data(), length);
+    response.text[length] = L'\0';
+}
+
 } // namespace
 
 HookIpcServer::HookIpcServer(QObject* parent)
@@ -72,7 +95,7 @@ HookIpcServer::HookIpcServer(QObject* parent)
 
     HANDLE pipe = CreateNamedPipeW(
         hookipc::kPipeName,
-        PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
         PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
         PIPE_UNLIMITED_INSTANCES,
         sizeof(hookipc::Message),
@@ -127,6 +150,29 @@ void HookIpcServer::run()
     HANDLE pipe = static_cast<HANDLE>(m_pipe);
     HANDLE stopEvent = static_cast<HANDLE>(m_stopEvent);
     HANDLE ioEvent = static_cast<HANDLE>(m_ioEvent);
+    std::unordered_map<std::wstring, std::wstring> textClipboardByBox;
+
+    auto writeResponse = [&](const hookipc::Message& response) {
+        OVERLAPPED writeOverlapped{};
+        ResetEvent(ioEvent);
+        writeOverlapped.hEvent = ioEvent;
+
+        BOOL writeOk = WriteFile(pipe, &response, sizeof(response),
+                                 nullptr, &writeOverlapped);
+        if (!writeOk && GetLastError() == ERROR_IO_PENDING) {
+            HANDLE waits[] = { stopEvent, ioEvent };
+            const DWORD wait = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+            if (wait == WAIT_OBJECT_0) {
+                CancelIoEx(pipe, &writeOverlapped);
+                return false;
+            }
+            DWORD written = 0;
+            writeOk = GetOverlappedResult(pipe, &writeOverlapped,
+                                          &written, FALSE);
+            return writeOk && written == sizeof(response);
+        }
+        return writeOk != FALSE;
+    };
 
     while (m_running.load()) {
         OVERLAPPED connectOverlapped{};
@@ -185,6 +231,36 @@ void HookIpcServer::run()
                 emit hookLogReceived(message.processId, message.threadId, text);
             } else if (type == hookipc::MessageType::ShowInFolder) {
                 emit showInFolderRequested(message.processId, text);
+            } else if (type == hookipc::MessageType::ClipboardSetText) {
+                const std::wstring boxName = message.boxName;
+                if (!boxName.empty()) {
+                    textClipboardByBox[boxName] =
+                        std::wstring(message.text, message.text + message.textLength);
+                }
+                hookipc::Message response{};
+                fillResponse(response, hookipc::MessageType::ClipboardStatusResponse,
+                             message.boxName,
+                             boxName.empty() ? L"0" : L"1");
+                writeResponse(response);
+            } else if (type == hookipc::MessageType::ClipboardGetText ||
+                       type == hookipc::MessageType::ClipboardHasText) {
+                const std::wstring boxName = message.boxName;
+                auto found = textClipboardByBox.find(boxName);
+                const bool hasText = found != textClipboardByBox.end() &&
+                                     !found->second.empty();
+                hookipc::Message response{};
+                if (type == hookipc::MessageType::ClipboardGetText) {
+                    fillResponse(response,
+                                 hookipc::MessageType::ClipboardTextResponse,
+                                 message.boxName,
+                                 hasText ? found->second : std::wstring());
+                } else {
+                    fillResponse(response,
+                                 hookipc::MessageType::ClipboardStatusResponse,
+                                 message.boxName,
+                                 hasText ? L"1" : L"0");
+                }
+                writeResponse(response);
             }
         } else if (m_running.load()) {
             emit serverError(QStringLiteral("Hook IPC received an invalid frame (%1 bytes, GLE=%2)")
