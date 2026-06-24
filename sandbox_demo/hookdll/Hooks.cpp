@@ -11,6 +11,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <commdlg.h>
+#include <winspool.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #if __has_include(<detours/detours.h>)
@@ -46,6 +48,25 @@ using IsClipboardFormatAvailableFn = BOOL (WINAPI*)(UINT);
 using CountClipboardFormatsFn = int (WINAPI*)();
 using EnumClipboardFormatsFn = UINT (WINAPI*)(UINT);
 using GetPriorityClipboardFormatFn = int (WINAPI*)(UINT*, int);
+using StartDocWFn = int (WINAPI*)(HDC, const DOCINFOW*);
+using StartDocAFn = int (WINAPI*)(HDC, const DOCINFOA*);
+using StartPageFn = int (WINAPI*)(HDC);
+using EndPageFn = int (WINAPI*)(HDC);
+using EndDocFn = int (WINAPI*)(HDC);
+using AbortDocFn = int (WINAPI*)(HDC);
+using OpenPrinterWFn = BOOL (WINAPI*)(LPWSTR, LPHANDLE, LPPRINTER_DEFAULTSW);
+using OpenPrinterAFn = BOOL (WINAPI*)(LPSTR, LPHANDLE, LPPRINTER_DEFAULTSA);
+using StartDocPrinterWFn = DWORD (WINAPI*)(HANDLE, DWORD, LPBYTE);
+using StartDocPrinterAFn = DWORD (WINAPI*)(HANDLE, DWORD, LPBYTE);
+using StartPagePrinterFn = BOOL (WINAPI*)(HANDLE);
+using WritePrinterFn = BOOL (WINAPI*)(HANDLE, LPVOID, DWORD, LPDWORD);
+using AddJobWFn = BOOL (WINAPI*)(HANDLE, DWORD, LPBYTE, DWORD, LPDWORD);
+using AddJobAFn = BOOL (WINAPI*)(HANDLE, DWORD, LPBYTE, DWORD, LPDWORD);
+using ScheduleJobFn = BOOL (WINAPI*)(HANDLE, DWORD);
+using PrintDlgWFn = BOOL (WINAPI*)(LPPRINTDLGW);
+using PrintDlgAFn = BOOL (WINAPI*)(LPPRINTDLGA);
+using PrintDlgExWFn = HRESULT (WINAPI*)(void*);
+using PrintDlgExAFn = HRESULT (WINAPI*)(void*);
 
 SHOpenFn g_originalSHOpen = nullptr;
 ShellExecuteWFn g_originalShellExecuteW = nullptr;
@@ -60,6 +81,25 @@ IsClipboardFormatAvailableFn g_originalIsClipboardFormatAvailable = nullptr;
 CountClipboardFormatsFn g_originalCountClipboardFormats = nullptr;
 EnumClipboardFormatsFn g_originalEnumClipboardFormats = nullptr;
 GetPriorityClipboardFormatFn g_originalGetPriorityClipboardFormat = nullptr;
+StartDocWFn g_originalStartDocW = nullptr;
+StartDocAFn g_originalStartDocA = nullptr;
+StartPageFn g_originalStartPage = nullptr;
+EndPageFn g_originalEndPage = nullptr;
+EndDocFn g_originalEndDoc = nullptr;
+AbortDocFn g_originalAbortDoc = nullptr;
+OpenPrinterWFn g_originalOpenPrinterW = nullptr;
+OpenPrinterAFn g_originalOpenPrinterA = nullptr;
+StartDocPrinterWFn g_originalStartDocPrinterW = nullptr;
+StartDocPrinterAFn g_originalStartDocPrinterA = nullptr;
+StartPagePrinterFn g_originalStartPagePrinter = nullptr;
+WritePrinterFn g_originalWritePrinter = nullptr;
+AddJobWFn g_originalAddJobW = nullptr;
+AddJobAFn g_originalAddJobA = nullptr;
+ScheduleJobFn g_originalScheduleJob = nullptr;
+PrintDlgWFn g_originalPrintDlgW = nullptr;
+PrintDlgAFn g_originalPrintDlgA = nullptr;
+PrintDlgExWFn g_originalPrintDlgExW = nullptr;
+PrintDlgExAFn g_originalPrintDlgExA = nullptr;
 bool g_installed = false;
 std::wstring g_downloadsLower;
 std::vector<HGLOBAL> g_localClipboardHandles;
@@ -396,6 +436,156 @@ int WINAPI hookedGetPriorityClipboardFormat(UINT* formats, int count)
     return 0;
 }
 
+void denyPrint(const wchar_t* api)
+{
+    hooklog::write(L"[print] %s blocked: printing is disabled inside sandbox",
+                   api ? api : L"<unknown>");
+    SetLastError(ERROR_ACCESS_DENIED);
+}
+
+int WINAPI hookedStartDocW(HDC, const DOCINFOW*)
+{
+    HookScope scope;
+    denyPrint(L"StartDocW");
+    return SP_ERROR;
+}
+
+int WINAPI hookedStartDocA(HDC, const DOCINFOA*)
+{
+    HookScope scope;
+    denyPrint(L"StartDocA");
+    return SP_ERROR;
+}
+
+int WINAPI hookedStartPage(HDC)
+{
+    HookScope scope;
+    denyPrint(L"StartPage");
+    return SP_ERROR;
+}
+
+int WINAPI hookedEndPage(HDC)
+{
+    HookScope scope;
+    denyPrint(L"EndPage");
+    return SP_ERROR;
+}
+
+int WINAPI hookedEndDoc(HDC)
+{
+    HookScope scope;
+    denyPrint(L"EndDoc");
+    return SP_ERROR;
+}
+
+int WINAPI hookedAbortDoc(HDC)
+{
+    HookScope scope;
+    denyPrint(L"AbortDoc");
+    return SP_ERROR;
+}
+
+BOOL WINAPI hookedOpenPrinterW(LPWSTR, LPHANDLE printer, LPPRINTER_DEFAULTSW)
+{
+    HookScope scope;
+    if (printer)
+        *printer = nullptr;
+    denyPrint(L"OpenPrinterW");
+    return FALSE;
+}
+
+BOOL WINAPI hookedOpenPrinterA(LPSTR, LPHANDLE printer, LPPRINTER_DEFAULTSA)
+{
+    HookScope scope;
+    if (printer)
+        *printer = nullptr;
+    denyPrint(L"OpenPrinterA");
+    return FALSE;
+}
+
+DWORD WINAPI hookedStartDocPrinterW(HANDLE, DWORD, LPBYTE)
+{
+    HookScope scope;
+    denyPrint(L"StartDocPrinterW");
+    return 0;
+}
+
+DWORD WINAPI hookedStartDocPrinterA(HANDLE, DWORD, LPBYTE)
+{
+    HookScope scope;
+    denyPrint(L"StartDocPrinterA");
+    return 0;
+}
+
+BOOL WINAPI hookedStartPagePrinter(HANDLE)
+{
+    HookScope scope;
+    denyPrint(L"StartPagePrinter");
+    return FALSE;
+}
+
+BOOL WINAPI hookedWritePrinter(HANDLE, LPVOID, DWORD, LPDWORD written)
+{
+    HookScope scope;
+    if (written)
+        *written = 0;
+    denyPrint(L"WritePrinter");
+    return FALSE;
+}
+
+BOOL WINAPI hookedAddJobW(HANDLE, DWORD, LPBYTE, DWORD, LPDWORD needed)
+{
+    HookScope scope;
+    if (needed)
+        *needed = 0;
+    denyPrint(L"AddJobW");
+    return FALSE;
+}
+
+BOOL WINAPI hookedAddJobA(HANDLE, DWORD, LPBYTE, DWORD, LPDWORD needed)
+{
+    HookScope scope;
+    if (needed)
+        *needed = 0;
+    denyPrint(L"AddJobA");
+    return FALSE;
+}
+
+BOOL WINAPI hookedScheduleJob(HANDLE, DWORD)
+{
+    HookScope scope;
+    denyPrint(L"ScheduleJob");
+    return FALSE;
+}
+
+BOOL WINAPI hookedPrintDlgW(LPPRINTDLGW)
+{
+    HookScope scope;
+    denyPrint(L"PrintDlgW");
+    return FALSE;
+}
+
+BOOL WINAPI hookedPrintDlgA(LPPRINTDLGA)
+{
+    HookScope scope;
+    denyPrint(L"PrintDlgA");
+    return FALSE;
+}
+
+HRESULT WINAPI hookedPrintDlgExW(void*)
+{
+    HookScope scope;
+    denyPrint(L"PrintDlgExW");
+    return HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED);
+}
+
+HRESULT WINAPI hookedPrintDlgExA(void*)
+{
+    HookScope scope;
+    denyPrint(L"PrintDlgExA");
+    return HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED);
+}
+
 HRESULT WINAPI hookedSHOpenFolderAndSelectItems(
     PCIDLIST_ABSOLUTE folder, UINT itemCount,
     PCUITEMID_CHILD_ARRAY items, DWORD flags)
@@ -582,6 +772,34 @@ bool install()
     resolve(L"user32.dll", "GetPriorityClipboardFormat",
             g_originalGetPriorityClipboardFormat,
             L"GetPriorityClipboardFormat");
+    resolve(L"gdi32.dll", "StartDocW", g_originalStartDocW, L"StartDocW");
+    resolve(L"gdi32.dll", "StartDocA", g_originalStartDocA, L"StartDocA");
+    resolve(L"gdi32.dll", "StartPage", g_originalStartPage, L"StartPage");
+    resolve(L"gdi32.dll", "EndPage", g_originalEndPage, L"EndPage");
+    resolve(L"gdi32.dll", "EndDoc", g_originalEndDoc, L"EndDoc");
+    resolve(L"gdi32.dll", "AbortDoc", g_originalAbortDoc, L"AbortDoc");
+    resolve(L"winspool.drv", "OpenPrinterW", g_originalOpenPrinterW,
+            L"OpenPrinterW");
+    resolve(L"winspool.drv", "OpenPrinterA", g_originalOpenPrinterA,
+            L"OpenPrinterA");
+    resolve(L"winspool.drv", "StartDocPrinterW",
+            g_originalStartDocPrinterW, L"StartDocPrinterW");
+    resolve(L"winspool.drv", "StartDocPrinterA",
+            g_originalStartDocPrinterA, L"StartDocPrinterA");
+    resolve(L"winspool.drv", "StartPagePrinter",
+            g_originalStartPagePrinter, L"StartPagePrinter");
+    resolve(L"winspool.drv", "WritePrinter", g_originalWritePrinter,
+            L"WritePrinter");
+    resolve(L"winspool.drv", "AddJobW", g_originalAddJobW, L"AddJobW");
+    resolve(L"winspool.drv", "AddJobA", g_originalAddJobA, L"AddJobA");
+    resolve(L"winspool.drv", "ScheduleJob", g_originalScheduleJob,
+            L"ScheduleJob");
+    resolve(L"comdlg32.dll", "PrintDlgW", g_originalPrintDlgW, L"PrintDlgW");
+    resolve(L"comdlg32.dll", "PrintDlgA", g_originalPrintDlgA, L"PrintDlgA");
+    resolve(L"comdlg32.dll", "PrintDlgExW", g_originalPrintDlgExW,
+            L"PrintDlgExW");
+    resolve(L"comdlg32.dll", "PrintDlgExA", g_originalPrintDlgExA,
+            L"PrintDlgExA");
 
     LONG result = DetourTransactionBegin();
     hooklog::write(L"[setup] DetourTransactionBegin -> %ld", result);
@@ -612,6 +830,28 @@ bool install()
     attach(g_originalGetPriorityClipboardFormat,
            hookedGetPriorityClipboardFormat,
            L"GetPriorityClipboardFormat");
+    attach(g_originalStartDocW, hookedStartDocW, L"StartDocW");
+    attach(g_originalStartDocA, hookedStartDocA, L"StartDocA");
+    attach(g_originalStartPage, hookedStartPage, L"StartPage");
+    attach(g_originalEndPage, hookedEndPage, L"EndPage");
+    attach(g_originalEndDoc, hookedEndDoc, L"EndDoc");
+    attach(g_originalAbortDoc, hookedAbortDoc, L"AbortDoc");
+    attach(g_originalOpenPrinterW, hookedOpenPrinterW, L"OpenPrinterW");
+    attach(g_originalOpenPrinterA, hookedOpenPrinterA, L"OpenPrinterA");
+    attach(g_originalStartDocPrinterW, hookedStartDocPrinterW,
+           L"StartDocPrinterW");
+    attach(g_originalStartDocPrinterA, hookedStartDocPrinterA,
+           L"StartDocPrinterA");
+    attach(g_originalStartPagePrinter, hookedStartPagePrinter,
+           L"StartPagePrinter");
+    attach(g_originalWritePrinter, hookedWritePrinter, L"WritePrinter");
+    attach(g_originalAddJobW, hookedAddJobW, L"AddJobW");
+    attach(g_originalAddJobA, hookedAddJobA, L"AddJobA");
+    attach(g_originalScheduleJob, hookedScheduleJob, L"ScheduleJob");
+    attach(g_originalPrintDlgW, hookedPrintDlgW, L"PrintDlgW");
+    attach(g_originalPrintDlgA, hookedPrintDlgA, L"PrintDlgA");
+    attach(g_originalPrintDlgExW, hookedPrintDlgExW, L"PrintDlgExW");
+    attach(g_originalPrintDlgExA, hookedPrintDlgExA, L"PrintDlgExA");
 
     result = DetourTransactionCommit();
     hooklog::write(L"[setup] DetourTransactionCommit -> %ld", result);
@@ -652,6 +892,28 @@ void remove()
     detach(g_originalGetPriorityClipboardFormat,
            hookedGetPriorityClipboardFormat,
            L"GetPriorityClipboardFormat");
+    detach(g_originalStartDocW, hookedStartDocW, L"StartDocW");
+    detach(g_originalStartDocA, hookedStartDocA, L"StartDocA");
+    detach(g_originalStartPage, hookedStartPage, L"StartPage");
+    detach(g_originalEndPage, hookedEndPage, L"EndPage");
+    detach(g_originalEndDoc, hookedEndDoc, L"EndDoc");
+    detach(g_originalAbortDoc, hookedAbortDoc, L"AbortDoc");
+    detach(g_originalOpenPrinterW, hookedOpenPrinterW, L"OpenPrinterW");
+    detach(g_originalOpenPrinterA, hookedOpenPrinterA, L"OpenPrinterA");
+    detach(g_originalStartDocPrinterW, hookedStartDocPrinterW,
+           L"StartDocPrinterW");
+    detach(g_originalStartDocPrinterA, hookedStartDocPrinterA,
+           L"StartDocPrinterA");
+    detach(g_originalStartPagePrinter, hookedStartPagePrinter,
+           L"StartPagePrinter");
+    detach(g_originalWritePrinter, hookedWritePrinter, L"WritePrinter");
+    detach(g_originalAddJobW, hookedAddJobW, L"AddJobW");
+    detach(g_originalAddJobA, hookedAddJobA, L"AddJobA");
+    detach(g_originalScheduleJob, hookedScheduleJob, L"ScheduleJob");
+    detach(g_originalPrintDlgW, hookedPrintDlgW, L"PrintDlgW");
+    detach(g_originalPrintDlgA, hookedPrintDlgA, L"PrintDlgA");
+    detach(g_originalPrintDlgExW, hookedPrintDlgExW, L"PrintDlgExW");
+    detach(g_originalPrintDlgExA, hookedPrintDlgExA, L"PrintDlgExA");
     const LONG result = DetourTransactionCommit();
     g_installed = false;
     hooklog::write(L"[lifecycle] hooks::remove end commit=%ld", result);
