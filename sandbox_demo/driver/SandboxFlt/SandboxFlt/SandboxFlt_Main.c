@@ -36,6 +36,12 @@ static const FLT_OPERATION_REGISTRATION c_Callbacks[] = {
         SandboxFlt_PostSetInformation
     },
     {
+        IRP_MJ_QUERY_INFORMATION,
+        0,
+        SandboxFlt_PreQueryInformation,
+        NULL
+    },
+    {
         IRP_MJ_DIRECTORY_CONTROL,
         0,
         SandboxFlt_PreDirectoryControl,
