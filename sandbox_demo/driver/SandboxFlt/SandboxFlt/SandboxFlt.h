@@ -131,6 +131,19 @@ SandboxFlt_PostCreate(
     _In_     FLT_POST_OPERATION_FLAGS        Flags);
 
 FLT_PREOP_CALLBACK_STATUS
+SandboxFlt_PreSetInformation(
+    _Inout_  PFLT_CALLBACK_DATA              Data,
+    _In_     PCFLT_RELATED_OBJECTS           FltObjects,
+    _Outptr_result_maybenull_ PVOID* CompletionContext);
+
+FLT_POSTOP_CALLBACK_STATUS
+SandboxFlt_PostSetInformation(
+    _Inout_  PFLT_CALLBACK_DATA              Data,
+    _In_     PCFLT_RELATED_OBJECTS           FltObjects,
+    _In_opt_ PVOID                           CompletionContext,
+    _In_     FLT_POST_OPERATION_FLAGS        Flags);
+
+FLT_PREOP_CALLBACK_STATUS
 SandboxFlt_PreDirectoryControl(
     _Inout_  PFLT_CALLBACK_DATA              Data,
     _In_     PCFLT_RELATED_OBJECTS           FltObjects,
@@ -240,6 +253,7 @@ VOID PidBitmap_OnRemove(_In_ ULONG Pid);
 NTSTATUS Filter_SetProcContext(_In_ ULONG Pid, _In_ PBOX_ENTRY Box);
 VOID     Filter_ClearProcContext(_In_ ULONG Pid);
 PBOX_ENTRY Filter_GetProcContext(_In_ ULONG Pid);
+VOID     Filter_InitRuntimeState(VOID);
 
 // Global active-box counter (Tier 0)
 extern volatile LONG g_AnyBoxActive;

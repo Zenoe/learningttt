@@ -30,6 +30,12 @@ static const FLT_OPERATION_REGISTRATION c_Callbacks[] = {
         SandboxFlt_PostCreate
     },
     {
+        IRP_MJ_SET_INFORMATION,
+        0,
+        SandboxFlt_PreSetInformation,
+        SandboxFlt_PostSetInformation
+    },
+    {
         IRP_MJ_DIRECTORY_CONTROL,
         0,
         SandboxFlt_PreDirectoryControl,
@@ -78,6 +84,7 @@ DriverEntry(
     g_Sandbox.DriverObject = DriverObject;
     InitializeListHead(&g_Sandbox.BoxList);
     InitializeListHead(&g_Sandbox.PidList);
+    Filter_InitRuntimeState();
 
     // Initialize ERESOURCE locks
     status = ExInitializeResourceLite(&g_Sandbox.BoxLock);
