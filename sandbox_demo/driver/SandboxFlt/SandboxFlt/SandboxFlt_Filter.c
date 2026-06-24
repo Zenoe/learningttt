@@ -147,6 +147,11 @@
 #include "SandboxFlt.h"
 #include <wdm.h>
 
+NTKERNELAPI
+PUCHAR
+PsGetProcessImageFileName(
+    _In_ PEPROCESS Process);
+
 #ifndef SANDBOXFLT_TRACE_REDIRECTS
 #define SANDBOXFLT_TRACE_REDIRECTS 0
 #endif
@@ -321,6 +326,31 @@ static ULONG Hash_Unicode(_In_ PC_UNICODE_STRING Text, _In_ ULONG Seed)
     if (hash == CACHE_EMPTY_KEY)
         hash = 2166136261u;
     return hash;
+}
+
+static CHAR Ascii_Upcase(_In_ CHAR ch)
+{
+    if (ch >= 'a' && ch <= 'z')
+        return (CHAR)(ch - ('a' - 'A'));
+    return ch;
+}
+
+static BOOLEAN CurrentProcess_IsWinword(VOID)
+{
+    static const CHAR kWinword[] = "WINWORD.EXE";
+    PUCHAR imageName;
+    ULONG i;
+
+    imageName = PsGetProcessImageFileName(PsGetCurrentProcess());
+    if (!imageName)
+        return FALSE;
+
+    for (i = 0; kWinword[i] != '\0'; i++) {
+        if (Ascii_Upcase((CHAR)imageName[i]) != kWinword[i])
+            return FALSE;
+    }
+
+    return (BOOLEAN)(imageName[i] == '\0');
 }
 
 // 这两个数字是 FNV-1a 哈希算法 中定义的两个核心常量：
@@ -2268,6 +2298,9 @@ SandboxFlt_PreQueryInformation(
     if (KeGetCurrentIrql() != PASSIVE_LEVEL)
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
+    if (!CurrentProcess_IsWinword())
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
     box = Filter_GetCurrentBox();
     if (!box || !box->RedirectReads)
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
@@ -2376,6 +2409,9 @@ SandboxFlt_PreSetInformation(
     if (!SetInfo_IsRenameOrLink(infoClass) &&
         !SetInfo_IsDisposition(infoClass) &&
         !SetInfo_IsBasic(infoClass))
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
+    if (!CurrentProcess_IsWinword())
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
     box = Filter_GetCurrentBox();
