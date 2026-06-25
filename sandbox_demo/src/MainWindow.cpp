@@ -160,7 +160,7 @@ static constexpr int kBorderThickness = 4;
 struct HostBorderEntry {
     HWND target = nullptr;
     HWND overlay = nullptr;
-    bool hoverTitle = false;
+    bool hoverWindow = false;
     bool moving = false;
 };
 
@@ -240,7 +240,7 @@ static bool IsHostCaptionHit(LRESULT hit)
         hit == HTMAXBUTTON || hit == HTCLOSE || hit == HTHELP;
 }
 
-static bool IsCursorOverHostTitle(HWND target)
+static bool IsCursorOverHostWindow(HWND target)
 {
     if (!IsWindow(target) || !IsWindowVisible(target) || IsIconic(target))
         return false;
@@ -260,10 +260,14 @@ static bool IsCursorOverHostTitle(HWND target)
         25,
         &hit)) {
         return false;
+        
     }
+    
+	return IsHostCaptionHit((LRESULT)hit);
 
-    return IsHostCaptionHit((LRESULT)hit);
+    //return true;
 }
+
 
 static void RepositionHostBorder(HWND overlay, HWND target, bool show)
 {
@@ -284,9 +288,9 @@ static void RepositionHostBorder(HWND overlay, HWND target, bool show)
 
 static void SyncHostBorder(HostBorderEntry& entry)
 {
-    entry.hoverTitle = IsCursorOverHostTitle(entry.target);
+    entry.hoverWindow = IsCursorOverHostWindow(entry.target);
     RepositionHostBorder(entry.overlay, entry.target,
-        entry.hoverTitle || entry.moving);
+        entry.hoverWindow || entry.moving);
 }
 
 static void RefreshHostBorderVisibility()
@@ -321,7 +325,7 @@ static void CALLBACK HostBorderWinEventProc(
         SyncHostBorder(*entry);
         break;
     case EVENT_OBJECT_LOCATIONCHANGE:
-        if (entry->moving || entry->hoverTitle)
+        if (entry->moving || entry->hoverWindow)
             SyncHostBorder(*entry);
         break;
     case EVENT_OBJECT_HIDE:
@@ -383,6 +387,7 @@ static HWND EnsureHostBorder(HWND target)
     SyncHostBorder(g_hostBorders.back());
     return overlay;
 }
+
 
 static void PrefixHostWindowTitle(HWND hwnd, const std::wstring& boxName)
 {
@@ -590,9 +595,9 @@ void MainWindow::setupUi()
     //m_exePath->setText("C:\\Windows\\notepad.exe");
     m_exePath = makeCombo(mono);
     m_exePath->addItems({
-    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+   "C:\\Users\\admin\\AppData\\Local\\Kingsoft\\WPS Office\\ksolaunch.exe",
+	"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
     "C:\\Windows\\notepad.exe",
-    "C:\\Users\\admin\\AppData\\Local\\Chromium\\Application\\chrome.exe",
     "C:\\Program Files\\Microsoft Office\\root\\Office16\\WINWORD.EXE",
     "C:\\Program Files\\Microsoft Office\\root\\Office16\\EXCEL.EXE",
     "C:\\Windows\\System32\\cmd.exe"
@@ -1810,8 +1815,13 @@ bool MainWindow::isSandboxWindow(HWND hwnd, std::wstring* boxName) const
 
     LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
     LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    if (!(style & WS_CAPTION)) return false;
+    //if (!(style & WS_CAPTION)) return false;
+    if (style & WS_CHILD) return false;
     if (exStyle & WS_EX_TOOLWINDOW) return false;
+
+    RECT rc{};
+    if (!GetWindowRect(hwnd, &rc)) return false;
+    if (rc.right - rc.left < 160 || rc.bottom - rc.top < 100) return false;
 
     wchar_t cls[64]{};
     GetClassNameW(hwnd, cls, 64);
@@ -1839,7 +1849,7 @@ bool MainWindow::isSandboxWindow(HWND hwnd, std::wstring* boxName) const
             return true;
         }
         return false;
-    };
+        };
 
     for (const auto& sp : m_sandboxProcs) {
         if (matchJob(sp)) {
@@ -1859,6 +1869,7 @@ bool MainWindow::isSandboxWindow(HWND hwnd, std::wstring* boxName) const
     CloseHandle(proc);
     return matched;
 }
+
 
 void MainWindow::updateSandboxWindowBorders()
 {
