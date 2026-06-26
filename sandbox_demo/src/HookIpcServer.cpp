@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <sddl.h>
 
+#include <algorithm>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -67,6 +68,50 @@ void fillResponse(hookipc::Message& response,
     if (length)
         wmemcpy(response.text, text.data(), length);
     response.text[length] = L'\0';
+}
+
+std::wstring readHostClipboardText()
+{
+    if (!OpenClipboard(nullptr))
+        return {};
+
+    std::wstring result;
+    HANDLE data = nullptr;
+    UINT format = 0;
+    if (IsClipboardFormatAvailable(CF_UNICODETEXT)) {
+        format = CF_UNICODETEXT;
+        data = GetClipboardData(CF_UNICODETEXT);
+    } else if (IsClipboardFormatAvailable(CF_TEXT)) {
+        format = CF_TEXT;
+        data = GetClipboardData(CF_TEXT);
+    }
+
+    if (data) {
+        void* locked = GlobalLock(data);
+        if (locked && format == CF_UNICODETEXT) {
+            result = static_cast<const wchar_t*>(locked);
+        } else if (locked && format == CF_TEXT) {
+            const char* text = static_cast<const char*>(locked);
+            const int needed = MultiByteToWideChar(CP_ACP, 0, text, -1,
+                                                   nullptr, 0);
+            if (needed > 0) {
+                result.resize(static_cast<std::size_t>(needed - 1));
+                MultiByteToWideChar(CP_ACP, 0, text, -1,
+                                    result.data(), needed);
+            }
+        }
+        if (locked)
+            GlobalUnlock(data);
+    }
+
+    CloseClipboard();
+    return result;
+}
+
+bool hostClipboardHasText()
+{
+    return IsClipboardFormatAvailable(CF_UNICODETEXT) ||
+           IsClipboardFormatAvailable(CF_TEXT);
 }
 
 } // namespace
@@ -246,14 +291,22 @@ void HookIpcServer::run()
                        type == hookipc::MessageType::ClipboardHasText) {
                 const std::wstring boxName = message.boxName;
                 auto found = textClipboardByBox.find(boxName);
-                const bool hasText = found != textClipboardByBox.end() &&
-                                     !found->second.empty();
+                const bool hasLocalClipboard = found != textClipboardByBox.end();
+                const bool requestText =
+                    type == hookipc::MessageType::ClipboardGetText;
+                const std::wstring importedText =
+                    hasLocalClipboard || !requestText
+                        ? std::wstring()
+                        : readHostClipboardText();
+                const bool hasText = hasLocalClipboard
+                    ? !found->second.empty()
+                    : (requestText ? !importedText.empty() : hostClipboardHasText());
                 hookipc::Message response{};
                 if (type == hookipc::MessageType::ClipboardGetText) {
                     fillResponse(response,
                                  hookipc::MessageType::ClipboardTextResponse,
                                  message.boxName,
-                                 hasText ? found->second : std::wstring());
+                                 hasLocalClipboard ? found->second : importedText);
                 } else {
                     fillResponse(response,
                                  hookipc::MessageType::ClipboardStatusResponse,
