@@ -49,6 +49,16 @@ static bool isChromiumExecutable(const QString& path)
            lower.contains(QStringLiteral("brave"));
 }
 
+static QString chromiumProfileDirName(const QString& path)
+{
+    const QString lower = QFileInfo(path).fileName().toLower();
+    if (lower.contains(QStringLiteral("msedge")))
+        return QStringLiteral("edge");
+    if (lower.contains(QStringLiteral("brave")))
+        return QStringLiteral("brave");
+    return QStringLiteral("chrome");
+}
+
 static bool isConsoleExecutable(const QString& path)
 {
     const QString name = QFileInfo(path).fileName().toLower();
@@ -922,9 +932,10 @@ void MainWindow::onLaunchNormal()
         }
 
         const QString profile = QDir(QDir::tempPath()).filePath(
-            QStringLiteral("SandboxDemo/NormalChrome/p%1"));
+            QStringLiteral("SandboxDemo/Profile/%1")
+                .arg(chromiumProfileDirName(exe)));
         if (!QDir().mkpath(profile)) {
-            appendLog("! Failed to create isolated normal Chrome profile: " + profile);
+            appendLog("! Failed to create isolated normal browser profile: " + profile);
             return;
         }
         cmd += L" --user-data-dir=\"" +
@@ -960,9 +971,9 @@ void MainWindow::onLaunchNormal()
         appendLog("  [HookDll] Detours payload: " +
                   QDir::toNativeSeparators(hookDll));
         if (usedInteractiveToken) {
-            appendLog("  [Chrome] Elevated host: launched with interactive medium-integrity token.");
+            appendLog("  [Browser] Elevated host: launched with interactive medium-integrity token.");
         }
-        appendLog("  [Chrome] Isolated normal profile: " +
+        appendLog("  [Browser] Isolated normal profile: " +
                   QDir::toNativeSeparators(profile));
     } else {
         launched = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr,

@@ -58,6 +58,17 @@ static bool isChromiumFamilyPath(std::wstring path)
         path.find(L"brave") != std::wstring::npos;
 }
 
+static std::wstring chromiumProfileDirName(const std::wstring& path)
+{
+    std::wstring name = fs::path(path).filename().wstring();
+    std::transform(name.begin(), name.end(), name.begin(), ::towlower);
+    if (name.find(L"msedge") != std::wstring::npos)
+        return L"edge";
+    if (name.find(L"brave") != std::wstring::npos)
+        return L"brave";
+    return L"chrome";
+}
+
 static std::string utf8FromWide(const std::wstring& text)
 {
     if (text.empty()) return {};
@@ -672,7 +683,8 @@ bool SandboxEngine::spawnInJob(const SandboxConfig& cfg,
     // points at out.fsRoot\Profile, the minifilter redirects it again into a
     // nested path and Chrome exits during early profile initialization.
     if (isChromiumFamilyPath(cfg.executablePath)) {
-        cmdLine += L" --user-data-dir=\"" + out.fsRoot + L"\\drive\\Profile\"";
+        cmdLine += L" --user-data-dir=\"" + out.fsRoot + L"\\drive\\Profile\\" +
+                   chromiumProfileDirName(cfg.executablePath) + L"\"";
         cmdLine += L" --no-first-run";
         cmdLine += L" --disable-background-networking";
         cmdLine += L" --no-sandbox";
@@ -788,7 +800,9 @@ std::wstring SandboxEngine::prepareFsRootAt(const std::wstring& root)
     fs::create_directories(fs::path(root + L"\\drive\\C"), ec);
     fs::create_directories(fs::path(root + L"\\drive\\Downloads"), ec);
     fs::create_directories(fs::path(root + L"\\drive\\Profile"), ec);
-    fs::create_directories(fs::path(root + L"\\drive\\Profile\\Default"), ec);
+    fs::create_directories(fs::path(root + L"\\drive\\Profile\\chrome\\Default"), ec);
+    fs::create_directories(fs::path(root + L"\\drive\\Profile\\edge\\Default"), ec);
+    fs::create_directories(fs::path(root + L"\\drive\\Profile\\brave\\Default"), ec);
     fs::create_directories(fs::path(root + L"\\RegHive"), ec);
     fs::create_directories(fs::path(root + L"\\Profile"), ec);
 
@@ -798,7 +812,12 @@ std::wstring SandboxEngine::prepareFsRootAt(const std::wstring& root)
         root + L"\\drive\\C",
         root + L"\\drive\\Downloads",
         root + L"\\drive\\Profile",
-        root + L"\\drive\\Profile\\Default",
+        root + L"\\drive\\Profile\\chrome",
+        root + L"\\drive\\Profile\\chrome\\Default",
+        root + L"\\drive\\Profile\\edge",
+        root + L"\\drive\\Profile\\edge\\Default",
+        root + L"\\drive\\Profile\\brave",
+        root + L"\\drive\\Profile\\brave\\Default",
         root + L"\\RegHive",
         root + L"\\Profile"
     }) {
@@ -809,8 +828,10 @@ std::wstring SandboxEngine::prepareFsRootAt(const std::wstring& root)
         }
     }
 
-    {
-        fs::path prefsPath(root + L"\\drive\\Profile\\Default\\Preferences");
+    for (const auto& browserProfile : { L"chrome", L"edge", L"brave" }) {
+        fs::path prefsPath(root + L"\\drive\\Profile\\" +
+                           std::wstring(browserProfile) +
+                           L"\\Default\\Preferences");
         std::ofstream prefs(prefsPath, std::ios::binary | std::ios::trunc);
         if (prefs) {
             std::string downloads = jsonEscape(
