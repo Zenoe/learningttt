@@ -11,5 +11,8 @@ bool clearClipboard(const std::wstring& boxName);
 bool getClipboardText(const std::wstring& boxName, std::wstring& text,
                       bool& hasText);
 bool hasClipboardText(const std::wstring& boxName, bool& hasText);
+bool getSystemClipboardText(const std::wstring& boxName, std::wstring& text,
+                            bool& hasText);
+bool hasSystemClipboardText(const std::wstring& boxName, bool& hasText);
 
 } // namespace pipeclient

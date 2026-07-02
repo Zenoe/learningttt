@@ -20,6 +20,8 @@ enum class MessageType : std::uint32_t {
     ClipboardHasText = 6,
     ClipboardTextResponse = 7,
     ClipboardStatusResponse = 8,
+    ClipboardGetSystemText = 9,
+    ClipboardHasSystemText = 10,
 };
 
 struct Message {
@@ -51,7 +53,9 @@ inline bool isValid(const Message& message, std::uint32_t bytesRead)
            type == MessageType::ClipboardGetText ||
            type == MessageType::ClipboardHasText ||
            type == MessageType::ClipboardTextResponse ||
-           type == MessageType::ClipboardStatusResponse;
+           type == MessageType::ClipboardStatusResponse ||
+           type == MessageType::ClipboardGetSystemText ||
+           type == MessageType::ClipboardHasSystemText;
 }
 
 } // namespace hookipc

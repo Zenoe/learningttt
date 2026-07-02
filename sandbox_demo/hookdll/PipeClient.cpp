@@ -166,4 +166,34 @@ bool hasClipboardText(const std::wstring& boxName, bool& hasText)
     return true;
 }
 
+bool getSystemClipboardText(const std::wstring& boxName, std::wstring& text,
+                            bool& hasText)
+{
+    hookipc::Message response{};
+    if (!sendRequest(hookipc::MessageType::ClipboardGetSystemText, boxName, {},
+                     response) ||
+        static_cast<hookipc::MessageType>(response.type) !=
+            hookipc::MessageType::ClipboardTextResponse) {
+        return false;
+    }
+
+    hasText = response.result != 0;
+    text.assign(response.text, response.text + response.textLength);
+    return true;
+}
+
+bool hasSystemClipboardText(const std::wstring& boxName, bool& hasText)
+{
+    hookipc::Message response{};
+    if (!sendRequest(hookipc::MessageType::ClipboardHasSystemText, boxName, {},
+                     response) ||
+        static_cast<hookipc::MessageType>(response.type) !=
+            hookipc::MessageType::ClipboardStatusResponse) {
+        return false;
+    }
+
+    hasText = response.result != 0;
+    return true;
+}
+
 } // namespace pipeclient

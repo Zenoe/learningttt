@@ -35,12 +35,12 @@ bool createPipeSecurityDescriptor(PSECURITY_DESCRIPTOR& descriptor)
     if (!ConvertSidToStringSidW(tokenUser->User.Sid, &sidText))
         return false;
 
-    // Same user and SYSTEM get full access. The explicit medium mandatory
-    // label permits a medium-integrity Chrome browser to write to a pipe owned
-    // by an elevated SandboxDemo process.
+    // Same user and SYSTEM get full access. The explicit low mandatory label
+    // permits low-integrity browser children on Win10 to reach the broker while
+    // the DACL still limits access to this user and SYSTEM.
     const std::wstring sddl =
         L"D:P(A;;GA;;;" + std::wstring(sidText) +
-        L")(A;;GA;;;SY)S:(ML;;NW;;;ME)";
+        L")(A;;GA;;;SY)S:(ML;;NW;;;LW)";
     LocalFree(sidText);
 
     return ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -72,6 +72,75 @@ void fillResponse(hookipc::Message& response,
     if (textLength > 0)
         wmemcpy(response.text, text.data(), textLength);
     response.text[textLength] = L'\0';
+}
+
+std::wstring textFromClipboardHandle(HANDLE data, UINT format)
+{
+    if (!data)
+        return {};
+
+    const SIZE_T size = GlobalSize(data);
+    void* locked = GlobalLock(data);
+    if (!locked)
+        return {};
+
+    std::wstring result;
+    if (format == CF_UNICODETEXT) {
+        const wchar_t* text = static_cast<const wchar_t*>(locked);
+        const std::size_t maxChars = size / sizeof(wchar_t);
+        std::size_t length = 0;
+        while (length < maxChars && text[length] != L'\0')
+            ++length;
+        result.assign(text, text + length);
+    } else if (format == CF_TEXT) {
+        const char* text = static_cast<const char*>(locked);
+        std::size_t length = 0;
+        while (length < size && text[length] != '\0')
+            ++length;
+        if (length > 0) {
+            const int needed = MultiByteToWideChar(
+                CP_ACP, 0, text, static_cast<int>(length), nullptr, 0);
+            if (needed > 0) {
+                result.resize(static_cast<std::size_t>(needed));
+                MultiByteToWideChar(CP_ACP, 0, text, static_cast<int>(length),
+                                    result.data(), needed);
+            }
+        }
+    }
+
+    GlobalUnlock(data);
+    return result;
+}
+
+bool readSystemClipboardText(std::wstring& text)
+{
+    text.clear();
+    bool opened = false;
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        if (OpenClipboard(nullptr)) {
+            opened = true;
+            break;
+        }
+        Sleep(10);
+    }
+    if (!opened)
+        return false;
+
+    bool hasText = false;
+    HANDLE data = GetClipboardData(CF_UNICODETEXT);
+    if (data) {
+        text = textFromClipboardHandle(data, CF_UNICODETEXT);
+        hasText = true;
+    } else {
+        data = GetClipboardData(CF_TEXT);
+        if (data) {
+            text = textFromClipboardHandle(data, CF_TEXT);
+            hasText = true;
+        }
+    }
+
+    CloseClipboard();
+    return hasText;
 }
 
 } // namespace
@@ -159,6 +228,22 @@ bool HookIpcServer::handleClipboardMessage(const hookipc::Message& message,
         return false;
 
     const std::wstring text(message.text, message.text + message.textLength);
+
+    if (type == hookipc::MessageType::ClipboardGetSystemText) {
+        std::wstring systemText;
+        const bool hasText = readSystemClipboardText(systemText);
+        fillResponse(response, hookipc::MessageType::ClipboardTextResponse,
+                     boxName, systemText, hasText);
+        return true;
+    }
+
+    if (type == hookipc::MessageType::ClipboardHasSystemText) {
+        std::wstring systemText;
+        const bool hasText = readSystemClipboardText(systemText);
+        fillResponse(response, hookipc::MessageType::ClipboardStatusResponse,
+                     boxName, {}, hasText);
+        return true;
+    }
 
     std::lock_guard<std::mutex> lock(m_clipboardMutex);
     if (type == hookipc::MessageType::ClipboardSetText) {

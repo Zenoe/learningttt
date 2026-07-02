@@ -207,9 +207,11 @@ bool hasPrivateClipboardText(bool& hasText)
 
 bool systemClipboardHasTextFormat(UINT format)
 {
-    return textClipboardFormat(format) &&
-           g_originalIsClipboardFormatAvailable &&
-           g_originalIsClipboardFormatAvailable(format) != FALSE;
+    if (!textClipboardFormat(format))
+        return false;
+
+    bool hasText = false;
+    return pipeclient::hasSystemClipboardText(g_boxName, hasText) && hasText;
 }
 
 int systemTextClipboardFormatCount()
@@ -242,20 +244,17 @@ UINT nextSystemTextClipboardFormat(UINT format)
 
 HGLOBAL getSystemClipboardText(UINT format)
 {
-    if (!g_originalOpenClipboard || !g_originalGetClipboardData ||
-        !g_originalCloseClipboard)
+    if (!textClipboardFormat(format))
         return nullptr;
 
-    if (!g_originalOpenClipboard(nullptr))
+    std::wstring text;
+    bool hasText = false;
+    if (!pipeclient::getSystemClipboardText(g_boxName, text, hasText) ||
+        !hasText) {
         return nullptr;
+    }
 
-    HGLOBAL result = nullptr;
-    HANDLE systemData = g_originalGetClipboardData(format);
-    const std::wstring text = textFromClipboardHandle(systemData, format);
-    if (systemData)
-        result = allocateClipboardText(text, format);
-    g_originalCloseClipboard();
-    return result;
+    return allocateClipboardText(text, format);
 }
 
 void freeFakeClipboardHandles()
@@ -608,9 +607,7 @@ BOOL WINAPI hookedIsClipboardFormatAvailable(UINT format)
     bool hasText = false;
     if (hasPrivateClipboardText(hasText) && hasText)
         return TRUE;
-    return g_originalIsClipboardFormatAvailable
-        ? g_originalIsClipboardFormatAvailable(format)
-        : FALSE;
+    return systemClipboardHasTextFormat(format) ? TRUE : FALSE;
 }
 
 int WINAPI hookedGetPriorityClipboardFormat(UINT* priorityList, int count)
@@ -629,9 +626,11 @@ int WINAPI hookedGetPriorityClipboardFormat(UINT* priorityList, int count)
         return -1;
     }
 
-    return g_originalGetPriorityClipboardFormat
-        ? g_originalGetPriorityClipboardFormat(priorityList, count)
-        : 0;
+    for (int i = 0; i < count; ++i) {
+        if (systemClipboardHasTextFormat(priorityList[i]))
+            return static_cast<int>(priorityList[i]);
+    }
+    return -1;
 }
 
 int WINAPI hookedCountClipboardFormats()
