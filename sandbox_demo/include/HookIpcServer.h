@@ -6,6 +6,7 @@
 #include <QString>
 
 #include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -27,6 +28,11 @@ signals:
     void serverError(const QString& message);
 
 private:
+    struct ClipboardState {
+        std::wstring text;
+        std::uint32_t systemSequenceAtSet = 0;
+    };
+
     void run();
     bool handleClipboardMessage(const hookipc::Message& message,
                                 hookipc::Message& response);
@@ -38,5 +44,5 @@ private:
     std::atomic_bool m_running{false};
     std::atomic_bool m_listening{false};
     std::mutex m_clipboardMutex;
-    std::unordered_map<std::wstring, std::wstring> m_clipboardTextByBox;
+    std::unordered_map<std::wstring, ClipboardState> m_clipboardByBox;
 };

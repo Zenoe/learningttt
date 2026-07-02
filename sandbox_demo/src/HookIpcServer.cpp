@@ -245,34 +245,71 @@ bool HookIpcServer::handleClipboardMessage(const hookipc::Message& message,
         return true;
     }
 
-    std::lock_guard<std::mutex> lock(m_clipboardMutex);
     if (type == hookipc::MessageType::ClipboardSetText) {
-        m_clipboardTextByBox[boxName] = text;
+        std::lock_guard<std::mutex> lock(m_clipboardMutex);
+        m_clipboardByBox[boxName] = ClipboardState{
+            text,
+            GetClipboardSequenceNumber()
+        };
         fillResponse(response, hookipc::MessageType::ClipboardStatusResponse,
                      boxName, {}, true);
         return true;
     }
 
     if (type == hookipc::MessageType::ClipboardClear) {
-        m_clipboardTextByBox.erase(boxName);
+        std::lock_guard<std::mutex> lock(m_clipboardMutex);
+        m_clipboardByBox.erase(boxName);
         fillResponse(response, hookipc::MessageType::ClipboardStatusResponse,
                      boxName, {}, true);
         return true;
     }
 
     if (type == hookipc::MessageType::ClipboardHasText) {
-        const bool hasText = m_clipboardTextByBox.find(boxName) !=
-            m_clipboardTextByBox.end();
+        ClipboardState state;
+        bool hasPrivate = false;
+        {
+            std::lock_guard<std::mutex> lock(m_clipboardMutex);
+            const auto it = m_clipboardByBox.find(boxName);
+            hasPrivate = it != m_clipboardByBox.end();
+            if (hasPrivate)
+                state = it->second;
+        }
+
+        bool hasText = hasPrivate;
+        if (!hasPrivate ||
+            GetClipboardSequenceNumber() != state.systemSequenceAtSet) {
+            std::wstring systemText;
+            if (readSystemClipboardText(systemText))
+                hasText = true;
+        }
         fillResponse(response, hookipc::MessageType::ClipboardStatusResponse,
                      boxName, {}, hasText);
         return true;
     }
 
     if (type == hookipc::MessageType::ClipboardGetText) {
-        const auto it = m_clipboardTextByBox.find(boxName);
-        const bool hasText = it != m_clipboardTextByBox.end();
+        ClipboardState state;
+        bool hasPrivate = false;
+        {
+            std::lock_guard<std::mutex> lock(m_clipboardMutex);
+            const auto it = m_clipboardByBox.find(boxName);
+            hasPrivate = it != m_clipboardByBox.end();
+            if (hasPrivate)
+                state = it->second;
+        }
+
+        std::wstring resultText;
+        bool hasText = false;
+        if (!hasPrivate ||
+            GetClipboardSequenceNumber() != state.systemSequenceAtSet) {
+            hasText = readSystemClipboardText(resultText);
+        }
+        if (!hasText && hasPrivate) {
+            resultText = state.text;
+            hasText = true;
+        }
         fillResponse(response, hookipc::MessageType::ClipboardTextResponse,
-                     boxName, hasText ? it->second : std::wstring{}, hasText);
+                     boxName, resultText, hasText);
         return true;
     }
 
