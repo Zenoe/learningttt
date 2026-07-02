@@ -1,4 +1,4 @@
-﻿// ============================================================
+// ============================================================
 //  SandboxEngine.cpp
 //
 //  Core implementation.  Read the inline comments — they
@@ -589,15 +589,10 @@ HANDLE SandboxEngine::createJobObject(const SandboxConfig& cfg)
 
     // -- UI restrictions (mirrors Sandboxie's UIPI enforcement) --
     JOBOBJECT_BASIC_UI_RESTRICTIONS uir{};
-    if (cfg.isolateClipboard) {
-        uir.UIRestrictionsClass |=
-            JOB_OBJECT_UILIMIT_READCLIPBOARD |
-            JOB_OBJECT_UILIMIT_WRITECLIPBOARD;
-    }
     if (cfg.restrictUI) {
         uir.UIRestrictionsClass |=
-            JOB_OBJECT_UILIMIT_HANDLES |       // no cross-job USER handles
-            JOB_OBJECT_UILIMIT_GLOBALATOMS |   // no global atom table / DDE
+            //JOB_OBJECT_UILIMIT_HANDLES |       // no cross-job USER handles
+            //JOB_OBJECT_UILIMIT_GLOBALATOMS |   // no global atom table / DDE
             JOB_OBJECT_UILIMIT_EXITWINDOWS |   // no ExitWindowsEx
             JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS;   // no SystemParametersInfo
     }

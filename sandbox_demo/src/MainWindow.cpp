@@ -595,9 +595,10 @@ void MainWindow::setupUi()
     //m_exePath->setText("C:\\Windows\\notepad.exe");
     m_exePath = makeCombo(mono);
     m_exePath->addItems({
-   "C:\\Users\\admin\\AppData\\Local\\Kingsoft\\WPS Office\\ksolaunch.exe",
+    "C:\\Program Files(x86)\\Microsoft\\Edge\\Application\\msedge.exe",
 	"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
     "C:\\Windows\\notepad.exe",
+    "C:\\Users\\admin\\AppData\\Local\\Kingsoft\\WPS Office\\ksolaunch.exe",
     "C:\\Program Files\\Microsoft Office\\root\\Office16\\WINWORD.EXE",
     "C:\\Program Files\\Microsoft Office\\root\\Office16\\EXCEL.EXE",
     "C:\\Windows\\System32\\cmd.exe"
@@ -1421,7 +1422,6 @@ bool MainWindow::openConfiguredBoxVaultInExplorer()
     SandboxConfig sessionCfg;
     sessionCfg.boxName = boxName.toStdWString();
     sessionCfg.restrictUI = true;
-    sessionCfg.isolateClipboard = true;
     sessionCfg.killOnClose = false;
     SandboxedProcess session =
         m_engine.createBoxSession(sessionCfg, mounted);
@@ -1787,7 +1787,6 @@ void MainWindow::onOpenSandboxFileRequested(const QString& path)
     cfg.commandLine = L"\"" + QDir::toNativeSeparators(fileInfo.absoluteFilePath()).toStdWString() + L"\"";
     cfg.useVault = false;
     cfg.restrictUI = false;
-    cfg.isolateClipboard = true;
     cfg.killOnClose = false;
 
     if (isChromiumExecutable(viewer)) {
