@@ -205,6 +205,41 @@ bool hasPrivateClipboardText(bool& hasText)
            pipeclient::hasClipboardText(g_boxName, hasText);
 }
 
+bool systemClipboardHasTextFormat(UINT format)
+{
+    return textClipboardFormat(format) &&
+           g_originalIsClipboardFormatAvailable &&
+           g_originalIsClipboardFormatAvailable(format) != FALSE;
+}
+
+int systemTextClipboardFormatCount()
+{
+    int count = 0;
+    if (systemClipboardHasTextFormat(CF_UNICODETEXT))
+        ++count;
+    if (systemClipboardHasTextFormat(CF_TEXT))
+        ++count;
+    return count;
+}
+
+UINT nextSystemTextClipboardFormat(UINT format)
+{
+    if (format == 0) {
+        if (systemClipboardHasTextFormat(CF_UNICODETEXT))
+            return CF_UNICODETEXT;
+        if (systemClipboardHasTextFormat(CF_TEXT))
+            return CF_TEXT;
+        return 0;
+    }
+
+    if (format == CF_UNICODETEXT &&
+        systemClipboardHasTextFormat(CF_TEXT)) {
+        return CF_TEXT;
+    }
+
+    return 0;
+}
+
 HGLOBAL getSystemClipboardText(UINT format)
 {
     if (!g_originalOpenClipboard || !g_originalGetClipboardData ||
@@ -217,7 +252,7 @@ HGLOBAL getSystemClipboardText(UINT format)
     HGLOBAL result = nullptr;
     HANDLE systemData = g_originalGetClipboardData(format);
     const std::wstring text = textFromClipboardHandle(systemData, format);
-    if (!text.empty())
+    if (systemData)
         result = allocateClipboardText(text, format);
     g_originalCloseClipboard();
     return result;
@@ -609,9 +644,7 @@ int WINAPI hookedCountClipboardFormats()
     bool hasText = false;
     if (hasPrivateClipboardText(hasText) && hasText)
         return 2;
-    return g_originalCountClipboardFormats
-        ? g_originalCountClipboardFormats()
-        : 0;
+    return systemTextClipboardFormatCount();
 }
 
 UINT WINAPI hookedEnumClipboardFormats(UINT format)
@@ -630,9 +663,7 @@ UINT WINAPI hookedEnumClipboardFormats(UINT format)
         return 0;
     }
 
-    return g_originalEnumClipboardFormats
-        ? g_originalEnumClipboardFormats(format)
-        : 0;
+    return nextSystemTextClipboardFormat(format);
 }
 
 template <typename Function>

@@ -605,7 +605,7 @@ void MainWindow::setupUi()
     //m_exePath->setText("C:\\Windows\\notepad.exe");
     m_exePath = makeCombo(mono);
     m_exePath->addItems({
-    "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
+    "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
 	"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
     "C:\\Windows\\notepad.exe",
     "C:\\Users\\admin\\AppData\\Local\\Kingsoft\\WPS Office\\ksolaunch.exe",
