@@ -600,6 +600,9 @@ HANDLE SandboxEngine::createJobObject(const SandboxConfig& cfg)
 
     // -- UI restrictions (mirrors Sandboxie's UIPI enforcement) --
     JOBOBJECT_BASIC_UI_RESTRICTIONS uir{};
+    if (cfg.isolateClipboard) {
+        uir.UIRestrictionsClass |= JOB_OBJECT_UILIMIT_WRITECLIPBOARD;
+    }
     if (cfg.restrictUI) {
         uir.UIRestrictionsClass |=
             //JOB_OBJECT_UILIMIT_HANDLES |       // no cross-job USER handles

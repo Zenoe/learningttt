@@ -22,7 +22,10 @@
 #endif
 
 #include <cwctype>
+#include <cstring>
+#include <mutex>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -36,13 +39,35 @@ using CreateProcessWFn = BOOL (WINAPI*)(LPCWSTR, LPWSTR,
                                          LPSECURITY_ATTRIBUTES, BOOL, DWORD,
                                          LPVOID, LPCWSTR, LPSTARTUPINFOW,
                                          LPPROCESS_INFORMATION);
+using OpenClipboardFn = BOOL (WINAPI*)(HWND);
+using CloseClipboardFn = BOOL (WINAPI*)();
+using EmptyClipboardFn = BOOL (WINAPI*)();
+using SetClipboardDataFn = HANDLE (WINAPI*)(UINT, HANDLE);
+using GetClipboardDataFn = HANDLE (WINAPI*)(UINT);
+using IsClipboardFormatAvailableFn = BOOL (WINAPI*)(UINT);
+using GetPriorityClipboardFormatFn = int (WINAPI*)(UINT*, int);
+using CountClipboardFormatsFn = int (WINAPI*)();
+using EnumClipboardFormatsFn = UINT (WINAPI*)(UINT);
 
 SHOpenFn g_originalSHOpen = nullptr;
 ShellExecuteWFn g_originalShellExecuteW = nullptr;
 ShellExecuteExWFn g_originalShellExecuteExW = nullptr;
 CreateProcessWFn g_originalCreateProcessW = nullptr;
+OpenClipboardFn g_originalOpenClipboard = nullptr;
+CloseClipboardFn g_originalCloseClipboard = nullptr;
+EmptyClipboardFn g_originalEmptyClipboard = nullptr;
+SetClipboardDataFn g_originalSetClipboardData = nullptr;
+GetClipboardDataFn g_originalGetClipboardData = nullptr;
+IsClipboardFormatAvailableFn g_originalIsClipboardFormatAvailable = nullptr;
+GetPriorityClipboardFormatFn g_originalGetPriorityClipboardFormat = nullptr;
+CountClipboardFormatsFn g_originalCountClipboardFormats = nullptr;
+EnumClipboardFormatsFn g_originalEnumClipboardFormats = nullptr;
 bool g_installed = false;
 std::wstring g_downloadsLower;
+std::wstring g_boxName;
+bool g_clipboardVirtualization = false;
+std::mutex g_fakeClipboardHandlesMutex;
+std::vector<HGLOBAL> g_fakeClipboardHandles;
 
 thread_local int g_hookDepth = 0;
 thread_local bool g_showMessageSent = false;
@@ -67,6 +92,142 @@ std::wstring lower(std::wstring value)
     for (wchar_t& ch : value)
         ch = static_cast<wchar_t>(towlower(ch));
     return value;
+}
+
+std::wstring environmentString(const wchar_t* name)
+{
+    wchar_t buffer[hookipc::kMaxText]{};
+    const DWORD count = GetEnvironmentVariableW(name, buffer, _countof(buffer));
+    if (count == 0 || count >= _countof(buffer))
+        return {};
+    return buffer;
+}
+
+bool textClipboardFormat(UINT format)
+{
+    return format == CF_UNICODETEXT || format == CF_TEXT;
+}
+
+std::wstring textFromClipboardHandle(HANDLE data, UINT format)
+{
+    if (!data || !textClipboardFormat(format))
+        return {};
+
+    const SIZE_T size = GlobalSize(data);
+    void* locked = GlobalLock(data);
+    if (!locked)
+        return {};
+
+    std::wstring result;
+    if (format == CF_UNICODETEXT) {
+        const wchar_t* text = static_cast<const wchar_t*>(locked);
+        const std::size_t maxChars = size / sizeof(wchar_t);
+        std::size_t length = 0;
+        while (length < maxChars && text[length] != L'\0')
+            ++length;
+        result.assign(text, text + length);
+    } else {
+        const char* text = static_cast<const char*>(locked);
+        std::size_t maxChars = size;
+        std::size_t length = 0;
+        while (length < maxChars && text[length] != '\0')
+            ++length;
+        if (length > 0) {
+            const int needed = MultiByteToWideChar(
+                CP_ACP, 0, text, static_cast<int>(length), nullptr, 0);
+            if (needed > 0) {
+                result.resize(static_cast<std::size_t>(needed));
+                MultiByteToWideChar(CP_ACP, 0, text, static_cast<int>(length),
+                                    result.data(), needed);
+            }
+        }
+    }
+
+    GlobalUnlock(data);
+    return result;
+}
+
+HGLOBAL allocateClipboardText(const std::wstring& text, UINT format)
+{
+    HGLOBAL memory = nullptr;
+    if (format == CF_UNICODETEXT) {
+        const SIZE_T bytes = (text.size() + 1) * sizeof(wchar_t);
+        memory = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes);
+        if (!memory)
+            return nullptr;
+        void* locked = GlobalLock(memory);
+        if (!locked) {
+            GlobalFree(memory);
+            return nullptr;
+        }
+        memcpy(locked, text.c_str(), bytes);
+        GlobalUnlock(memory);
+    } else if (format == CF_TEXT) {
+        const int needed = WideCharToMultiByte(
+            CP_ACP, 0, text.c_str(), -1, nullptr, 0, nullptr, nullptr);
+        if (needed <= 0)
+            return nullptr;
+        memory = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT,
+                             static_cast<SIZE_T>(needed));
+        if (!memory)
+            return nullptr;
+        void* locked = GlobalLock(memory);
+        if (!locked) {
+            GlobalFree(memory);
+            return nullptr;
+        }
+        WideCharToMultiByte(CP_ACP, 0, text.c_str(), -1,
+                            static_cast<char*>(locked), needed, nullptr,
+                            nullptr);
+        GlobalUnlock(memory);
+    }
+
+    if (memory) {
+        std::lock_guard<std::mutex> lock(g_fakeClipboardHandlesMutex);
+        g_fakeClipboardHandles.push_back(memory);
+    }
+    return memory;
+}
+
+bool getPrivateClipboardText(std::wstring& text, bool& hasText)
+{
+    hasText = false;
+    text.clear();
+    return g_clipboardVirtualization &&
+           pipeclient::getClipboardText(g_boxName, text, hasText);
+}
+
+bool hasPrivateClipboardText(bool& hasText)
+{
+    hasText = false;
+    return g_clipboardVirtualization &&
+           pipeclient::hasClipboardText(g_boxName, hasText);
+}
+
+HGLOBAL getSystemClipboardText(UINT format)
+{
+    if (!g_originalOpenClipboard || !g_originalGetClipboardData ||
+        !g_originalCloseClipboard)
+        return nullptr;
+
+    if (!g_originalOpenClipboard(nullptr))
+        return nullptr;
+
+    HGLOBAL result = nullptr;
+    HANDLE systemData = g_originalGetClipboardData(format);
+    const std::wstring text = textFromClipboardHandle(systemData, format);
+    if (!text.empty())
+        result = allocateClipboardText(text, format);
+    g_originalCloseClipboard();
+    return result;
+}
+
+void freeFakeClipboardHandles()
+{
+    std::lock_guard<std::mutex> lock(g_fakeClipboardHandlesMutex);
+    for (HGLOBAL handle : g_fakeClipboardHandles)
+        GlobalFree(handle);
+    g_fakeClipboardHandles.clear();
 }
 
 std::wstring normalizedDirectory(std::wstring path)
@@ -279,6 +440,151 @@ BOOL WINAPI hookedCreateProcessW(
     return result;
 }
 
+BOOL WINAPI hookedOpenClipboard(HWND)
+{
+    if (!g_clipboardVirtualization)
+        return g_originalOpenClipboard ? g_originalOpenClipboard(nullptr) : FALSE;
+
+    hooklog::write(L"[clipboard] OpenClipboard virtual box=%s",
+                   g_boxName.c_str());
+    return TRUE;
+}
+
+BOOL WINAPI hookedCloseClipboard()
+{
+    if (!g_clipboardVirtualization)
+        return g_originalCloseClipboard ? g_originalCloseClipboard() : FALSE;
+    return TRUE;
+}
+
+BOOL WINAPI hookedEmptyClipboard()
+{
+    if (!g_clipboardVirtualization)
+        return g_originalEmptyClipboard ? g_originalEmptyClipboard() : FALSE;
+
+    const bool ok = pipeclient::clearClipboard(g_boxName);
+    hooklog::write(L"[clipboard] EmptyClipboard private -> %d", ok ? 1 : 0);
+    return ok ? TRUE : FALSE;
+}
+
+HANDLE WINAPI hookedSetClipboardData(UINT format, HANDLE data)
+{
+    if (!g_clipboardVirtualization)
+        return g_originalSetClipboardData
+            ? g_originalSetClipboardData(format, data)
+            : nullptr;
+
+    if (!textClipboardFormat(format)) {
+        hooklog::write(L"[clipboard] SetClipboardData format=%u suppressed",
+                       format);
+        return data;
+    }
+
+    const std::wstring text = textFromClipboardHandle(data, format);
+    const bool ok = pipeclient::setClipboardText(g_boxName, text);
+    hooklog::write(L"[clipboard] SetClipboardData format=%u chars=%zu -> %d",
+                   format, text.size(), ok ? 1 : 0);
+    return ok ? data : nullptr;
+}
+
+HANDLE WINAPI hookedGetClipboardData(UINT format)
+{
+    if (!g_clipboardVirtualization)
+        return g_originalGetClipboardData
+            ? g_originalGetClipboardData(format)
+            : nullptr;
+
+    if (!textClipboardFormat(format))
+        return nullptr;
+
+    std::wstring text;
+    bool hasText = false;
+    if (getPrivateClipboardText(text, hasText) && hasText) {
+        hooklog::write(L"[clipboard] GetClipboardData format=%u private chars=%zu",
+                       format, text.size());
+        return allocateClipboardText(text, format);
+    }
+
+    hooklog::write(L"[clipboard] GetClipboardData format=%u fallback system",
+                   format);
+    return getSystemClipboardText(format);
+}
+
+BOOL WINAPI hookedIsClipboardFormatAvailable(UINT format)
+{
+    if (!g_clipboardVirtualization)
+        return g_originalIsClipboardFormatAvailable
+            ? g_originalIsClipboardFormatAvailable(format)
+            : FALSE;
+
+    if (!textClipboardFormat(format))
+        return FALSE;
+
+    bool hasText = false;
+    if (hasPrivateClipboardText(hasText) && hasText)
+        return TRUE;
+    return g_originalIsClipboardFormatAvailable
+        ? g_originalIsClipboardFormatAvailable(format)
+        : FALSE;
+}
+
+int WINAPI hookedGetPriorityClipboardFormat(UINT* priorityList, int count)
+{
+    if (!g_clipboardVirtualization)
+        return g_originalGetPriorityClipboardFormat
+            ? g_originalGetPriorityClipboardFormat(priorityList, count)
+            : 0;
+
+    bool hasText = false;
+    if (hasPrivateClipboardText(hasText) && hasText) {
+        for (int i = 0; i < count; ++i) {
+            if (textClipboardFormat(priorityList[i]))
+                return static_cast<int>(priorityList[i]);
+        }
+        return -1;
+    }
+
+    return g_originalGetPriorityClipboardFormat
+        ? g_originalGetPriorityClipboardFormat(priorityList, count)
+        : 0;
+}
+
+int WINAPI hookedCountClipboardFormats()
+{
+    if (!g_clipboardVirtualization)
+        return g_originalCountClipboardFormats
+            ? g_originalCountClipboardFormats()
+            : 0;
+
+    bool hasText = false;
+    if (hasPrivateClipboardText(hasText) && hasText)
+        return 2;
+    return g_originalCountClipboardFormats
+        ? g_originalCountClipboardFormats()
+        : 0;
+}
+
+UINT WINAPI hookedEnumClipboardFormats(UINT format)
+{
+    if (!g_clipboardVirtualization)
+        return g_originalEnumClipboardFormats
+            ? g_originalEnumClipboardFormats(format)
+            : 0;
+
+    bool hasText = false;
+    if (hasPrivateClipboardText(hasText) && hasText) {
+        if (format == 0)
+            return CF_UNICODETEXT;
+        if (format == CF_UNICODETEXT)
+            return CF_TEXT;
+        return 0;
+    }
+
+    return g_originalEnumClipboardFormats
+        ? g_originalEnumClipboardFormats(format)
+        : 0;
+}
+
 template <typename Function>
 bool resolve(const wchar_t* moduleName, const char* functionName,
              Function& original, const wchar_t* label)
@@ -322,6 +628,12 @@ namespace hooks {
 bool install()
 {
     hooklog::write(L"[lifecycle] hooks::install begin");
+    g_boxName = environmentString(L"SANDBOX_BOX");
+    g_clipboardVirtualization = !g_boxName.empty();
+    hooklog::write(L"[setup] box=%s clipboardVirtualization=%d",
+                   g_boxName.empty() ? L"<none>" : g_boxName.c_str(),
+                   g_clipboardVirtualization ? 1 : 0);
+
     wchar_t downloads[hookipc::kMaxText]{};
     if (GetEnvironmentVariableW(L"SANDBOX_DOWNLOADS", downloads,
                                 _countof(downloads)) > 0) {
@@ -341,6 +653,28 @@ bool install()
             L"ShellExecuteExW");
     resolve(L"kernel32.dll", "CreateProcessW", g_originalCreateProcessW,
             L"CreateProcessW");
+    resolve(L"user32.dll", "OpenClipboard", g_originalOpenClipboard,
+            L"OpenClipboard");
+    resolve(L"user32.dll", "CloseClipboard", g_originalCloseClipboard,
+            L"CloseClipboard");
+    resolve(L"user32.dll", "EmptyClipboard", g_originalEmptyClipboard,
+            L"EmptyClipboard");
+    resolve(L"user32.dll", "SetClipboardData", g_originalSetClipboardData,
+            L"SetClipboardData");
+    resolve(L"user32.dll", "GetClipboardData", g_originalGetClipboardData,
+            L"GetClipboardData");
+    resolve(L"user32.dll", "IsClipboardFormatAvailable",
+            g_originalIsClipboardFormatAvailable,
+            L"IsClipboardFormatAvailable");
+    resolve(L"user32.dll", "GetPriorityClipboardFormat",
+            g_originalGetPriorityClipboardFormat,
+            L"GetPriorityClipboardFormat");
+    resolve(L"user32.dll", "CountClipboardFormats",
+            g_originalCountClipboardFormats,
+            L"CountClipboardFormats");
+    resolve(L"user32.dll", "EnumClipboardFormats",
+            g_originalEnumClipboardFormats,
+            L"EnumClipboardFormats");
 
     LONG result = DetourTransactionBegin();
     hooklog::write(L"[setup] DetourTransactionBegin -> %ld", result);
@@ -354,6 +688,19 @@ bool install()
     attach(g_originalShellExecuteW, hookedShellExecuteW, L"ShellExecuteW");
     attach(g_originalShellExecuteExW, hookedShellExecuteExW, L"ShellExecuteExW");
     attach(g_originalCreateProcessW, hookedCreateProcessW, L"CreateProcessW");
+    attach(g_originalOpenClipboard, hookedOpenClipboard, L"OpenClipboard");
+    attach(g_originalCloseClipboard, hookedCloseClipboard, L"CloseClipboard");
+    attach(g_originalEmptyClipboard, hookedEmptyClipboard, L"EmptyClipboard");
+    attach(g_originalSetClipboardData, hookedSetClipboardData, L"SetClipboardData");
+    attach(g_originalGetClipboardData, hookedGetClipboardData, L"GetClipboardData");
+    attach(g_originalIsClipboardFormatAvailable, hookedIsClipboardFormatAvailable,
+           L"IsClipboardFormatAvailable");
+    attach(g_originalGetPriorityClipboardFormat, hookedGetPriorityClipboardFormat,
+           L"GetPriorityClipboardFormat");
+    attach(g_originalCountClipboardFormats, hookedCountClipboardFormats,
+           L"CountClipboardFormats");
+    attach(g_originalEnumClipboardFormats, hookedEnumClipboardFormats,
+           L"EnumClipboardFormats");
 
     result = DetourTransactionCommit();
     hooklog::write(L"[setup] DetourTransactionCommit -> %ld", result);
@@ -377,8 +724,22 @@ void remove()
     detach(g_originalShellExecuteW, hookedShellExecuteW, L"ShellExecuteW");
     detach(g_originalShellExecuteExW, hookedShellExecuteExW, L"ShellExecuteExW");
     detach(g_originalCreateProcessW, hookedCreateProcessW, L"CreateProcessW");
+    detach(g_originalOpenClipboard, hookedOpenClipboard, L"OpenClipboard");
+    detach(g_originalCloseClipboard, hookedCloseClipboard, L"CloseClipboard");
+    detach(g_originalEmptyClipboard, hookedEmptyClipboard, L"EmptyClipboard");
+    detach(g_originalSetClipboardData, hookedSetClipboardData, L"SetClipboardData");
+    detach(g_originalGetClipboardData, hookedGetClipboardData, L"GetClipboardData");
+    detach(g_originalIsClipboardFormatAvailable, hookedIsClipboardFormatAvailable,
+           L"IsClipboardFormatAvailable");
+    detach(g_originalGetPriorityClipboardFormat, hookedGetPriorityClipboardFormat,
+           L"GetPriorityClipboardFormat");
+    detach(g_originalCountClipboardFormats, hookedCountClipboardFormats,
+           L"CountClipboardFormats");
+    detach(g_originalEnumClipboardFormats, hookedEnumClipboardFormats,
+           L"EnumClipboardFormats");
     const LONG result = DetourTransactionCommit();
     g_installed = false;
+    freeFakeClipboardHandles();
     hooklog::write(L"[lifecycle] hooks::remove end commit=%ld", result);
 }
 

@@ -1,10 +1,15 @@
 #pragma once
 
+#include "HookIpcProtocol.h"
+
 #include <QObject>
 #include <QString>
 
 #include <atomic>
+#include <mutex>
+#include <string>
 #include <thread>
+#include <unordered_map>
 
 class HookIpcServer : public QObject {
     Q_OBJECT
@@ -23,6 +28,8 @@ signals:
 
 private:
     void run();
+    bool handleClipboardMessage(const hookipc::Message& message,
+                                hookipc::Message& response);
 
     void* m_pipe = nullptr;
     void* m_stopEvent = nullptr;
@@ -30,4 +37,6 @@ private:
     std::thread m_thread;
     std::atomic_bool m_running{false};
     std::atomic_bool m_listening{false};
+    std::mutex m_clipboardMutex;
+    std::unordered_map<std::wstring, std::wstring> m_clipboardTextByBox;
 };

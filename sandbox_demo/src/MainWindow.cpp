@@ -605,7 +605,7 @@ void MainWindow::setupUi()
     //m_exePath->setText("C:\\Windows\\notepad.exe");
     m_exePath = makeCombo(mono);
     m_exePath->addItems({
-    "C:\\Program Files(x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+    "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
 	"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
     "C:\\Windows\\notepad.exe",
     "C:\\Users\\admin\\AppData\\Local\\Kingsoft\\WPS Office\\ksolaunch.exe",
@@ -1051,22 +1051,22 @@ void MainWindow::onLaunchSandboxed()
         ? mountDir.toStdWString()
         : QDir(mountDir).filePath(QStringLiteral("_vault")).toStdWString());
     cfg.vaultSizeMB    = vaultSizeMb;
-    if (isChromium) {
-        if (!m_hookIpc || !m_hookIpc->isListening()) {
-            appendLog("! Hook IPC broker is not listening; sandboxed Chrome launch aborted.");
-            return;
-        }
-        const QString hookDll = QDir(QCoreApplication::applicationDirPath())
-                                    .filePath(QStringLiteral("HookDll.dll"));
-        if (!QFileInfo::exists(hookDll)) {
-            appendLog("! HookDll.dll not found next to SandboxDemo.exe: " + hookDll);
-            appendLog("  Sandboxed Chrome launch aborted because Explorer suppression would be unavailable.");
-            return;
-        }
-        cfg.borderDllPath = QDir::toNativeSeparators(hookDll).toStdWString();
-        appendLog("  [HookDll] Detours payload: " + QDir::toNativeSeparators(hookDll));
+    if (!m_hookIpc || !m_hookIpc->isListening()) {
+        appendLog("! Hook IPC broker is not listening; sandboxed launch aborted.");
+        appendLog("  Private clipboard isolation requires the Hook IPC broker.");
+        return;
     }
+    const QString hookDll = QDir(QCoreApplication::applicationDirPath())
+                                .filePath(QStringLiteral("HookDll.dll"));
+    if (!QFileInfo::exists(hookDll)) {
+        appendLog("! HookDll.dll not found next to SandboxDemo.exe: " + hookDll);
+        appendLog("  Sandboxed launch aborted because private clipboard isolation would be unavailable.");
+        return;
+    }
+    cfg.borderDllPath = QDir::toNativeSeparators(hookDll).toStdWString();
+    appendLog("  [HookDll] Detours payload: " + QDir::toNativeSeparators(hookDll));
     cfg.restrictUI     = m_chkRestrictUI->isChecked() && !isChromium;
+    cfg.isolateClipboard = true;
     cfg.killOnClose    = m_chkKillOnClose->isChecked();
     if (isChromium && m_chkRestrictUI->isChecked()) {
         appendLog("  [Chrome] Job UI limits disabled for Chromium compatibility.");
@@ -1798,15 +1798,20 @@ void MainWindow::onOpenSandboxFileRequested(const QString& path)
     cfg.commandLine = L"\"" + QDir::toNativeSeparators(fileInfo.absoluteFilePath()).toStdWString() + L"\"";
     cfg.useVault = false;
     cfg.restrictUI = false;
+    cfg.isolateClipboard = true;
     cfg.killOnClose = false;
 
-    if (isChromiumExecutable(viewer)) {
-        const QString hookDll = QDir(QCoreApplication::applicationDirPath())
-            .filePath(QStringLiteral("HookDll.dll"));
-        if (QFileInfo::exists(hookDll)) {
-            cfg.borderDllPath = QDir::toNativeSeparators(hookDll).toStdWString();
-        }
+    if (!m_hookIpc || !m_hookIpc->isListening()) {
+        appendLog("! Open blocked: Hook IPC broker is not listening.");
+        return;
     }
+    const QString hookDll = QDir(QCoreApplication::applicationDirPath())
+        .filePath(QStringLiteral("HookDll.dll"));
+    if (!QFileInfo::exists(hookDll)) {
+        appendLog("! Open blocked: HookDll.dll not found next to SandboxDemo.exe.");
+        return;
+    }
+    cfg.borderDllPath = QDir::toNativeSeparators(hookDll).toStdWString();
 
     appendLog(QString("  [Explorer] Open inside box '%1': %2")
                   .arg(QString::fromStdWString(owner->boxName),

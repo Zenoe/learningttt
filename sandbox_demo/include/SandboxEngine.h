@@ -53,6 +53,7 @@ struct SandboxConfig {
     std::wstring passphrase;
     std::wstring borderDllPath;   // path to injected shell broker; empty = skip
     bool restrictUI     = true;
+    bool isolateClipboard = true;
     bool killOnClose    = true;
     bool inheritConsole = false;
 };
