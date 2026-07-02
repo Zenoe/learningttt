@@ -34,6 +34,7 @@ struct SandboxedProcess {
     std::wstring bitLockerRecoveryPassword;
     std::vector<DWORD> driverPids;
     bool   wfpEnabled   = false;
+    bool   driverRegistered = false;
     ULONG  wfpVnicIp    = 0;
     bool   vaultMounted  = false;
     bool   valid        = false;

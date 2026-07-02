@@ -612,9 +612,9 @@ void MainWindow::setupUi()
     m_vaultSizeMb = makeEdit("512", mono);
     m_vaultSizeMb->setText("512");
     m_vaultSizeMb->setFixedWidth(100);
+    m_chkQuickTest = new QCheckBox("quickTest");
+    m_chkQuickTest->setChecked(true);
     m_chkPassphrase = new QCheckBox("Use BitLocker passphrase");
-    m_chkPassphrase->setStyleSheet("QCheckBox{color:#aab;}"
-        "QCheckBox::indicator:checked{background:#0af;}");
     m_passphrase = makeEdit("(optional)", mono);
     m_passphrase->setEchoMode(QLineEdit::Password);
     m_passphrase->setEnabled(false);
@@ -635,6 +635,8 @@ void MainWindow::setupUi()
     vaultRow->addWidget(m_vaultSizeMb);
     vaultRow->addWidget(makeLabel("MB"));
     vaultRow->addSpacing(20);
+    vaultRow->addWidget(m_chkQuickTest);
+    vaultRow->addSpacing(20);
     vaultRow->addWidget(m_chkPassphrase);
     vaultRow->addWidget(m_passphrase, 1);
     cfgGrid->addLayout(vaultRow, 4, 1);
@@ -650,6 +652,8 @@ void MainWindow::setupUi()
     m_chkKillOnClose->setChecked(true);
     QString cbStyle = "QCheckBox{color:#aab;}"
                       "QCheckBox::indicator:checked{background:#0af;}";
+    m_chkQuickTest->setStyleSheet(cbStyle);
+    m_chkPassphrase->setStyleSheet(cbStyle);
     m_chkRestrictUI->setStyleSheet(cbStyle);
     m_chkKillOnClose->setStyleSheet(cbStyle);
     m_chkWfpForce->setStyleSheet(cbStyle);
@@ -769,6 +773,24 @@ void MainWindow::setupUi()
             m_wfpVnicIp, &QLineEdit::setEnabled);
     connect(m_chkPassphrase, &QCheckBox::toggled,
             m_passphrase, &QLineEdit::setEnabled);
+    connect(m_chkQuickTest, &QCheckBox::toggled, this, [this](bool checked) {
+        m_vaultDir->setEnabled(!checked);
+        m_vaultSizeMb->setEnabled(!checked);
+        m_chkPassphrase->setEnabled(!checked);
+        m_passphrase->setEnabled(!checked && m_chkPassphrase->isChecked());
+        m_chkWfpForce->setEnabled(!checked);
+        m_wfpVnicIp->setEnabled(!checked && m_chkWfpForce->isChecked());
+        m_cmbPolicy->setEnabled(!checked);
+    });
+    m_vaultDir->setEnabled(!m_chkQuickTest->isChecked());
+    m_vaultSizeMb->setEnabled(!m_chkQuickTest->isChecked());
+    m_chkPassphrase->setEnabled(!m_chkQuickTest->isChecked());
+    m_passphrase->setEnabled(!m_chkQuickTest->isChecked() &&
+                             m_chkPassphrase->isChecked());
+    m_chkWfpForce->setEnabled(!m_chkQuickTest->isChecked());
+    m_wfpVnicIp->setEnabled(!m_chkQuickTest->isChecked() &&
+                            m_chkWfpForce->isChecked());
+    m_cmbPolicy->setEnabled(!m_chkQuickTest->isChecked());
     // ── NEW: restart pipe server if FS root changes
     connect(m_fsRoot, &QLineEdit::editingFinished,
             this, &MainWindow::onFsRootChanged);
@@ -979,22 +1001,26 @@ void MainWindow::onLaunchSandboxed()
 
     QString mountDir = m_fsRoot->text().trimmed();
     if (mountDir.isEmpty()) mountDir = "C:\\SandboxMounts";
+    const bool quickTest = m_chkQuickTest->isChecked();
     QString vaultDir = m_vaultDir->text().trimmed();
     if (vaultDir.isEmpty()) vaultDir = "C:\\SandboxBoxes";
     bool sizeOk = false;
     uint64_t vaultSizeMb = m_vaultSizeMb->text().trimmed().toULongLong(&sizeOk);
-    if (!sizeOk || vaultSizeMb < 64) {
+    if (!quickTest && (!sizeOk || vaultSizeMb < 64)) {
         appendLog("! Vault size must be at least 64 MB.");
         return;
     }
-    if (!DriverManager::isElevated()) {
+    if (!quickTest && !DriverManager::isElevated()) {
         appendLog("! Vault-backed sandbox launch requires Administrator privileges.");
         appendLog("  CreateVirtualDisk/AttachVirtualDisk cannot run from a non-elevated process.");
         return;
     }
 
     appendLog("--- Launch SANDBOXED box=\"" + uniqueBox + "\" ---");
-    if (!m_driver.isLoaded()) {
+    if (quickTest) {
+        appendLog("  [quickTest] Fast clipboard test mode: skipping driver, vault, BitLocker, WFP, and minifilter setup.");
+    }
+    else if (!m_driver.isLoaded()) {
         appendLog("  [!] Driver not loaded — FS redirection via driver DISABLED.");
         appendLog("      Job Object + namespace isolation still active.");
     }
@@ -1004,10 +1030,14 @@ void MainWindow::onLaunchSandboxed()
     cfg.boxName        = uniqueBox.toStdWString();
     cfg.executablePath = exe.toStdWString();
     cfg.commandLine    = m_extraArgs->text().toStdWString();
-    cfg.fsRootBase     = mountDir.toStdWString();
-    cfg.useVault       = true;
+    cfg.fsRootBase     = (quickTest
+        ? QDir(mountDir).filePath(QStringLiteral("_quickTest")).toStdWString()
+        : mountDir.toStdWString());
+    cfg.useVault       = !quickTest;
     cfg.vaultDir       = vaultDir.toStdWString();
-    cfg.mountDir       = mountDir.toStdWString();
+    cfg.mountDir       = (quickTest
+        ? mountDir.toStdWString()
+        : QDir(mountDir).filePath(QStringLiteral("_vault")).toStdWString());
     cfg.vaultSizeMB    = vaultSizeMb;
     if (isChromium) {
         if (!m_hookIpc || !m_hookIpc->isListening()) {
@@ -1032,7 +1062,7 @@ void MainWindow::onLaunchSandboxed()
     }
 
     SandboxedProcess* passiveBox = findPassiveBox(uniqueBox);
-    const bool reusePassiveBox = passiveBox && passiveBox->valid &&
+    const bool reusePassiveBox = !quickTest && passiveBox && passiveBox->valid &&
         passiveBox->hJob && !passiveBox->fsRoot.empty();
 
     SandboxedProcess sp;
@@ -1088,7 +1118,7 @@ void MainWindow::onLaunchSandboxed()
             return;
         }
     }
-    else if (m_driver.isLoaded()) {
+    else if (!quickTest && m_driver.isLoaded()) {
         QString sandboxRoot = QString::fromStdWString(sp.fsRoot + L"\\drive");
         QString sandboxVolRelative = sandboxRoot;
         if (sandboxVolRelative.length() >= 2 && sandboxVolRelative[1] == ':')
@@ -1139,12 +1169,13 @@ void MainWindow::onLaunchSandboxed()
             m_engine.release(sp);
             return;
         }
+        sp.driverRegistered = true;
     }
 
     // ---- Optional WFP source-IP forcing.  Must be registered before resume
     //      so child processes (Chrome Network Service, etc.) inherit the rule
     //      before their first bind().
-    if (m_chkWfpForce->isChecked()) {
+    if (!quickTest && m_chkWfpForce->isChecked()) {
         ULONG vnicIp = 0;
         std::wstring ipText = m_wfpVnicIp->text().trimmed().toStdWString();
         if (!DriverManager::parseIpv4(ipText, vnicIp)) {
@@ -1314,6 +1345,22 @@ bool MainWindow::openConfiguredBoxVaultInExplorer()
         return true;
     }
 
+    if (m_chkQuickTest->isChecked()) {
+        QString mountDir = m_fsRoot->text().trimmed();
+        if (mountDir.isEmpty())
+            mountDir = QStringLiteral("C:\\SandboxMounts");
+        const QString root = QDir::toNativeSeparators(
+            QDir(mountDir).filePath(QStringLiteral("_quickTest\\") +
+                                    boxName +
+                                    QStringLiteral("\\drive")));
+        QDir().mkpath(root);
+        appendLog(QString("  [quickTest] Opening directory-backed box '%1': %2")
+                      .arg(boxName, root));
+        if (m_fileExplorer)
+            m_fileExplorer->showForPath(root, boxName, root);
+        return true;
+    }
+
     QString vaultDir = m_vaultDir->text().trimmed();
     if (vaultDir.isEmpty())
         vaultDir = QStringLiteral("C:\\SandboxBoxes");
@@ -1344,7 +1391,8 @@ bool MainWindow::openConfiguredBoxVaultInExplorer()
     cfg.boxName = boxName.toStdWString();
     cfg.vaultFilePath = QDir::toNativeSeparators(vaultPath).toStdWString();
     cfg.mountPoint = QDir::toNativeSeparators(
-        QDir(mountDir).filePath(boxName)).toStdWString();
+        QDir(mountDir).filePath(QStringLiteral("_vault\\") + boxName))
+            .toStdWString();
     cfg.passphrase = m_chkPassphrase->isChecked()
         ? m_passphrase->text().toStdWString()
         : std::wstring();
@@ -1545,8 +1593,10 @@ void MainWindow::syncDriverPids(SandboxedProcess& sp)
 {
     if (!m_driver.isLoaded() || !sp.valid)
         return;
-    for (DWORD pid : sp.driverPids)
-        m_driver.addProcess(pid, sp.boxName);
+    for (DWORD pid : sp.driverPids) {
+        if (m_driver.addProcess(pid, sp.boxName))
+            sp.driverRegistered = true;
+    }
 }
 
 void MainWindow::unregisterDriverPids(SandboxedProcess& sp)
@@ -1558,7 +1608,7 @@ void MainWindow::unregisterDriverPids(SandboxedProcess& sp)
             QString::fromStdWString(sp.vaultMountPoint));
         QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
     }
-    if (!m_driver.isLoaded())
+    if (!m_driver.isLoaded() || !sp.driverRegistered)
         return;
 
     m_driver.removeProcess(sp.pid);

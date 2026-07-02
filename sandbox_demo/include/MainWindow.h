@@ -87,6 +87,7 @@ private:
     QLineEdit*   m_fsRoot        = nullptr;
     QLineEdit*   m_vaultDir      = nullptr;
     QLineEdit*   m_vaultSizeMb   = nullptr;
+    QCheckBox*   m_chkQuickTest  = nullptr;
     QCheckBox*   m_chkPassphrase = nullptr;
     QLineEdit*   m_passphrase    = nullptr;
     QLineEdit*   m_extraArgs     = nullptr;
