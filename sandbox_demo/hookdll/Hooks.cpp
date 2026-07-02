@@ -65,6 +65,7 @@ EnumClipboardFormatsFn g_originalEnumClipboardFormats = nullptr;
 bool g_installed = false;
 std::wstring g_downloadsLower;
 std::wstring g_boxName;
+std::wstring g_hookDllPath;
 bool g_clipboardVirtualization = false;
 std::mutex g_fakeClipboardHandlesMutex;
 std::vector<HGLOBAL> g_fakeClipboardHandles;
@@ -228,6 +229,40 @@ void freeFakeClipboardHandles()
     for (HGLOBAL handle : g_fakeClipboardHandles)
         GlobalFree(handle);
     g_fakeClipboardHandles.clear();
+}
+
+bool injectHookDllIntoProcess(HANDLE process)
+{
+    if (!process || g_hookDllPath.empty())
+        return false;
+
+    const SIZE_T bytes = (g_hookDllPath.size() + 1) * sizeof(wchar_t);
+    void* remotePath = VirtualAllocEx(process, nullptr, bytes,
+                                      MEM_COMMIT | MEM_RESERVE,
+                                      PAGE_READWRITE);
+    if (!remotePath)
+        return false;
+
+    bool ok = false;
+    if (WriteProcessMemory(process, remotePath, g_hookDllPath.c_str(), bytes,
+                           nullptr)) {
+        HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+        auto* loadLibraryW = reinterpret_cast<LPTHREAD_START_ROUTINE>(
+            GetProcAddress(kernel32, "LoadLibraryW"));
+        HANDLE thread = loadLibraryW
+            ? CreateRemoteThread(process, nullptr, 0, loadLibraryW, remotePath,
+                                 0, nullptr)
+            : nullptr;
+        if (thread) {
+            WaitForSingleObject(thread, 5000);
+            DWORD exitCode = 0;
+            ok = GetExitCodeThread(thread, &exitCode) && exitCode != 0;
+            CloseHandle(thread);
+        }
+    }
+
+    VirtualFreeEx(process, remotePath, 0, MEM_RELEASE);
+    return ok;
 }
 
 std::wstring normalizedDirectory(std::wstring path)
@@ -429,11 +464,26 @@ BOOL WINAPI hookedCreateProcessW(
         return result;
     }
 
+    const bool propagateHook = g_clipboardVirtualization && !g_hookDllPath.empty();
+    const bool callerSuspended = (creationFlags & CREATE_SUSPENDED) != 0;
+    const DWORD adjustedFlags = propagateHook
+        ? (creationFlags | CREATE_SUSPENDED)
+        : creationFlags;
+
     const BOOL result = g_originalCreateProcessW(
         application, commandLine, processAttributes, threadAttributes,
-        inheritHandles, creationFlags, environment, currentDirectory,
+        inheritHandles, adjustedFlags, environment, currentDirectory,
         startupInfo, processInfo);
     const DWORD error = GetLastError();
+
+    if (result && propagateHook && processInfo && processInfo->hProcess) {
+        const bool injected = injectHookDllIntoProcess(processInfo->hProcess);
+        hooklog::write(L"[child] HookDll injection pid=%lu -> %d",
+                       processInfo->dwProcessId, injected ? 1 : 0);
+        if (!callerSuspended && processInfo->hThread)
+            ResumeThread(processInfo->hThread);
+    }
+
     hooklog::write(L"[return] CreateProcessW -> %d gle=%lu (passed through)",
                    result, result ? ERROR_SUCCESS : error);
     SetLastError(error);
@@ -629,10 +679,24 @@ bool install()
 {
     hooklog::write(L"[lifecycle] hooks::install begin");
     g_boxName = environmentString(L"SANDBOX_BOX");
+    g_hookDllPath = environmentString(L"SANDBOX_HOOK_DLL");
+    if (g_hookDllPath.empty()) {
+        wchar_t modulePath[MAX_PATH]{};
+        HMODULE module = nullptr;
+        if (GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCWSTR>(&install), &module) &&
+            GetModuleFileNameW(module, modulePath, _countof(modulePath)) > 0) {
+            g_hookDllPath = modulePath;
+        }
+    }
     g_clipboardVirtualization = !g_boxName.empty();
     hooklog::write(L"[setup] box=%s clipboardVirtualization=%d",
                    g_boxName.empty() ? L"<none>" : g_boxName.c_str(),
                    g_clipboardVirtualization ? 1 : 0);
+    hooklog::write(L"[setup] hookDllPath=%s",
+                   g_hookDllPath.empty() ? L"<unset>" : g_hookDllPath.c_str());
 
     wchar_t downloads[hookipc::kMaxText]{};
     if (GetEnvironmentVariableW(L"SANDBOX_DOWNLOADS", downloads,
