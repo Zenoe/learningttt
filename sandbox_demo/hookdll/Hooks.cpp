@@ -11,6 +11,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <ole2.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #if __has_include(<detours/detours.h>)
@@ -48,6 +49,7 @@ using IsClipboardFormatAvailableFn = BOOL (WINAPI*)(UINT);
 using GetPriorityClipboardFormatFn = int (WINAPI*)(UINT*, int);
 using CountClipboardFormatsFn = int (WINAPI*)();
 using EnumClipboardFormatsFn = UINT (WINAPI*)(UINT);
+using OleSetClipboardFn = HRESULT (WINAPI*)(IDataObject*);
 
 SHOpenFn g_originalSHOpen = nullptr;
 ShellExecuteWFn g_originalShellExecuteW = nullptr;
@@ -62,6 +64,7 @@ IsClipboardFormatAvailableFn g_originalIsClipboardFormatAvailable = nullptr;
 GetPriorityClipboardFormatFn g_originalGetPriorityClipboardFormat = nullptr;
 CountClipboardFormatsFn g_originalCountClipboardFormats = nullptr;
 EnumClipboardFormatsFn g_originalEnumClipboardFormats = nullptr;
+OleSetClipboardFn g_originalOleSetClipboard = nullptr;
 bool g_installed = false;
 std::wstring g_downloadsLower;
 std::wstring g_boxName;
@@ -146,6 +149,37 @@ std::wstring textFromClipboardHandle(HANDLE data, UINT format)
 
     GlobalUnlock(data);
     return result;
+}
+
+bool textFromDataObject(IDataObject* dataObject, std::wstring& text)
+{
+    text.clear();
+    if (!dataObject)
+        return false;
+
+    const UINT formats[] = { CF_UNICODETEXT, CF_TEXT };
+    for (UINT format : formats) {
+        FORMATETC formatEtc{};
+        formatEtc.cfFormat = static_cast<CLIPFORMAT>(format);
+        formatEtc.dwAspect = DVASPECT_CONTENT;
+        formatEtc.lindex = -1;
+        formatEtc.tymed = TYMED_HGLOBAL;
+
+        STGMEDIUM medium{};
+        const HRESULT hr = dataObject->GetData(&formatEtc, &medium);
+        if (FAILED(hr))
+            continue;
+        if (medium.tymed != TYMED_HGLOBAL || !medium.hGlobal) {
+            ReleaseStgMedium(&medium);
+            continue;
+        }
+
+        text = textFromClipboardHandle(medium.hGlobal, format);
+        ReleaseStgMedium(&medium);
+        return true;
+    }
+
+    return false;
 }
 
 HGLOBAL allocateClipboardText(const std::wstring& text, UINT format)
@@ -564,6 +598,12 @@ HANDLE WINAPI hookedSetClipboardData(UINT format, HANDLE data)
         return data;
     }
 
+    if (!data) {
+        hooklog::write(L"[clipboard] SetClipboardData format=%u delayed rendering suppressed",
+                       format);
+        return data;
+    }
+
     const std::wstring text = textFromClipboardHandle(data, format);
     const bool ok = pipeclient::setClipboardText(g_boxName, text);
     hooklog::write(L"[clipboard] SetClipboardData format=%u chars=%zu -> %d",
@@ -663,6 +703,33 @@ UINT WINAPI hookedEnumClipboardFormats(UINT format)
     }
 
     return nextSystemTextClipboardFormat(format);
+}
+
+HRESULT WINAPI hookedOleSetClipboard(IDataObject* dataObject)
+{
+    if (!g_clipboardVirtualization)
+        return g_originalOleSetClipboard
+            ? g_originalOleSetClipboard(dataObject)
+            : E_FAIL;
+
+    if (!dataObject) {
+        const bool ok = pipeclient::clearClipboard(g_boxName);
+        hooklog::write(L"[clipboard] OleSetClipboard(NULL) clear -> %d",
+                       ok ? 1 : 0);
+        return ok ? S_OK : E_FAIL;
+    }
+
+    std::wstring text;
+    const bool hasText = textFromDataObject(dataObject, text);
+    if (!hasText) {
+        hooklog::write(L"[clipboard] OleSetClipboard suppressed: no text format");
+        return S_OK;
+    }
+
+    const bool ok = pipeclient::setClipboardText(g_boxName, text);
+    hooklog::write(L"[clipboard] OleSetClipboard text chars=%zu -> %d",
+                   text.size(), ok ? 1 : 0);
+    return ok ? S_OK : E_FAIL;
 }
 
 template <typename Function>
@@ -769,6 +836,8 @@ bool install()
     resolve(L"user32.dll", "EnumClipboardFormats",
             g_originalEnumClipboardFormats,
             L"EnumClipboardFormats");
+    resolve(L"ole32.dll", "OleSetClipboard", g_originalOleSetClipboard,
+            L"OleSetClipboard");
 
     LONG result = DetourTransactionBegin();
     hooklog::write(L"[setup] DetourTransactionBegin -> %ld", result);
@@ -795,6 +864,8 @@ bool install()
            L"CountClipboardFormats");
     attach(g_originalEnumClipboardFormats, hookedEnumClipboardFormats,
            L"EnumClipboardFormats");
+    attach(g_originalOleSetClipboard, hookedOleSetClipboard,
+           L"OleSetClipboard");
 
     result = DetourTransactionCommit();
     hooklog::write(L"[setup] DetourTransactionCommit -> %ld", result);
@@ -831,6 +902,8 @@ void remove()
            L"CountClipboardFormats");
     detach(g_originalEnumClipboardFormats, hookedEnumClipboardFormats,
            L"EnumClipboardFormats");
+    detach(g_originalOleSetClipboard, hookedOleSetClipboard,
+           L"OleSetClipboard");
     const LONG result = DetourTransactionCommit();
     g_installed = false;
     freeFakeClipboardHandles();
