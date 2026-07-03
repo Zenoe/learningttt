@@ -345,6 +345,21 @@ bool contains(const std::wstring& text, const wchar_t* value)
     return text.find(value) != std::wstring::npos;
 }
 
+bool shouldSkipChildHookInjection(LPCWSTR application, LPCWSTR commandLine)
+{
+    const std::wstring appLower = lower(application ? application : L"");
+    const std::wstring cmdLower = lower(commandLine ? commandLine : L"");
+
+    if (contains(appLower, L"\\ai.exe") ||
+        appLower == L"ai.exe" ||
+        contains(cmdLower, L"\\ai.exe") ||
+        cmdLower.rfind(L"ai.exe", 0) == 0) {
+        return true;
+    }
+
+    return false;
+}
+
 bool explorerRevealCommand(LPCWSTR application, LPCWSTR commandLine,
                            std::wstring& selectedPath)
 {
@@ -532,7 +547,11 @@ BOOL WINAPI hookedCreateProcessW(
         return result;
     }
 
-    const bool propagateHook = g_clipboardVirtualization && !g_hookDllPath.empty();
+    const bool skipChildHook = shouldSkipChildHookInjection(application,
+                                                           commandLine);
+    const bool propagateHook = g_clipboardVirtualization &&
+                               !g_hookDllPath.empty() &&
+                               !skipChildHook;
     const bool callerSuspended = (creationFlags & CREATE_SUSPENDED) != 0;
     const DWORD adjustedFlags = propagateHook
         ? (creationFlags | CREATE_SUSPENDED)
@@ -550,6 +569,11 @@ BOOL WINAPI hookedCreateProcessW(
                        processInfo->dwProcessId, injected ? 1 : 0);
         if (!callerSuspended && processInfo->hThread)
             ResumeThread(processInfo->hThread);
+    } else if (result && skipChildHook && processInfo) {
+        hooklog::write(L"[child] HookDll injection skipped pid=%lu app=%s cmd=%s",
+                       processInfo->dwProcessId,
+                       safe(application),
+                       safe(commandLine));
     }
 
     hooklog::write(L"[return] CreateProcessW -> %d gle=%lu (passed through)",
