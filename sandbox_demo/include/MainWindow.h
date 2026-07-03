@@ -61,10 +61,11 @@ private:
     bool hasOtherSandboxInBox(const std::wstring& boxName, DWORD exceptPid) const;
     void unregisterWfp(SandboxedProcess& sp);
     SandboxedProcess* findSandboxForPath(const QString& path);
+    SandboxedProcess* findActiveBox(const QString& boxName);
     SandboxedProcess* findPassiveBox(const QString& boxName);
     QString boxDriveRoot(const SandboxedProcess& sp) const;
     QString chooseViewerExecutable(const QString& filePath) const;
-    bool openConfiguredBoxVaultInExplorer();
+    bool openConfiguredBoxInExplorer();
 
     // ---- Driver panel ----
     QLineEdit*   m_sysPath      = nullptr;
@@ -85,11 +86,7 @@ private:
     QComboBox*   m_exePath       = nullptr;
     QLineEdit*   m_boxName       = nullptr;
     QLineEdit*   m_fsRoot        = nullptr;
-    QLineEdit*   m_vaultDir      = nullptr;
-    QLineEdit*   m_vaultSizeMb   = nullptr;
     QCheckBox*   m_chkQuickTest  = nullptr;
-    QCheckBox*   m_chkPassphrase = nullptr;
-    QLineEdit*   m_passphrase    = nullptr;
     QLineEdit*   m_extraArgs     = nullptr;
     QCheckBox*   m_chkRestrictUI = nullptr;
     QCheckBox*   m_chkKillOnClose= nullptr;
@@ -111,7 +108,6 @@ private:
     // ---- Engine / state ----
     SandboxEngine   m_engine;
     DriverManager   m_driver;
-    VaultManager    m_explorerVault;
     ProcessMonitor* m_monitor    = nullptr;
     QTimer*         m_statsTimer = nullptr;
     QTimer*         m_borderTimer = nullptr;
@@ -121,5 +117,4 @@ private:
     std::vector<SandboxedProcess> m_normalProcs;
     std::vector<SandboxedProcess> m_sandboxProcs;
     std::vector<SandboxedProcess> m_passiveBoxSessions;
-    std::vector<std::wstring> m_explorerMountedVaults;
 };

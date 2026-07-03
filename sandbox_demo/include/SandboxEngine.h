@@ -7,13 +7,10 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
-#include <array>
-#include <cstdint>
 #include <string>
 #include <vector>
 #include <functional>
 #include "NtDefs.h"
-#include "VaultManager.h"
 
 #ifndef SANDBOX_LOG_CALLBACK_DEFINED
 #define SANDBOX_LOG_CALLBACK_DEFINED
@@ -28,15 +25,10 @@ struct SandboxedProcess {
     HANDLE hNamespaceDir= nullptr;
     std::wstring boxName;
     std::wstring fsRoot;
-    std::wstring vaultFilePath;
-    std::wstring vaultMountPoint;
-    std::wstring mountPointNt;
-    std::wstring bitLockerRecoveryPassword;
     std::vector<DWORD> driverPids;
     bool   wfpEnabled   = false;
     bool   driverRegistered = false;
     ULONG  wfpVnicIp    = 0;
-    bool   vaultMounted  = false;
     bool   valid        = false;
     bool   suspended    = false;
 };
@@ -46,11 +38,6 @@ struct SandboxConfig {
     std::wstring executablePath;
     std::wstring commandLine;
     std::wstring fsRootBase;
-    bool useVault = true;
-    std::wstring vaultDir = L"C:\\SandboxBoxes";
-    std::wstring mountDir = L"C:\\SandboxMounts";
-    uint64_t vaultSizeMB = 512;
-    std::wstring passphrase;
     std::wstring borderDllPath;   // path to injected shell broker; empty = skip
     bool restrictUI     = true;
     bool isolateClipboard = true;
@@ -77,7 +64,6 @@ public:
     static std::wstring describeJob(HANDLE hJob);
 private:
     LogCallback m_log;
-    VaultManager m_vault;
 
     HANDLE createPrivateNamespace(const std::wstring& boxName);
     HANDLE createJobObject(const SandboxConfig& cfg);

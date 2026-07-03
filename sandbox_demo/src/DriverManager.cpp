@@ -5,7 +5,6 @@
 #include <filesystem>
 #include <sstream>
 #include <cassert>
-#include <wincrypt.h>
 
 namespace fs = std::filesystem;
 
@@ -368,58 +367,6 @@ bool DriverManager::setWfpPolicy(DWORD pid,
                 std::to_wstring(pid));
         }
     }
-    return ok;
-}
-
-bool DriverManager::setCryptoKey(const std::wstring& boxName,
-    const std::array<uint8_t, 32>& masterKey,
-    const std::array<uint8_t, 32>& hmacKey)
-{
-    SANDBOX_CRYPTO_INFO info{};
-    wcsncpy_s(info.BoxName, boxName.c_str(), SANDBOX_MAX_BOX - 1);
-    memcpy(info.MasterKey, masterKey.data(), masterKey.size());
-    memcpy(info.HmacKey, hmacKey.data(), hmacKey.size());
-    info.BlockSize = CRYPTO_BLOCK_SIZE;
-
-    bool ok = sendIoctl(IOCTL_SANDBOX_SET_CRYPTO_KEY,
-        &info, sizeof(info),
-        nullptr, 0);
-
-    SecureZeroMemory(&info, sizeof(info));
-    if (ok)
-        log(L"[Driver][Crypto] key installed for box='" + boxName + L"'");
-    return ok;
-}
-
-bool DriverManager::clearCryptoKey(const std::wstring& boxName)
-{
-    SANDBOX_CRYPTO_INFO info{};
-    wcsncpy_s(info.BoxName, boxName.c_str(), SANDBOX_MAX_BOX - 1);
-
-    bool ok = sendIoctl(IOCTL_SANDBOX_CLEAR_CRYPTO_KEY,
-        &info, sizeof(info),
-        nullptr, 0);
-
-    SecureZeroMemory(&info, sizeof(info));
-    if (ok)
-        log(L"[Driver][Crypto] key cleared for box='" + boxName + L"'");
-    return ok;
-}
-
-bool DriverManager::setMountPoint(const std::wstring& boxName,
-    const std::wstring& mountPointNt)
-{
-    SANDBOX_MOUNT_POINT_INFO info{};
-    wcsncpy_s(info.BoxName, boxName.c_str(), SANDBOX_MAX_BOX - 1);
-    wcsncpy_s(info.MountPointNt, mountPointNt.c_str(), SANDBOX_MAX_PATH - 1);
-
-    bool ok = sendIoctl(IOCTL_SANDBOX_SET_MOUNT_POINT,
-        &info, sizeof(info),
-        nullptr, 0);
-
-    if (ok)
-        log(L"[Driver][Vault] mount point set for box='" + boxName +
-            L"' -> " + mountPointNt);
     return ok;
 }
 

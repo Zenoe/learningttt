@@ -47,16 +47,6 @@ typedef struct _BOX_ENTRY {
     WCHAR           BoxNameBuf[SANDBOX_MAX_BOX];
     WCHAR           SandboxRootBuf[SANDBOX_MAX_PATH];
     WCHAR           RealRootBuf[SANDBOX_MAX_PATH];
-
-    BOOLEAN         CryptoEnabled;
-    UCHAR           MasterKey[32];
-    UCHAR           HmacKey[32];
-    ULONG           CryptoBlockSize;
-
-    BOOLEAN         AccessControlEnabled;
-    ULONG           ControllerPid;
-    UNICODE_STRING  MountPointNt;
-    WCHAR           MountPointBuf[SANDBOX_MAX_PATH];
 } BOX_ENTRY, * PBOX_ENTRY;
 
 // ============================================================
@@ -184,32 +174,6 @@ SandboxFlt_PreNetworkQueryOpen(
     _In_     PCFLT_RELATED_OBJECTS           FltObjects,
     _Outptr_result_maybenull_ PVOID* CompletionContext);
 
-FLT_PREOP_CALLBACK_STATUS
-SandboxFlt_PreRead(
-    _Inout_  PFLT_CALLBACK_DATA              Data,
-    _In_     PCFLT_RELATED_OBJECTS           FltObjects,
-    _Outptr_result_maybenull_ PVOID* CompletionContext);
-
-FLT_POSTOP_CALLBACK_STATUS
-SandboxFlt_PostRead(
-    _Inout_  PFLT_CALLBACK_DATA              Data,
-    _In_     PCFLT_RELATED_OBJECTS           FltObjects,
-    _In_opt_ PVOID                           CompletionContext,
-    _In_     FLT_POST_OPERATION_FLAGS        Flags);
-
-FLT_PREOP_CALLBACK_STATUS
-SandboxFlt_PreWrite(
-    _Inout_  PFLT_CALLBACK_DATA              Data,
-    _In_     PCFLT_RELATED_OBJECTS           FltObjects,
-    _Outptr_result_maybenull_ PVOID* CompletionContext);
-
-FLT_POSTOP_CALLBACK_STATUS
-SandboxFlt_PostWrite(
-    _Inout_  PFLT_CALLBACK_DATA              Data,
-    _In_     PCFLT_RELATED_OBJECTS           FltObjects,
-    _In_opt_ PVOID                           CompletionContext,
-    _In_     FLT_POST_OPERATION_FLAGS        Flags);
-
 // IOCTL dispatch
 NTSTATUS SandboxFlt_DispatchCreate(
     _In_ PDEVICE_OBJECT DevObj,
@@ -263,24 +227,6 @@ ULONG Pid_CopyProcessList(
     _In_ ULONG MaxEntries);
 
 PBOX_ENTRY Filter_GetCurrentBox(VOID);
-
-NTSTATUS Crypto_Initialize(VOID);
-VOID     Crypto_Cleanup(VOID);
-
-NTSTATUS Crypto_EncryptBlock(
-    _In_  PBOX_ENTRY Box,
-    _In_  ULONG BlockIndex,
-    _In_reads_(CRYPTO_BLOCK_SIZE) const UCHAR* Plaintext,
-    _Out_writes_(CRYPTO_BLOCK_SIZE + CRYPTO_HEADER_SIZE) UCHAR* Ciphertext);
-
-NTSTATUS Crypto_DecryptBlock(
-    _In_  PBOX_ENTRY Box,
-    _In_  ULONG BlockIndex,
-    _In_reads_(CRYPTO_BLOCK_SIZE + CRYPTO_HEADER_SIZE) const UCHAR* Ciphertext,
-    _Out_writes_(CRYPTO_BLOCK_SIZE) UCHAR* Plaintext);
-
-LONGLONG Crypto_LogicalToPhysical(_In_ LONGLONG LogicalOffset);
-LONGLONG Crypto_PhysicalToLogical(_In_ LONGLONG PhysicalOffset);
 
 // WFP source-IP forcing
 NTSTATUS SandboxWfp_Register(

@@ -30,26 +30,6 @@ static std::wstring withTrailingSlash(std::wstring path)
     return path;
 }
 
-static std::wstring queryNtDeviceForMountPoint(const std::wstring& mountPoint)
-{
-    wchar_t volumeName[MAX_PATH]{};
-    std::wstring mount = withTrailingSlash(mountPoint);
-    if (!GetVolumeNameForVolumeMountPointW(mount.c_str(), volumeName, MAX_PATH))
-        return {};
-
-    std::wstring dosName(volumeName);
-    if (dosName.rfind(L"\\\\?\\", 0) == 0)
-        dosName.erase(0, 4);
-    while (!dosName.empty() && dosName.back() == L'\\')
-        dosName.pop_back();
-
-    wchar_t deviceName[1024]{};
-    if (!QueryDosDeviceW(dosName.c_str(), deviceName, 1024))
-        return {};
-
-    return deviceName;
-}
-
 static bool isChromiumFamilyPath(std::wstring path)
 {
     std::transform(path.begin(), path.end(), path.begin(), ::towlower);
@@ -206,62 +186,8 @@ SandboxedProcess SandboxEngine::launch(const SandboxConfig& cfg)
         std::wstring(cfg.killOnClose ? L"yes" : L"no") + L")");
 
     // STEP 3 — Filesystem Root Preparation
-    //   Vault mode stores the sandbox tree inside a VHDX-backed .vault file
-    //   and exposes only the mounted NTFS directory to the minifilter.
-    if (cfg.useVault) {
-        std::wstring vaultFilePath = (fs::path(cfg.vaultDir) /
-            (cfg.boxName + L".vault")).wstring();
-        std::array<uint8_t, 32> salt{};
-        if (!m_vault.loadOrCreateSalt(vaultFilePath, salt, m_log)) {
-            log(L"[!] Failed to load or create vault salt.");
-            if (result.hJob) CloseHandle(result.hJob);
-            if (result.hNamespaceDir) ClosePrivateNamespace(result.hNamespaceDir, 0);
-            return result;
-        }
-
-        VaultManager::VaultConfig vaultCfg;
-        vaultCfg.vaultFilePath = vaultFilePath;
-        vaultCfg.mountPoint = (fs::path(cfg.mountDir) / cfg.boxName).wstring();
-        vaultCfg.boxName = cfg.boxName;
-        vaultCfg.passphrase = cfg.passphrase;
-        vaultCfg.sizeMB = cfg.vaultSizeMB;
-        vaultCfg.salt = salt;
-
-        result.vaultFilePath = vaultCfg.vaultFilePath;
-        result.vaultMountPoint = vaultCfg.mountPoint;
-        result.fsRoot = m_vault.createAndMount(vaultCfg, m_log);
-        result.bitLockerRecoveryPassword =
-            m_vault.takePendingRecoveryPassword(vaultCfg.vaultFilePath);
-        SecureZeroMemory(vaultCfg.passphrase.data(),
-            vaultCfg.passphrase.size() * sizeof(wchar_t));
-        SecureZeroMemory(&vaultCfg.salt, sizeof(vaultCfg.salt));
-        SecureZeroMemory(salt.data(), salt.size());
-
-        if (result.fsRoot.empty()) {
-            log(L"[!] Failed to create or mount vault.");
-            if (result.hJob) CloseHandle(result.hJob);
-            if (result.hNamespaceDir) ClosePrivateNamespace(result.hNamespaceDir, 0);
-            return result;
-        }
-
-        result.vaultMounted = true;
-        result.mountPointNt = queryNtDeviceForMountPoint(result.fsRoot);
-        if (result.mountPointNt.empty()) {
-            log(L"[!] Failed to resolve vault mount NT device path.");
-            m_vault.unmount(result.vaultFilePath, m_log);
-            result.vaultMounted = false;
-            if (result.hJob) CloseHandle(result.hJob);
-            if (result.hNamespaceDir) ClosePrivateNamespace(result.hNamespaceDir, 0);
-            return result;
-        }
-
-        result.fsRoot = prepareFsRootAt(result.fsRoot);
-        log(L"[+] Vault root: " + result.fsRoot);
-        log(L"[+] Vault device: " + result.mountPointNt);
-    }
-    else {
-        result.fsRoot = prepareFsRoot(cfg.fsRootBase, cfg.boxName);
-    }
+    //   Directory-backed overlay root used by SandboxFlt path redirection.
+    result.fsRoot = prepareFsRoot(cfg.fsRootBase, cfg.boxName);
     log(L"[+] FS root: " + result.fsRoot);
 
     // STEP 4 — Spawn process suspended → assign to Job.
@@ -277,10 +203,6 @@ SandboxedProcess SandboxEngine::launch(const SandboxConfig& cfg)
         if (result.hNamespaceDir) {
             ClosePrivateNamespace(result.hNamespaceDir, 0);
             result.hNamespaceDir = nullptr;
-        }
-        if (result.vaultMounted) {
-            m_vault.unmount(result.vaultFilePath, m_log);
-            result.vaultMounted = false;
         }
         return result;
     }
@@ -375,10 +297,6 @@ void SandboxEngine::release(SandboxedProcess& sp)
     if (sp.hNamespaceDir) {
         ClosePrivateNamespace(sp.hNamespaceDir, 0);
         sp.hNamespaceDir = nullptr;
-    }
-    if (sp.vaultMounted) {
-        m_vault.unmount(sp.vaultFilePath, m_log);
-        sp.vaultMounted = false;
     }
     sp.valid = false;
     sp.suspended = false;
