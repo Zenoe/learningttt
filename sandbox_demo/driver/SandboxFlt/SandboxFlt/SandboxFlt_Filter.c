@@ -541,11 +541,36 @@ static BOOLEAN Path_GetVolumeRelative(
     return TRUE;
 }
 
+static BOOLEAN Path_IsNtDevicePath(_In_ PC_UNICODE_STRING Path)
+{
+    UNICODE_STRING prefix;
+    UNICODE_STRING sub;
+
+    RtlInitUnicodeString(&prefix, L"\\Device\\");
+    if (!Path || Path->Length < prefix.Length)
+        return FALSE;
+
+    sub.Buffer = Path->Buffer;
+    sub.Length = prefix.Length;
+    sub.MaximumLength = prefix.Length;
+    return RtlCompareUnicodeString(&sub, &prefix, TRUE) == 0;
+}
+
+static BOOLEAN Box_UsesAbsoluteSandboxRoot(_In_ PBOX_ENTRY Box)
+{
+    return Box && Path_IsNtDevicePath((PC_UNICODE_STRING)&Box->SandboxRootNt);
+}
+
 static BOOLEAN Path_IsInSandbox(
     _In_ PC_UNICODE_STRING FullPath,
     _In_ PBOX_ENTRY Box)
 {
     UNICODE_STRING relPath;
+
+    if (Box_UsesAbsoluteSandboxRoot(Box)) {
+        return Path_StartsWith(FullPath,
+            (PC_UNICODE_STRING)&Box->SandboxRootNt);
+    }
 
     if (!Path_GetVolumeRelative(FullPath, &relPath))
         return FALSE;
@@ -752,7 +777,7 @@ static BOOLEAN Path_IsExcluded(
 static BOOLEAN Path_EnsureParentDir(
     _In_ PFLT_INSTANCE     Instance,
     _In_ PC_UNICODE_STRING SandboxFilePath,
-    _In_ PC_UNICODE_STRING SandboxRootNt)   /* volume-relative root */
+    _In_ PC_UNICODE_STRING SandboxRootNt)
 {
     PWCHAR          pathBuf;
     USHORT          charCount;
@@ -764,6 +789,7 @@ static BOOLEAN Path_EnsureParentDir(
     IO_STATUS_BLOCK   iosb;
     HANDLE            h;
     NTSTATUS          st;
+    PFLT_INSTANCE     createInstance;
 
     charCount = SandboxFilePath->Length / sizeof(WCHAR);
 
@@ -796,14 +822,18 @@ static BOOLEAN Path_EnsureParentDir(
         return FALSE;
     }
 
-    /* Find where the subdirectories begin — skip the sandbox root itself
-     * (e.g. \SandboxDemo\Box\drive) since that was created in user mode.
-     * rootRelEnd = volumeEnd + length-of-SandboxRootNt-in-chars */
-    rootRelEnd = volumeEnd + (SandboxRootNt->Length / sizeof(WCHAR));
+    /* Find where the subdirectories begin.  Relative roots are appended to
+     * the original volume prefix; absolute VHD roots already include it. */
+    if (Path_IsNtDevicePath(SandboxRootNt))
+        rootRelEnd = SandboxRootNt->Length / sizeof(WCHAR);
+    else
+        rootRelEnd = volumeEnd + (SandboxRootNt->Length / sizeof(WCHAR));
     if (rootRelEnd >= charCount) {
         ExFreePoolWithTag(pathBuf, SANDBOX_POOL_TAG);
         return TRUE;
     }
+
+    createInstance = Path_IsNtDevicePath(SandboxRootNt) ? NULL : Instance;
 
     /* Walk from rootRelEnd+1, creating each new directory component */
     for (i = rootRelEnd + 1; i <= charCount; i++) {
@@ -821,7 +851,7 @@ static BOOLEAN Path_EnsureParentDir(
 
             st = FltCreateFile(
                 g_Sandbox.FilterHandle,
-                Instance,
+                createInstance,
                 &h,
                 FILE_LIST_DIRECTORY | SYNCHRONIZE,
                 &oa, &iosb, NULL,
@@ -892,16 +922,24 @@ Path_BuildRedirect(
     relPath.Length = relPath.MaximumLength =
         OriginalPath->Length - volumePrefix.Length;
 
-    totalChars = (USHORT)((volumePrefix.Length + Box->SandboxRootNt.Length +
-        relPath.Length) / sizeof(WCHAR) + 1);
+    if (Box_UsesAbsoluteSandboxRoot(Box)) {
+        totalChars = (USHORT)((Box->SandboxRootNt.Length +
+            relPath.Length) / sizeof(WCHAR) + 1);
+    }
+    else {
+        totalChars = (USHORT)((volumePrefix.Length + Box->SandboxRootNt.Length +
+            relPath.Length) / sizeof(WCHAR) + 1);
+    }
 
     buf = (PWCHAR)ExAllocatePoolWithTag(NonPagedPool,
         totalChars * sizeof(WCHAR), SANDBOX_POOL_TAG);
     if (!buf) return STATUS_INSUFFICIENT_RESOURCES;
 
     off = 0;
-    RtlCopyMemory(buf + off, volumePrefix.Buffer, volumePrefix.Length);
-    off += volumePrefix.Length / sizeof(WCHAR);
+    if (!Box_UsesAbsoluteSandboxRoot(Box)) {
+        RtlCopyMemory(buf + off, volumePrefix.Buffer, volumePrefix.Length);
+        off += volumePrefix.Length / sizeof(WCHAR);
+    }
     RtlCopyMemory(buf + off, Box->SandboxRootNt.Buffer, Box->SandboxRootNt.Length);
     off += Box->SandboxRootNt.Length / sizeof(WCHAR);
     RtlCopyMemory(buf + off, relPath.Buffer, relPath.Length);
@@ -923,6 +961,9 @@ Path_BuildRedirectRelative(
     USHORT i, slashCount, volumeEnd, charCount, totalChars, off;
     PWCHAR p, buf;
     UNICODE_STRING relPath;
+
+    if (Box_UsesAbsoluteSandboxRoot(Box))
+        return Path_BuildRedirect(OriginalPath, Box, RedirectedPath);
 
     slashCount = 0;
     volumeEnd = 0;
@@ -992,7 +1033,7 @@ Path_SandboxFileExists(
     NTSTATUS status;
 
     openPath = *SandboxPath;
-    instance = FltObjects->Instance;
+    instance = Box_UsesAbsoluteSandboxRoot(Box) ? NULL : FltObjects->Instance;
 
     InitializeObjectAttributes(&oa, &openPath,
         OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
@@ -1165,6 +1206,14 @@ SandboxFlt_PreCreate(
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
+    if (Box_UsesAbsoluteSandboxRoot(box) &&
+        Path_StartsWith((PC_UNICODE_STRING)&nameInfo->Name,
+            (PC_UNICODE_STRING)&box->SandboxRootNt)) {
+        FltReleaseFileNameInformation(nameInfo);
+        InterlockedIncrement(&g_Sandbox.TotalPassThrough);
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
     if (Path_IsExcluded((PC_UNICODE_STRING)&relPath,
         (PC_UNICODE_STRING)&box->SandboxRootNt)) {
         FltReleaseFileNameInformation(nameInfo);
@@ -1247,6 +1296,33 @@ SandboxFlt_PreCreate(
     // RelatedFileObject 通常用于表示相对于某个目录的文件
     // 设为 NULL 确保路径替换时不会产生相对路径解析问题 避免内核混淆"这个文件相对于什么"
     Data->Iopb->TargetFileObject->RelatedFileObject = NULL;
+    if (Box_UsesAbsoluteSandboxRoot(box)) {
+        status = IoReplaceFileObjectName(Data->Iopb->TargetFileObject,
+            fullPath.Buffer, fullPath.Length);
+        if (NT_SUCCESS(status)) {
+            FltSetCallbackDataDirty(Data);
+            Data->IoStatus.Status = STATUS_REPARSE;
+            Data->IoStatus.Information = IO_REPARSE;
+            InterlockedIncrement(&g_Sandbox.TotalRedirects);
+            SandboxFlt_RecordRedirectPath((PC_UNICODE_STRING)&fullPath);
+            if (isWrite)
+                Cache_Add(g_WritePathCache, WRITE_PATH_CACHE_SIZE, writeKey);
+        }
+        else {
+            InterlockedIncrement(&g_Sandbox.TotalPassThrough);
+            DbgPrint("[SandboxFlt] absolute IoReplaceFileObjectName failed: %08x\n",
+                status);
+        }
+
+        if (fullPath.Buffer)
+            ExFreePoolWithTag(fullPath.Buffer, SANDBOX_POOL_TAG);
+        if (fileObjectPath.Buffer)
+            ExFreePoolWithTag(fileObjectPath.Buffer, SANDBOX_POOL_TAG);
+        return NT_SUCCESS(status)
+            ? FLT_PREOP_COMPLETE
+            : FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
     status = IoReplaceFileObjectName(Data->Iopb->TargetFileObject,
         fileObjectPath.Buffer, fileObjectPath.Length);
     if (NT_SUCCESS(status)) {
@@ -1369,6 +1445,9 @@ SandboxPath_OpenForInformation(
 
     InitializeObjectAttributes(&oa, (PUNICODE_STRING)SandboxPath,
         OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    if (Path_IsNtDevicePath(SandboxPath))
+        Instance = NULL;
 
     return FltCreateFileEx(g_Sandbox.FilterHandle,
         Instance,

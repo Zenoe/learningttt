@@ -99,6 +99,17 @@ static bool pathIsSameOrChildOf(const QString& path, const QString& root)
            candidate.startsWith(cleanRoot, Qt::CaseInsensitive);
 }
 
+static QString volumeRelativeForDriver(QString sandboxRoot)
+{
+    sandboxRoot = QDir::toNativeSeparators(sandboxRoot);
+    if (sandboxRoot.length() >= 2 && sandboxRoot[1] == ':')
+        sandboxRoot = sandboxRoot.mid(2);
+    sandboxRoot = sandboxRoot.replace('/', '\\');
+    if (!sandboxRoot.startsWith('\\'))
+        sandboxRoot.prepend('\\');
+    return sandboxRoot;
+}
+
 static QLineEdit* makeEdit(const QString& ph, const QFont& f) {
     auto* e = new QLineEdit;
     e->setPlaceholderText(ph);
@@ -410,6 +421,11 @@ MainWindow::MainWindow(QWidget* parent)
         QMetaObject::invokeMethod(this, [this, text] { appendLog(text); },
             Qt::QueuedConnection);
     })
+    , m_vaults([this](const std::wstring& m) {
+        const QString text = QString::fromStdWString(m);
+        QMetaObject::invokeMethod(this, [this, text] { appendLog(text); },
+            Qt::QueuedConnection);
+    })
     , m_monitor(new ProcessMonitor(this))
     , m_statsTimer(new QTimer(this))
     , m_borderTimer(new QTimer(this))
@@ -484,14 +500,17 @@ MainWindow::~MainWindow()
             TerminateProcess(sp.hProcess, 0);
         unregisterDriverPids(sp);
         m_engine.release(sp);
+        releaseVaultIfUnused(sp.boxName);
     }
     for (auto& sp : m_passiveBoxSessions) {
         if (m_driver.isLoaded()) {
             m_driver.removeBox(sp.boxName);
         }
         m_engine.release(sp);
+        releaseVaultIfUnused(sp.boxName);
     }
     for (auto& sp : m_normalProcs)  m_engine.release(sp);
+    m_vaults.unmountAll();
 }
 
 // ============================================================
@@ -597,8 +616,8 @@ void MainWindow::setupUi()
 
     m_boxName   = makeEdit("Box00", mono);
     m_boxName->setText("Box00");
-    m_fsRoot    = makeEdit("C:\\SandboxDemo", mono);
-    m_fsRoot->setText("C:\\SandboxDemo");
+    m_fsRoot    = makeEdit("C:\\SandboxBoxes", mono);
+    m_fsRoot->setText(QString::fromStdWString(VaultManager::defaultBaseDir()));
     m_chkQuickTest = new QCheckBox("quickTest (skip driver)");
     m_chkQuickTest->setChecked(false);
     m_extraArgs = makeEdit("(optional extra arguments)", mono);
@@ -609,7 +628,7 @@ void MainWindow::setupUi()
     cfgGrid->addWidget(m_exePath,   0, 1); cfgGrid->addWidget(m_btnBrowse, 0, 2);
     cfgGrid->addWidget(makeLabel("Box Name:"),   1, 0);
     cfgGrid->addWidget(m_boxName,   1, 1);
-    cfgGrid->addWidget(makeLabel("Root Dir:"),  2, 0);
+    cfgGrid->addWidget(makeLabel("Vault Base:"),  2, 0);
     cfgGrid->addWidget(m_fsRoot,    2, 1);
     cfgGrid->addWidget(makeLabel("Mode:"), 3, 0);
     cfgGrid->addWidget(m_chkQuickTest, 3, 1);
@@ -962,7 +981,8 @@ void MainWindow::onLaunchSandboxed()
     if (uniqueBox.isEmpty()) uniqueBox = "Box00";
 
     QString rootDir = m_fsRoot->text().trimmed();
-    if (rootDir.isEmpty()) rootDir = "C:\\SandboxDemo";
+    if (rootDir.isEmpty())
+        rootDir = QString::fromStdWString(VaultManager::defaultBaseDir());
     const bool quickTest = m_chkQuickTest->isChecked();
 
     appendLog("--- Launch SANDBOXED box=\"" + uniqueBox + "\" ---");
@@ -1010,6 +1030,21 @@ void MainWindow::onLaunchSandboxed()
     const bool reuseExistingBox = existingBox && existingBox->valid &&
         existingBox->hJob && !existingBox->fsRoot.empty();
 
+    if (!reuseExistingBox && !quickTest) {
+        auto vault = m_vaults.mountBox(rootDir.toStdWString(),
+                                       uniqueBox.toStdWString());
+        if (!vault) {
+            appendLog("! VHD vault mount failed; sandboxed launch aborted.");
+            return;
+        }
+        const QFileInfo mountInfo(
+            QDir::toNativeSeparators(QString::fromStdWString(vault->mountPoint)));
+        cfg.fsRootBase = mountInfo.absoluteDir().absolutePath().toStdWString();
+        appendLog(QString("  [Vault] Box storage: %1")
+                      .arg(QDir::toNativeSeparators(
+                          QString::fromStdWString(vault->vaultPath))));
+    }
+
     SandboxedProcess sp;
     if (reuseExistingBox) {
         appendLog("  [Sandbox] Reusing existing box job/root.");
@@ -1022,30 +1057,30 @@ void MainWindow::onLaunchSandboxed()
     }
     if (!sp.valid) {
         appendLog("! Process launch failed.");
+        releaseVaultIfUnused(uniqueBox.toStdWString());
         return;
     }
 
-    // ---- Register the directory-backed sandbox root with the driver. ----
+    // ---- Register the vault-backed sandbox root with the driver. ----
     bool driverOk = false;
     if (reuseExistingBox && !quickTest) {
         driverOk = m_driver.isLoaded();
         if (!driverOk) {
             appendLog("! Existing box is open but SandboxFlt driver is not loaded; terminating suspended process.");
             m_engine.release(sp);
+            releaseVaultIfUnused(sp.boxName);
             return;
         }
     }
     else if (!quickTest && m_driver.isLoaded()) {
-        QString sandboxRoot = QString::fromStdWString(sp.fsRoot + L"\\drive");
-        QString sandboxVolRelative = sandboxRoot;
-        if (sandboxVolRelative.length() >= 2 && sandboxVolRelative[1] == ':')
-            sandboxVolRelative = sandboxVolRelative.mid(2);
-        sandboxVolRelative = sandboxVolRelative.replace('/', '\\');
-        if (!sandboxVolRelative.startsWith('\\'))
-            sandboxVolRelative.prepend('\\');
+        std::wstring sandboxRootNt = m_vaults.driverRootNt(sp.boxName);
+        if (sandboxRootNt.empty()) {
+            sandboxRootNt = volumeRelativeForDriver(
+                QString::fromStdWString(sp.fsRoot + L"\\drive")).toStdWString();
+        }
 
         driverOk = m_driver.addBox(uniqueBox.toStdWString(),
-                                    sandboxVolRelative.toStdWString(),
+                                    sandboxRootNt,
                                     L"\\");
         if (driverOk) {
             int pol = m_cmbPolicy->currentIndex();
@@ -1059,6 +1094,7 @@ void MainWindow::onLaunchSandboxed()
                 m_driver.removeBox(uniqueBox.toStdWString());
             }
             m_engine.release(sp);
+            releaseVaultIfUnused(sp.boxName);
             return;
         }
     }
@@ -1077,6 +1113,7 @@ void MainWindow::onLaunchSandboxed()
                 m_driver.removeBox(uniqueBox.toStdWString());
             }
             m_engine.release(sp);
+            releaseVaultIfUnused(sp.boxName);
             return;
         }
         sp.driverRegistered = true;
@@ -1097,12 +1134,14 @@ void MainWindow::onLaunchSandboxed()
                 }
             }
             m_engine.release(sp);
+            releaseVaultIfUnused(sp.boxName);
             return;
         }
 
         if (!driverOk) {
             appendLog("! WFP source-IP forcing requires SandboxFlt driver registration.");
             m_engine.release(sp);
+            releaseVaultIfUnused(sp.boxName);
             return;
         }
 
@@ -1115,6 +1154,7 @@ void MainWindow::onLaunchSandboxed()
                 }
             }
             m_engine.release(sp);
+            releaseVaultIfUnused(sp.boxName);
             return;
         }
 
@@ -1140,6 +1180,7 @@ void MainWindow::onLaunchSandboxed()
             }
         }
         m_engine.release(sp);
+        releaseVaultIfUnused(sp.boxName);
         return;
     }
 
@@ -1254,13 +1295,31 @@ bool MainWindow::openConfiguredBoxInExplorer()
 
     QString rootDir = m_fsRoot->text().trimmed();
     if (rootDir.isEmpty())
-        rootDir = QStringLiteral("C:\\SandboxDemo");
+        rootDir = QString::fromStdWString(VaultManager::defaultBaseDir());
 
-    if (m_chkQuickTest->isChecked())
+    const bool quickTest = m_chkQuickTest->isChecked();
+    if (quickTest)
         rootDir = QDir(rootDir).filePath(QStringLiteral("_quickTest"));
 
-    const QString boxRoot = QDir::toNativeSeparators(
-        QDir(rootDir).filePath(boxName));
+    QString boxRoot;
+    std::wstring driverRootNt;
+    if (quickTest) {
+        boxRoot = QDir::toNativeSeparators(QDir(rootDir).filePath(boxName));
+    }
+    else {
+        auto vault = m_vaults.mountBox(rootDir.toStdWString(),
+                                       boxName.toStdWString());
+        if (!vault) {
+            appendLog("! VHD vault mount failed; Box Explorer aborted.");
+            return false;
+        }
+        boxRoot = QDir::toNativeSeparators(QString::fromStdWString(vault->mountPoint));
+        driverRootNt = vault->driverRootNt;
+        appendLog(QString("  [Vault] Box storage: %1")
+                      .arg(QDir::toNativeSeparators(
+                          QString::fromStdWString(vault->vaultPath))));
+    }
+
     const QString explorerRoot = QDir::toNativeSeparators(
         QDir(boxRoot).filePath(QStringLiteral("drive")));
     QDir().mkpath(explorerRoot);
@@ -1274,37 +1333,44 @@ bool MainWindow::openConfiguredBoxInExplorer()
         m_engine.createBoxSession(sessionCfg, boxRoot.toStdWString());
     if (!session.valid) {
         appendLog("! Failed to create passive box job.");
+        releaseVaultIfUnused(boxName.toStdWString());
         return false;
     }
 
-    QString sandboxRoot = QDir::toNativeSeparators(explorerRoot);
-    QString sandboxVolRelative = sandboxRoot;
-    if (sandboxVolRelative.length() >= 2 && sandboxVolRelative[1] == ':')
-        sandboxVolRelative = sandboxVolRelative.mid(2);
-    sandboxVolRelative = sandboxVolRelative.replace('/', '\\');
-    if (!sandboxVolRelative.startsWith('\\'))
-        sandboxVolRelative.prepend('\\');
+    if (!quickTest && !m_driver.isLoaded()) {
+        appendLog("! SandboxFlt driver must be loaded before opening a passive VHD box.");
+        m_engine.release(session);
+        releaseVaultIfUnused(session.boxName);
+        return false;
+    }
 
-    bool driverOk = m_driver.addBox(session.boxName,
-                                    sandboxVolRelative.toStdWString(),
-                                    L"\\");
+    if (driverRootNt.empty()) {
+        driverRootNt = volumeRelativeForDriver(explorerRoot).toStdWString();
+    }
+
+    bool driverOk = quickTest || m_driver.addBox(session.boxName,
+                                                 driverRootNt,
+                                                 L"\\");
     if (driverOk) {
         const int pol = m_cmbPolicy->currentIndex();
-        m_driver.setPolicy(session.boxName,
-                           (SANDBOX_WRITE_POLICY)pol,
-                           true,
-                           false);
+        if (!quickTest) {
+            m_driver.setPolicy(session.boxName,
+                               (SANDBOX_WRITE_POLICY)pol,
+                               true,
+                               false);
+        }
     }
     if (!driverOk) {
         appendLog("! Failed to register passive box with SandboxFlt driver.");
         m_driver.removeBox(session.boxName);
         m_engine.release(session);
+        releaseVaultIfUnused(session.boxName);
         return false;
     }
 
     m_passiveBoxSessions.push_back(session);
 
-    appendLog(QString("  [Explorer] Opening directory-backed box '%1': %2")
+    appendLog(QString("  [Explorer] Opening vault-backed box '%1': %2")
                   .arg(boxName, explorerRoot));
     if (m_fileExplorer)
         m_fileExplorer->showForPath(explorerRoot, boxName, explorerRoot);
@@ -1325,6 +1391,7 @@ void MainWindow::onKillSelected()
                 TerminateProcess(sp.hProcess, 0);
             unregisterDriverPids(sp);
             m_engine.release(sp);
+            releaseVaultIfUnused(sp.boxName);
             item->setText(4, item->text(4) + " [killed]");
             for (int c = 0; c < m_processTree->columnCount(); ++c)
                 item->setForeground(c, QColor(0xff,0x44,0x44));
@@ -1350,6 +1417,7 @@ void MainWindow::onKillAll()
                 TerminateProcess(sp.hProcess, 0);
             unregisterDriverPids(sp);
             m_engine.release(sp);
+            releaseVaultIfUnused(sp.boxName);
         }
     }
     m_sandboxProcs.clear();
@@ -1359,6 +1427,7 @@ void MainWindow::onKillAll()
                 m_driver.removeBox(sp.boxName);
             }
             m_engine.release(sp);
+            releaseVaultIfUnused(sp.boxName);
         }
     }
     m_passiveBoxSessions.clear();
@@ -1371,6 +1440,7 @@ void MainWindow::onKillAll()
     }
     m_normalProcs.clear();
     m_processTree->clear();
+    m_vaults.unmountAll();
     appendLog("  All processes terminated, boxes unregistered.");
 }
 
@@ -1421,6 +1491,33 @@ bool MainWindow::hasOtherSandboxInBox(const std::wstring& boxName,
     return false;
 }
 
+bool MainWindow::isBoxStillOpen(const std::wstring& boxName) const
+{
+    for (const auto& other : m_sandboxProcs) {
+        if (other.valid && other.boxName == boxName)
+            return true;
+    }
+    for (const auto& other : m_passiveBoxSessions) {
+        if (other.valid && other.boxName == boxName)
+            return true;
+    }
+    return false;
+}
+
+void MainWindow::releaseVaultIfUnused(const std::wstring& boxName)
+{
+    if (boxName.empty() || isBoxStillOpen(boxName) ||
+        !m_vaults.isMounted(boxName)) {
+        return;
+    }
+
+    const QString mountRoot = QDir::toNativeSeparators(
+        QString::fromStdWString(m_vaults.mountPoint(boxName)));
+    if (m_fileExplorer)
+        m_fileExplorer->releasePath(mountRoot);
+    m_vaults.unmountBox(boxName);
+}
+
 void MainWindow::syncDriverPids(SandboxedProcess& sp)
 {
     if (!m_driver.isLoaded() || !sp.valid)
@@ -1451,7 +1548,7 @@ void MainWindow::unregisterDriverPids(SandboxedProcess& sp)
 
 void MainWindow::onFsRootChanged()
 {
-    appendLog("  [Sandbox] Root directory changed: " + m_fsRoot->text());
+    appendLog("  [Vault] Base directory changed: " + m_fsRoot->text());
 }
 
 SandboxedProcess* MainWindow::findSandboxForPath(const QString& path)
@@ -1823,8 +1920,10 @@ void MainWindow::onProcessExited(DWORD pid, const QString& label, DWORD code)
                 appendLog("  [Sandbox] Box job kept alive for other processes.");
             }
             else {
+                const std::wstring boxName = sp.boxName;
                 unregisterDriverPids(sp);
                 m_engine.release(sp);
+                releaseVaultIfUnused(boxName);
             }
             break;
         }
@@ -1833,8 +1932,10 @@ void MainWindow::onProcessExited(DWORD pid, const QString& label, DWORD code)
     for (auto& sp : m_sandboxProcs) {
         if (sp.valid && sp.pid == 0 && sp.hJob &&
             jobActiveProcessCount(sp.hJob) == 0) {
+            const std::wstring boxName = sp.boxName;
             unregisterDriverPids(sp);
             m_engine.release(sp);
+            releaseVaultIfUnused(boxName);
         }
     }
 

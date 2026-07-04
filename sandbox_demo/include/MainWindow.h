@@ -17,6 +17,7 @@
 #include "SandboxEngine.h"
 #include "ProcessMonitor.h"
 #include "DriverManager.h"
+#include "VaultManager.h"
 
 class HookIpcServer;
 class SandboxFileExplorer;
@@ -59,6 +60,8 @@ private:
     void updateSandboxWindowBorders();
     bool isSandboxWindow(HWND hwnd, std::wstring* boxName = nullptr) const;
     bool hasOtherSandboxInBox(const std::wstring& boxName, DWORD exceptPid) const;
+    bool isBoxStillOpen(const std::wstring& boxName) const;
+    void releaseVaultIfUnused(const std::wstring& boxName);
     void unregisterWfp(SandboxedProcess& sp);
     SandboxedProcess* findSandboxForPath(const QString& path);
     SandboxedProcess* findActiveBox(const QString& boxName);
@@ -108,6 +111,7 @@ private:
     // ---- Engine / state ----
     SandboxEngine   m_engine;
     DriverManager   m_driver;
+    VaultManager    m_vaults;
     ProcessMonitor* m_monitor    = nullptr;
     QTimer*         m_statsTimer = nullptr;
     QTimer*         m_borderTimer = nullptr;
