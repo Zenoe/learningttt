@@ -120,7 +120,10 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <Inf Include="SandboxFlt.inf" />
+    <Inf Include="SandboxFlt.inf">
+      <DateStamp>01/01/2025</DateStamp>
+      <TimeStamp>1.0.0.0</TimeStamp>
+    </Inf>
   </ItemGroup>
   <ItemGroup>
     <FilesToPackage Include="$(TargetPath)" />
