@@ -166,6 +166,8 @@ bool VaultManager::unmountBox(const std::wstring& boxName)
     const std::wstring mountPoint = it->second.info.mountPoint;
     bool ok = true;
 
+    DeleteVolumeMountPointW(withTrailingSlash(mountPoint).c_str());
+
     if (it->second.handle) {
         DWORD err = DetachVirtualDisk(it->second.handle,
                                       DETACH_VIRTUAL_DISK_FLAG_NONE,
@@ -342,6 +344,10 @@ bool VaultManager::prepareMountedVolume(HANDLE handle,
     ULONG diskNumber = 0;
     if (!getAttachedDiskNumber(handle, diskNumber))
         return false;
+    if (!waitForDiskpartDisk(diskNumber))
+        return false;
+
+    DeleteVolumeMountPointW(withTrailingSlash(mountPoint).c_str());
 
     auto buildScript = [&](bool initialize) {
         std::wstring script;
@@ -363,15 +369,33 @@ bool VaultManager::prepareMountedVolume(HANDLE handle,
     };
 
     bool ok = runDiskpartScript(buildScript(freshVault));
-    if (!ok && !freshVault) {
-        log(L"[Vault] Existing vault did not mount; trying one-time partition initialization.");
-        ok = runDiskpartScript(buildScript(true));
+    if (!ok && freshVault) {
+        log(L"[Vault] Fresh vault initialization failed.");
     }
 
     return ok;
 }
 
-bool VaultManager::runDiskpartScript(const std::wstring& script)
+bool VaultManager::waitForDiskpartDisk(ULONG diskNumber)
+{
+    std::wstring probe =
+        L"select disk " + std::to_wstring(diskNumber) + L"\r\n"
+        L"exit\r\n";
+
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        if (runDiskpartScript(probe, false))
+            return true;
+        Sleep(250);
+    }
+
+    log(L"[Vault] Timed out waiting for diskpart to see disk " +
+        std::to_wstring(diskNumber));
+    runDiskpartScript(probe, true);
+    return false;
+}
+
+bool VaultManager::runDiskpartScript(const std::wstring& script,
+                                     bool logFailure)
 {
     wchar_t tempDir[MAX_PATH]{};
     wchar_t tempFile[MAX_PATH]{};
@@ -463,6 +487,10 @@ bool VaultManager::runDiskpartScript(const std::wstring& script)
     DeleteFileW(tempFile);
 
     if (exitCode != 0) {
+        if (!logFailure) {
+            DeleteFileW(tempOutput);
+            return false;
+        }
         log(L"[Vault] diskpart failed with exit code " +
             std::to_wstring(exitCode));
         std::ifstream diskpartOutput(tempOutput, std::ios::binary);

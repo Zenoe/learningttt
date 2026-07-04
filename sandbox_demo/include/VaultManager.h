@@ -46,8 +46,10 @@ private:
 
     bool createVaultFile(const std::wstring& vaultPath);
     bool openAndAttach(const std::wstring& vaultPath, HANDLE& handle);
-    bool runDiskpartScript(const std::wstring& script);
+    bool runDiskpartScript(const std::wstring& script,
+                           bool logFailure = true);
     bool getAttachedDiskNumber(HANDLE handle, ULONG& diskNumber);
+    bool waitForDiskpartDisk(ULONG diskNumber);
     bool prepareMountedVolume(HANDLE handle,
                               const std::wstring& mountPoint,
                               const std::wstring& boxName,
