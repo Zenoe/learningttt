@@ -227,6 +227,12 @@ static volatile LONG g_DirPathCache[DIR_PATH_CACHE_SIZE];
 #define WORD_SAVE_TRACK_MASK (WORD_SAVE_TRACK_SIZE - 1)
 #define WORD_SAVE_TRACK_PROBES 4
 #define WORD_COPY_BUFFER_SIZE (64 * 1024)
+#define RENAME_DIAG_SIZE 64
+#define RENAME_DIAG_MASK (RENAME_DIAG_SIZE - 1)
+
+#ifndef STATUS_VHD_INVALID_STATE
+#define STATUS_VHD_INVALID_STATE ((NTSTATUS)0xC03A001CL)
+#endif
 
 typedef struct _WORD_SAVE_TARGET {
     ULONG  Pid;
@@ -234,8 +240,20 @@ typedef struct _WORD_SAVE_TARGET {
     WCHAR  TargetPath[SANDBOX_MAX_PATH];
 } WORD_SAVE_TARGET;
 
+typedef struct _RENAME_DIAG_ENTRY {
+    ULONG Pid;
+    ULONG SourceKey;
+    ULONG DestKey;
+    ULONG Class;
+    NTSTATUS Status;
+    ULONG Count;
+    CHAR Stage[24];
+} RENAME_DIAG_ENTRY;
+
 static WORD_SAVE_TARGET g_WordSaveTargets[WORD_SAVE_TRACK_SIZE];
 static KSPIN_LOCK g_WordSaveLock;
+static RENAME_DIAG_ENTRY g_RenameDiag[RENAME_DIAG_SIZE];
+static KSPIN_LOCK g_RenameDiagLock;
 
 static const FLT_CONTEXT_REGISTRATION c_ContextReg[] = {
     {
@@ -256,6 +274,7 @@ const FLT_CONTEXT_REGISTRATION* Filter_GetContextReg(VOID)
 VOID Filter_InitRuntimeState(VOID)
 {
     KeInitializeSpinLock(&g_WordSaveLock);
+    KeInitializeSpinLock(&g_RenameDiagLock);
 }
 
 NTSTATUS Filter_SetProcContext(ULONG Pid, PBOX_ENTRY Box)
@@ -911,20 +930,40 @@ static BOOLEAN Path_EnsureParentDir(
             InitializeObjectAttributes(&oa, &dirPath,
                 OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-            st = FltCreateFile(
-                g_Sandbox.FilterHandle,
-                createInstance,
-                &h,
-                FILE_LIST_DIRECTORY | SYNCHRONIZE,
-                &oa, &iosb, NULL,
-                FILE_ATTRIBUTE_DIRECTORY,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                FILE_OPEN_IF,
-                FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
-                NULL, 0,
-                IO_IGNORE_SHARE_ACCESS_CHECK);
+            if (createInstance == NULL) {
+                st = ZwCreateFile(&h,
+                    FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                    &oa,
+                    &iosb,
+                    NULL,
+                    FILE_ATTRIBUTE_DIRECTORY,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    FILE_OPEN_IF,
+                    FILE_DIRECTORY_FILE | FILE_OPEN_FOR_BACKUP_INTENT |
+                    FILE_SYNCHRONOUS_IO_NONALERT,
+                    NULL,
+                    0);
+            }
+            else {
+                st = FltCreateFile(
+                    g_Sandbox.FilterHandle,
+                    createInstance,
+                    &h,
+                    FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                    &oa, &iosb, NULL,
+                    FILE_ATTRIBUTE_DIRECTORY,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    FILE_OPEN_IF,
+                    FILE_DIRECTORY_FILE | FILE_OPEN_FOR_BACKUP_INTENT |
+                    FILE_SYNCHRONOUS_IO_NONALERT,
+                    NULL, 0,
+                    IO_IGNORE_SHARE_ACCESS_CHECK);
+            }
             if (NT_SUCCESS(st)) {
-                FltClose(h);
+                if (createInstance == NULL)
+                    ZwClose(h);
+                else
+                    FltClose(h);
             }
             else if (st != STATUS_OBJECT_NAME_COLLISION &&
                 st != STATUS_OBJECT_NAME_EXISTS) {
@@ -1093,31 +1132,53 @@ Path_SandboxFileExists(
     IO_STATUS_BLOCK iosb;
     HANDLE h;
     NTSTATUS status;
+    BOOLEAN openedWithZw;
 
     openPath = *SandboxPath;
     instance = Box_UsesAbsoluteSandboxRoot(Box) ? NULL : FltObjects->Instance;
+    openedWithZw = Path_IsNtDevicePath(SandboxPath);
 
     InitializeObjectAttributes(&oa, &openPath,
         OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-    status = FltCreateFile(
-        g_Sandbox.FilterHandle,
-        instance,
-        &h,
-        FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-        &oa,
-        &iosb,
-        NULL,
-        FILE_ATTRIBUTE_NORMAL,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        FILE_OPEN,
-        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
-        NULL,
-        0,
-        IO_IGNORE_SHARE_ACCESS_CHECK);
+    if (openedWithZw) {
+        status = ZwCreateFile(&h,
+            FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            &oa,
+            &iosb,
+            NULL,
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE | FILE_OPEN_FOR_BACKUP_INTENT |
+            FILE_SYNCHRONOUS_IO_NONALERT,
+            NULL,
+            0);
+    }
+    else {
+        status = FltCreateFile(
+            g_Sandbox.FilterHandle,
+            instance,
+            &h,
+            FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            &oa,
+            &iosb,
+            NULL,
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+            NULL,
+            0,
+            IO_IGNORE_SHARE_ACCESS_CHECK);
+    }
 
-    if (NT_SUCCESS(status))
-        FltClose(h);
+    if (NT_SUCCESS(status)) {
+        if (openedWithZw)
+            ZwClose(h);
+        else
+            FltClose(h);
+    }
 
     return (BOOLEAN)NT_SUCCESS(status);
 }
@@ -1444,6 +1505,13 @@ SetInfo_IsRenameOrLink(_In_ FILE_INFORMATION_CLASS InfoClass)
 }
 
 static BOOLEAN
+SetInfo_IsLink(_In_ FILE_INFORMATION_CLASS InfoClass)
+{
+    return (BOOLEAN)(InfoClass == FileLinkInformation ||
+        InfoClass == FileLinkInformationEx);
+}
+
+static BOOLEAN
 SetInfo_IsDisposition(_In_ FILE_INFORMATION_CLASS InfoClass)
 {
     return (BOOLEAN)(InfoClass == FileDispositionInformation ||
@@ -1461,7 +1529,130 @@ SetInfo_ShouldCopyFallbackRename(_In_ NTSTATUS Status)
 {
     return (BOOLEAN)(Status == STATUS_NOT_SAME_DEVICE ||
         Status == STATUS_NO_SUCH_DEVICE ||
+        Status == STATUS_VHD_INVALID_STATE ||
         Status == STATUS_ACCESS_DENIED);
+}
+
+static BOOLEAN
+RenameDiag_StageEquals(
+    _In_reads_(Size) const CHAR* Left,
+    _In_z_ PCSTR Right,
+    _In_ ULONG Size)
+{
+    ULONG i;
+
+    for (i = 0; i < Size; ++i) {
+        if (Left[i] != Right[i])
+            return FALSE;
+        if (Left[i] == '\0')
+            return TRUE;
+    }
+    return Right[Size - 1] == '\0';
+}
+
+static VOID
+RenameDiag_CopyStage(
+    _Out_writes_(Size) CHAR* Dest,
+    _In_ ULONG Size,
+    _In_z_ PCSTR Source)
+{
+    ULONG i;
+
+    if (Size == 0)
+        return;
+
+    for (i = 0; i + 1 < Size && Source[i] != '\0'; ++i)
+        Dest[i] = Source[i];
+    Dest[i] = '\0';
+}
+
+static VOID
+SetInfo_LogRenameDiag(
+    _In_z_ PCSTR Stage,
+    _In_ ULONG Pid,
+    _In_ FILE_INFORMATION_CLASS InfoClass,
+    _In_ NTSTATUS Status,
+    _In_ PC_UNICODE_STRING SourcePath,
+    _In_opt_ PC_UNICODE_STRING DestPath)
+{
+    ULONG sourceKey;
+    ULONG destKey;
+    ULONG idx;
+    ULONG i;
+    ULONG count;
+    BOOLEAN shouldLog;
+    KIRQL oldIrql;
+    RENAME_DIAG_ENTRY* entry;
+    UNICODE_STRING emptyPath;
+    PC_UNICODE_STRING printSource;
+    PC_UNICODE_STRING printDest;
+
+    sourceKey = SourcePath ? Hash_Unicode(SourcePath, 2166136261u) : 0;
+    destKey = DestPath ? Hash_Unicode(DestPath, 2166136261u) : 0;
+    RtlInitUnicodeString(&emptyPath, L"");
+    printSource = SourcePath ? SourcePath : (PC_UNICODE_STRING)&emptyPath;
+    printDest = DestPath ? DestPath : (PC_UNICODE_STRING)&emptyPath;
+    idx = (sourceKey ^ destKey ^ Pid ^ (ULONG)InfoClass ^ (ULONG)Status) &
+        RENAME_DIAG_MASK;
+    shouldLog = FALSE;
+    count = 1;
+
+    KeAcquireSpinLock(&g_RenameDiagLock, &oldIrql);
+    entry = NULL;
+    for (i = 0; i < 4; ++i) {
+        RENAME_DIAG_ENTRY* candidate = &g_RenameDiag[(idx + i) &
+            RENAME_DIAG_MASK];
+        if (candidate->Pid == Pid &&
+            candidate->SourceKey == sourceKey &&
+            candidate->DestKey == destKey &&
+            candidate->Class == (ULONG)InfoClass &&
+            candidate->Status == Status &&
+            RenameDiag_StageEquals(candidate->Stage, Stage,
+                sizeof(candidate->Stage))) {
+            entry = candidate;
+            break;
+        }
+        if (candidate->Pid == 0 && !entry)
+            entry = candidate;
+    }
+
+    if (!entry)
+        entry = &g_RenameDiag[idx];
+
+    if (entry->Pid != Pid ||
+        entry->SourceKey != sourceKey ||
+        entry->DestKey != destKey ||
+        entry->Class != (ULONG)InfoClass ||
+        entry->Status != Status ||
+        !RenameDiag_StageEquals(entry->Stage, Stage,
+            sizeof(entry->Stage))) {
+        RtlZeroMemory(entry, sizeof(*entry));
+        entry->Pid = Pid;
+        entry->SourceKey = sourceKey;
+        entry->DestKey = destKey;
+        entry->Class = (ULONG)InfoClass;
+        entry->Status = Status;
+        RenameDiag_CopyStage(entry->Stage, sizeof(entry->Stage), Stage);
+        entry->Count = 1;
+        count = 1;
+        shouldLog = TRUE;
+    }
+    else {
+        count = ++entry->Count;
+        shouldLog = (BOOLEAN)((count & (count - 1)) == 0);
+    }
+    KeReleaseSpinLock(&g_RenameDiagLock, oldIrql);
+
+    if (shouldLog) {
+        DbgPrint("[SandboxFlt] RenameDiag stage=%s count=%lu pid=%lu class=%u status=%08x source=%wZ dest=%wZ\n",
+            Stage,
+            count,
+            Pid,
+            InfoClass,
+            Status,
+            printSource,
+            printDest);
+    }
 }
 
 static BOOLEAN
@@ -1537,6 +1728,77 @@ SandboxPath_OpenForInformation(
 }
 
 static NTSTATUS
+File_OpenKernelHandle(
+    _In_opt_ PFLT_INSTANCE Instance,
+    _In_ PC_UNICODE_STRING Path,
+    _In_ ACCESS_MASK DesiredAccess,
+    _In_ ULONG FileAttributes,
+    _In_ ULONG ShareAccess,
+    _In_ ULONG CreateDisposition,
+    _In_ ULONG CreateOptions,
+    _Out_ PHANDLE Handle,
+    _Outptr_result_maybenull_ PFILE_OBJECT* FileObject,
+    _Out_ PBOOLEAN OpenedWithZw)
+{
+    OBJECT_ATTRIBUTES oa;
+    IO_STATUS_BLOCK iosb;
+
+    *Handle = NULL;
+    *FileObject = NULL;
+    *OpenedWithZw = FALSE;
+
+    InitializeObjectAttributes(&oa, (PUNICODE_STRING)Path,
+        OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    if (Path_IsNtDevicePath(Path)) {
+        *OpenedWithZw = TRUE;
+        return ZwCreateFile(Handle,
+            DesiredAccess | SYNCHRONIZE,
+            &oa,
+            &iosb,
+            NULL,
+            FileAttributes,
+            ShareAccess,
+            CreateDisposition,
+            CreateOptions,
+            NULL,
+            0);
+    }
+
+    return FltCreateFileEx(g_Sandbox.FilterHandle,
+        Instance,
+        Handle,
+        FileObject,
+        DesiredAccess | SYNCHRONIZE,
+        &oa,
+        &iosb,
+        NULL,
+        FileAttributes,
+        ShareAccess,
+        CreateDisposition,
+        CreateOptions,
+        NULL,
+        0,
+        IO_IGNORE_SHARE_ACCESS_CHECK);
+}
+
+static VOID
+File_CloseKernelHandle(
+    _In_opt_ HANDLE Handle,
+    _In_opt_ PFILE_OBJECT FileObject,
+    _In_ BOOLEAN OpenedWithZw)
+{
+    if (FileObject)
+        ObDereferenceObject(FileObject);
+    if (Handle) {
+        if (OpenedWithZw)
+            ZwClose(Handle);
+        else
+            FltClose(Handle);
+    }
+}
+
+static NTSTATUS
 SetInfo_RedirectBasicInformation(
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _In_ PBOX_ENTRY Box,
@@ -1590,8 +1852,6 @@ File_CopyContentsNoDelete(
     _In_ PC_UNICODE_STRING SourcePath,
     _In_ PC_UNICODE_STRING TargetPath)
 {
-    OBJECT_ATTRIBUTES sourceOa;
-    OBJECT_ATTRIBUTES targetOa;
     IO_STATUS_BLOCK iosb;
     HANDLE sourceHandle;
     HANDLE targetHandle;
@@ -1606,6 +1866,8 @@ File_CopyContentsNoDelete(
     NTSTATUS status;
     PFLT_INSTANCE sourceInstance;
     PFLT_INSTANCE targetInstance;
+    BOOLEAN sourceOpenedWithZw;
+    BOOLEAN targetOpenedWithZw;
 
     sourceHandle = NULL;
     targetHandle = NULL;
@@ -1613,6 +1875,8 @@ File_CopyContentsNoDelete(
     targetFileObject = NULL;
     buffer = NULL;
     totalWritten = 0;
+    sourceOpenedWithZw = FALSE;
+    targetOpenedWithZw = FALSE;
 
     if (KeGetCurrentIrql() != PASSIVE_LEVEL)
         return STATUS_INVALID_DEVICE_STATE;
@@ -1620,43 +1884,33 @@ File_CopyContentsNoDelete(
     sourceInstance = Path_InstanceForOpen(FltObjects->Instance, SourcePath);
     targetInstance = Path_InstanceForOpen(FltObjects->Instance, TargetPath);
 
-    InitializeObjectAttributes(&sourceOa, (PUNICODE_STRING)SourcePath,
-        OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
-    status = FltCreateFileEx(g_Sandbox.FilterHandle,
+    status = File_OpenKernelHandle(
         sourceInstance,
-        &sourceHandle,
-        &sourceFileObject,
+        SourcePath,
         FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-        &sourceOa,
-        &iosb,
-        NULL,
         FILE_ATTRIBUTE_NORMAL,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         FILE_OPEN,
-        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
-        NULL,
-        0,
-        IO_IGNORE_SHARE_ACCESS_CHECK);
+        FILE_NON_DIRECTORY_FILE | FILE_OPEN_FOR_BACKUP_INTENT |
+        FILE_SYNCHRONOUS_IO_NONALERT,
+        &sourceHandle,
+        &sourceFileObject,
+        &sourceOpenedWithZw);
     if (!NT_SUCCESS(status))
         goto Cleanup;
 
-    InitializeObjectAttributes(&targetOa, (PUNICODE_STRING)TargetPath,
-        OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
-    status = FltCreateFileEx(g_Sandbox.FilterHandle,
+    status = File_OpenKernelHandle(
         targetInstance,
-        &targetHandle,
-        &targetFileObject,
+        TargetPath,
         FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE,
-        &targetOa,
-        &iosb,
-        NULL,
         FILE_ATTRIBUTE_NORMAL,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         FILE_OPEN_IF,
-        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
-        NULL,
-        0,
-        IO_IGNORE_SHARE_ACCESS_CHECK);
+        FILE_NON_DIRECTORY_FILE | FILE_OPEN_FOR_BACKUP_INTENT |
+        FILE_SYNCHRONOUS_IO_NONALERT,
+        &targetHandle,
+        &targetFileObject,
+        &targetOpenedWithZw);
     if (!NT_SUCCESS(status))
         goto Cleanup;
 
@@ -1741,14 +1995,8 @@ File_CopyContentsNoDelete(
 Cleanup:
     if (buffer)
         ExFreePoolWithTag(buffer, SANDBOX_POOL_TAG);
-    if (targetFileObject)
-        ObDereferenceObject(targetFileObject);
-    if (targetHandle)
-        FltClose(targetHandle);
-    if (sourceFileObject)
-        ObDereferenceObject(sourceFileObject);
-    if (sourceHandle)
-        FltClose(sourceHandle);
+    File_CloseKernelHandle(targetHandle, targetFileObject, targetOpenedWithZw);
+    File_CloseKernelHandle(sourceHandle, sourceFileObject, sourceOpenedWithZw);
     return status;
 }
 
@@ -1910,8 +2158,6 @@ WordSave_CopyFileContents(
     _In_ PC_UNICODE_STRING SandboxTemp,
     _In_ PC_UNICODE_STRING SandboxTarget)
 {
-    OBJECT_ATTRIBUTES tempOa;
-    OBJECT_ATTRIBUTES targetOa;
     IO_STATUS_BLOCK iosb;
     HANDLE tempHandle;
     HANDLE targetHandle;
@@ -1928,6 +2174,8 @@ WordSave_CopyFileContents(
     NTSTATUS closeStatus;
     PFLT_INSTANCE tempInstance;
     PFLT_INSTANCE targetInstance;
+    BOOLEAN tempOpenedWithZw;
+    BOOLEAN targetOpenedWithZw;
 
     tempHandle = NULL;
     targetHandle = NULL;
@@ -1935,6 +2183,8 @@ WordSave_CopyFileContents(
     targetFileObject = NULL;
     buffer = NULL;
     totalWritten = 0;
+    tempOpenedWithZw = FALSE;
+    targetOpenedWithZw = FALSE;
 
     if (KeGetCurrentIrql() != PASSIVE_LEVEL)
         return STATUS_INVALID_DEVICE_STATE;
@@ -1942,43 +2192,33 @@ WordSave_CopyFileContents(
     tempInstance = Path_InstanceForOpen(FltObjects->Instance, SandboxTemp);
     targetInstance = Path_InstanceForOpen(FltObjects->Instance, SandboxTarget);
 
-    InitializeObjectAttributes(&tempOa, (PUNICODE_STRING)SandboxTemp,
-        OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
-    status = FltCreateFileEx(g_Sandbox.FilterHandle,
+    status = File_OpenKernelHandle(
         tempInstance,
-        &tempHandle,
-        &tempFileObject,
+        SandboxTemp,
         FILE_READ_DATA | DELETE | SYNCHRONIZE,
-        &tempOa,
-        &iosb,
-        NULL,
         FILE_ATTRIBUTE_NORMAL,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         FILE_OPEN,
-        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
-        NULL,
-        0,
-        IO_IGNORE_SHARE_ACCESS_CHECK);
+        FILE_NON_DIRECTORY_FILE | FILE_OPEN_FOR_BACKUP_INTENT |
+        FILE_SYNCHRONOUS_IO_NONALERT,
+        &tempHandle,
+        &tempFileObject,
+        &tempOpenedWithZw);
     if (!NT_SUCCESS(status))
         goto Cleanup;
 
-    InitializeObjectAttributes(&targetOa, (PUNICODE_STRING)SandboxTarget,
-        OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
-    status = FltCreateFileEx(g_Sandbox.FilterHandle,
+    status = File_OpenKernelHandle(
         targetInstance,
-        &targetHandle,
-        &targetFileObject,
+        SandboxTarget,
         FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE,
-        &targetOa,
-        &iosb,
-        NULL,
         FILE_ATTRIBUTE_NORMAL,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         FILE_OPEN_IF,
-        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
-        NULL,
-        0,
-        IO_IGNORE_SHARE_ACCESS_CHECK);
+        FILE_NON_DIRECTORY_FILE | FILE_OPEN_FOR_BACKUP_INTENT |
+        FILE_SYNCHRONOUS_IO_NONALERT,
+        &targetHandle,
+        &targetFileObject,
+        &targetOpenedWithZw);
     if (!NT_SUCCESS(status))
         goto Cleanup;
 
@@ -2075,14 +2315,8 @@ WordSave_CopyFileContents(
 Cleanup:
     if (buffer)
         ExFreePoolWithTag(buffer, SANDBOX_POOL_TAG);
-    if (targetFileObject)
-        ObDereferenceObject(targetFileObject);
-    if (targetHandle)
-        FltClose(targetHandle);
-    if (tempFileObject)
-        ObDereferenceObject(tempFileObject);
-    if (tempHandle)
-        FltClose(tempHandle);
+    File_CloseKernelHandle(targetHandle, targetFileObject, targetOpenedWithZw);
+    File_CloseKernelHandle(tempHandle, tempFileObject, tempOpenedWithZw);
     return status;
 }
 
@@ -2099,7 +2333,6 @@ WordSave_CommitTempToTrackedTarget(
     UNICODE_STRING sandboxTemp;
     UNICODE_STRING sandboxTarget;
     PFILE_RENAME_INFORMATION renameInfo;
-    OBJECT_ATTRIBUTES oa;
     IO_STATUS_BLOCK iosb;
     HANDLE tempHandle;
     PFILE_OBJECT tempFileObject;
@@ -2108,11 +2341,13 @@ WordSave_CommitTempToTrackedTarget(
     ULONG writeKey;
     NTSTATUS status;
     PFLT_INSTANCE tempInstance;
+    BOOLEAN tempOpenedWithZw;
 
     UNREFERENCED_PARAMETER(Data);
 
     tempHandle = NULL;
     tempFileObject = NULL;
+    tempOpenedWithZw = FALSE;
     RtlZeroMemory(&sandboxTemp, sizeof(sandboxTemp));
     RtlZeroMemory(&sandboxTarget, sizeof(sandboxTarget));
 
@@ -2146,23 +2381,17 @@ WordSave_CommitTempToTrackedTarget(
         }
     }
 
-    InitializeObjectAttributes(&oa, &sandboxTemp,
-        OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
-    status = FltCreateFileEx(g_Sandbox.FilterHandle,
+    status = File_OpenKernelHandle(
         tempInstance,
-        &tempHandle,
-        &tempFileObject,
+        (PC_UNICODE_STRING)&sandboxTemp,
         DELETE | SYNCHRONIZE,
-        &oa,
-        &iosb,
-        NULL,
         FILE_ATTRIBUTE_NORMAL,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         FILE_OPEN,
         FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
-        NULL,
-        0,
-        IO_IGNORE_SHARE_ACCESS_CHECK);
+        &tempHandle,
+        &tempFileObject,
+        &tempOpenedWithZw);
     if (!NT_SUCCESS(status)) {
         DbgPrint("[SandboxFlt] Word-safe-save open temp failed: %08x temp=%wZ\n",
             status, &sandboxTemp);
@@ -2178,10 +2407,7 @@ WordSave_CommitTempToTrackedTarget(
         renameLength + sizeof(WCHAR),
         SANDBOX_POOL_TAG);
     if (!renameInfo) {
-        if (tempFileObject)
-            ObDereferenceObject(tempFileObject);
-        if (tempHandle)
-            FltClose(tempHandle);
+        File_CloseKernelHandle(tempHandle, tempFileObject, tempOpenedWithZw);
         ExFreePoolWithTag(sandboxTemp.Buffer, SANDBOX_POOL_TAG);
         ExFreePoolWithTag(sandboxTarget.Buffer, SANDBOX_POOL_TAG);
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -2236,10 +2462,7 @@ WordSave_CommitTempToTrackedTarget(
     }
 
     ExFreePoolWithTag(renameInfo, SANDBOX_POOL_TAG);
-    if (tempFileObject)
-        ObDereferenceObject(tempFileObject);
-    if (tempHandle)
-        FltClose(tempHandle);
+    File_CloseKernelHandle(tempHandle, tempFileObject, tempOpenedWithZw);
     ExFreePoolWithTag(sandboxTemp.Buffer, SANDBOX_POOL_TAG);
     ExFreePoolWithTag(sandboxTarget.Buffer, SANDBOX_POOL_TAG);
     return status;
@@ -2415,7 +2638,6 @@ SetInfo_RenameSandboxSourceToRedirectTarget(
     UNICODE_STRING relDest;
     UNICODE_STRING sandboxSource;
     UNICODE_STRING sandboxDest;
-    OBJECT_ATTRIBUTES oa;
     IO_STATUS_BLOCK iosb;
     HANDLE sourceHandle;
     PFILE_OBJECT sourceFileObject;
@@ -2428,6 +2650,10 @@ SetInfo_RenameSandboxSourceToRedirectTarget(
     BOOLEAN sandboxDestAllocated;
     BOOLEAN normalizedRawDestAllocated;
     BOOLEAN destInSandbox;
+    BOOLEAN sourceOpenedWithZw;
+    BOOLEAN isLinkInfo;
+    BOOLEAN isWordLinkTemp;
+    BOOLEAN usedCurrentFileObject;
 
     destInfo = NULL;
     destPath = NULL;
@@ -2438,6 +2664,11 @@ SetInfo_RenameSandboxSourceToRedirectTarget(
     sandboxDestAllocated = FALSE;
     normalizedRawDestAllocated = FALSE;
     destInSandbox = FALSE;
+    sourceOpenedWithZw = FALSE;
+    isLinkInfo = SetInfo_IsLink(
+        Data->Iopb->Parameters.SetFileInformation.FileInformationClass);
+    isWordLinkTemp = FALSE;
+    usedCurrentFileObject = FALSE;
     RtlZeroMemory(&sandboxSource, sizeof(sandboxSource));
     RtlZeroMemory(&sandboxDest, sizeof(sandboxDest));
     RtlZeroMemory(&rawDest, sizeof(rawDest));
@@ -2504,7 +2735,19 @@ SetInfo_RenameSandboxSourceToRedirectTarget(
 
     if (Path_FinalComponentStartsWithCi(destPath,
         L"~WRL")) {
+        isWordLinkTemp = TRUE;
         WordSave_TrackTarget(Pid, SourcePath);
+    }
+
+    if (isLinkInfo && isWordLinkTemp) {
+        SetInfo_LogRenameDiag("skip-word-link",
+            Pid,
+            Data->Iopb->Parameters.SetFileInformation.FileInformationClass,
+            STATUS_SUCCESS,
+            SourcePath,
+            destPath);
+        status = STATUS_SUCCESS;
+        goto Cleanup;
     }
 
     if (!Path_GetVolumeRelative(destPath, &relDest)) {
@@ -2564,76 +2807,6 @@ SetInfo_RenameSandboxSourceToRedirectTarget(
         }
     }
 
-    InitializeObjectAttributes(&oa, &sandboxSource,
-        OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
-    status = FltCreateFileEx(g_Sandbox.FilterHandle,
-        sourceInstance,
-        &sourceHandle,
-        &sourceFileObject,
-        DELETE | SYNCHRONIZE,
-        &oa,
-        &iosb,
-        NULL,
-        FILE_ATTRIBUTE_NORMAL,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        FILE_OPEN,
-        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
-        NULL,
-        0,
-        IO_IGNORE_SHARE_ACCESS_CHECK);
-
-    if (status == STATUS_OBJECT_NAME_NOT_FOUND ||
-        status == STATUS_OBJECT_PATH_NOT_FOUND ||
-        status == STATUS_NOT_FOUND ||
-        (SourceAlreadyInSandbox &&
-            (status == STATUS_NO_SUCH_DEVICE ||
-             status == STATUS_ACCESS_DENIED))) {
-        if (SourceAlreadyInSandbox) {
-            if (Path_SandboxFileExists(FltObjects,
-                Box,
-                (PC_UNICODE_STRING)&sandboxDest)) {
-                writeKey = Path_WriteCacheKey(destPath, Box);
-                Cache_Add(g_WritePathCache, WRITE_PATH_CACHE_SIZE, writeKey);
-                SandboxFlt_RecordRedirectPath((PC_UNICODE_STRING)&sandboxDest);
-                InterlockedIncrement(&g_Sandbox.TotalRedirects);
-                status = STATUS_SUCCESS;
-            }
-            goto Cleanup;
-        }
-
-        DbgPrint("[SandboxFlt] RenameSandboxSource source missing, migrating host source=%wZ -> %wZ\n",
-            SourcePath,
-            &sandboxSource);
-        status = File_CopyContentsNoDelete(FltObjects,
-            SourcePath,
-            (PC_UNICODE_STRING)&sandboxSource);
-        if (!NT_SUCCESS(status)) {
-            DbgPrint("[SandboxFlt] RenameSandboxSource migrate failed: %08x source=%wZ sandboxSource=%wZ\n",
-                status,
-                SourcePath,
-                &sandboxSource);
-            goto Cleanup;
-        }
-
-        status = FltCreateFileEx(g_Sandbox.FilterHandle,
-            sourceInstance,
-            &sourceHandle,
-            &sourceFileObject,
-            DELETE | SYNCHRONIZE,
-            &oa,
-            &iosb,
-            NULL,
-            FILE_ATTRIBUTE_NORMAL,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_OPEN,
-            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
-            NULL,
-            0,
-            IO_IGNORE_SHARE_ACCESS_CHECK);
-    }
-    if (!NT_SUCCESS(status))
-        goto Cleanup;
-
     renameLength = FIELD_OFFSET(FILE_RENAME_INFORMATION, FileName) +
         sandboxDest.Length;
     renameInfo = (PFILE_RENAME_INFORMATION)ExAllocatePool2(
@@ -2656,23 +2829,166 @@ SetInfo_RenameSandboxSourceToRedirectTarget(
         sandboxDest.Length);
     renameInfo->FileName[sandboxDest.Length / sizeof(WCHAR)] = L'\0';
 
+    if (SourceAlreadyInSandbox) {
+        usedCurrentFileObject = TRUE;
+        status = FltSetInformationFile(FltObjects->Instance,
+            FltObjects->FileObject,
+            renameInfo,
+            renameLength,
+            Data->Iopb->Parameters.SetFileInformation.FileInformationClass);
+        if (!NT_SUCCESS(status)) {
+            SetInfo_LogRenameDiag("set-current-failed",
+                Pid,
+                Data->Iopb->Parameters.SetFileInformation.FileInformationClass,
+                status,
+                (PC_UNICODE_STRING)&sandboxSource,
+                (PC_UNICODE_STRING)&sandboxDest);
+        }
+        goto HandleSetInfoResult;
+    }
+
+    status = File_OpenKernelHandle(
+        sourceInstance,
+        (PC_UNICODE_STRING)&sandboxSource,
+        DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_ATTRIBUTE_NORMAL,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE | FILE_OPEN_FOR_BACKUP_INTENT |
+        FILE_SYNCHRONOUS_IO_NONALERT,
+        &sourceHandle,
+        &sourceFileObject,
+        &sourceOpenedWithZw);
+
+    if (!NT_SUCCESS(status)) {
+        SetInfo_LogRenameDiag("open-source",
+            Pid,
+            Data->Iopb->Parameters.SetFileInformation.FileInformationClass,
+            status,
+            (PC_UNICODE_STRING)&sandboxSource,
+            (PC_UNICODE_STRING)&sandboxDest);
+    }
+
+    if (status == STATUS_OBJECT_NAME_NOT_FOUND ||
+        status == STATUS_OBJECT_PATH_NOT_FOUND ||
+        status == STATUS_NOT_FOUND ||
+        (SourceAlreadyInSandbox &&
+            SetInfo_ShouldCopyFallbackRename(status))) {
+        if (SourceAlreadyInSandbox) {
+            if (!isLinkInfo && SetInfo_ShouldCopyFallbackRename(status)) {
+                NTSTATUS copyStatus;
+
+                SetInfo_LogRenameDiag("open-copy-fallback",
+                    Pid,
+                    Data->Iopb->Parameters.SetFileInformation.FileInformationClass,
+                    status,
+                    (PC_UNICODE_STRING)&sandboxSource,
+                    (PC_UNICODE_STRING)&sandboxDest);
+                copyStatus = File_CopyContentsNoDelete(FltObjects,
+                    (PC_UNICODE_STRING)&sandboxSource,
+                    (PC_UNICODE_STRING)&sandboxDest);
+                if (NT_SUCCESS(copyStatus)) {
+                    writeKey = Path_WriteCacheKey(destPath, Box);
+                    Cache_Add(g_WritePathCache, WRITE_PATH_CACHE_SIZE,
+                        writeKey);
+                    SandboxFlt_RecordRedirectPath(
+                        (PC_UNICODE_STRING)&sandboxDest);
+                    InterlockedIncrement(&g_Sandbox.TotalRedirects);
+                    SetInfo_LogRenameDiag("open-copy-ok",
+                        Pid,
+                        Data->Iopb->Parameters.SetFileInformation.FileInformationClass,
+                        copyStatus,
+                        (PC_UNICODE_STRING)&sandboxSource,
+                        (PC_UNICODE_STRING)&sandboxDest);
+                    status = STATUS_SUCCESS;
+                    goto Cleanup;
+                }
+
+                SetInfo_LogRenameDiag("open-copy-failed",
+                    Pid,
+                    Data->Iopb->Parameters.SetFileInformation.FileInformationClass,
+                    copyStatus,
+                    (PC_UNICODE_STRING)&sandboxSource,
+                    (PC_UNICODE_STRING)&sandboxDest);
+            }
+
+            if (!isLinkInfo && Path_SandboxFileExists(FltObjects,
+                Box,
+                (PC_UNICODE_STRING)&sandboxDest)) {
+                writeKey = Path_WriteCacheKey(destPath, Box);
+                Cache_Add(g_WritePathCache, WRITE_PATH_CACHE_SIZE, writeKey);
+                SandboxFlt_RecordRedirectPath((PC_UNICODE_STRING)&sandboxDest);
+                InterlockedIncrement(&g_Sandbox.TotalRedirects);
+                SetInfo_LogRenameDiag("already-renamed",
+                    Pid,
+                    Data->Iopb->Parameters.SetFileInformation.FileInformationClass,
+                    status,
+                    (PC_UNICODE_STRING)&sandboxSource,
+                    (PC_UNICODE_STRING)&sandboxDest);
+                status = STATUS_SUCCESS;
+            }
+            goto Cleanup;
+        }
+
+        DbgPrint("[SandboxFlt] RenameSandboxSource source missing, migrating host source=%wZ -> %wZ\n",
+            SourcePath,
+            &sandboxSource);
+        status = File_CopyContentsNoDelete(FltObjects,
+            SourcePath,
+            (PC_UNICODE_STRING)&sandboxSource);
+        if (!NT_SUCCESS(status)) {
+            DbgPrint("[SandboxFlt] RenameSandboxSource migrate failed: %08x source=%wZ sandboxSource=%wZ\n",
+                status,
+                SourcePath,
+                &sandboxSource);
+            goto Cleanup;
+        }
+
+        File_CloseKernelHandle(sourceHandle, sourceFileObject,
+            sourceOpenedWithZw);
+        sourceHandle = NULL;
+        sourceFileObject = NULL;
+        sourceOpenedWithZw = FALSE;
+
+        status = File_OpenKernelHandle(
+            sourceInstance,
+            (PC_UNICODE_STRING)&sandboxSource,
+            DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE | FILE_OPEN_FOR_BACKUP_INTENT |
+            FILE_SYNCHRONOUS_IO_NONALERT,
+            &sourceHandle,
+            &sourceFileObject,
+            &sourceOpenedWithZw);
+    }
+    if (!NT_SUCCESS(status))
+        goto Cleanup;
+
     RtlZeroMemory(&iosb, sizeof(iosb));
     status = ZwSetInformationFile(sourceHandle,
         &iosb,
         renameInfo,
         renameLength,
         Data->Iopb->Parameters.SetFileInformation.FileInformationClass);
+
+HandleSetInfoResult:
     if (NT_SUCCESS(status)) {
         writeKey = Path_WriteCacheKey(destPath, Box);
         Cache_Add(g_WritePathCache, WRITE_PATH_CACHE_SIZE, writeKey);
         SandboxFlt_RecordRedirectPath((PC_UNICODE_STRING)&sandboxDest);
         InterlockedIncrement(&g_Sandbox.TotalRedirects);
     }
-    else if (SetInfo_ShouldCopyFallbackRename(status)) {
-        DbgPrint("[SandboxFlt] Word-safe-save rename fallback copy after status=%08x source=%wZ dest=%wZ\n",
+    else if (!isLinkInfo &&
+        SetInfo_ShouldCopyFallbackRename(status) &&
+        !(usedCurrentFileObject && status == STATUS_VHD_INVALID_STATE)) {
+        SetInfo_LogRenameDiag("rename-fallback",
+            Pid,
+            Data->Iopb->Parameters.SetFileInformation.FileInformationClass,
             status,
-            &sandboxSource,
-            &sandboxDest);
+            (PC_UNICODE_STRING)&sandboxSource,
+            (PC_UNICODE_STRING)&sandboxDest);
         status = WordSave_CopyFileContents(FltObjects,
             (PC_UNICODE_STRING)&sandboxSource,
             (PC_UNICODE_STRING)&sandboxDest);
@@ -2681,15 +2997,20 @@ SetInfo_RenameSandboxSourceToRedirectTarget(
             Cache_Add(g_WritePathCache, WRITE_PATH_CACHE_SIZE, writeKey);
             SandboxFlt_RecordRedirectPath((PC_UNICODE_STRING)&sandboxDest);
             InterlockedIncrement(&g_Sandbox.TotalRedirects);
-            DbgPrint("[SandboxFlt] Word-safe-save sandbox-source copied after cross-device rename: %wZ -> %wZ\n",
-                &sandboxSource,
-                &sandboxDest);
+            SetInfo_LogRenameDiag("copy-ok",
+                Pid,
+                Data->Iopb->Parameters.SetFileInformation.FileInformationClass,
+                status,
+                (PC_UNICODE_STRING)&sandboxSource,
+                (PC_UNICODE_STRING)&sandboxDest);
         }
         else {
-            DbgPrint("[SandboxFlt] Word-safe-save cross-device copy failed: %08x source=%wZ dest=%wZ\n",
+            SetInfo_LogRenameDiag("copy-failed",
+                Pid,
+                Data->Iopb->Parameters.SetFileInformation.FileInformationClass,
                 status,
-                &sandboxSource,
-                &sandboxDest);
+                (PC_UNICODE_STRING)&sandboxSource,
+                (PC_UNICODE_STRING)&sandboxDest);
             if (Path_SandboxFileExists(FltObjects,
                 Box,
                 (PC_UNICODE_STRING)&sandboxDest)) {
@@ -2697,6 +3018,12 @@ SetInfo_RenameSandboxSourceToRedirectTarget(
                 Cache_Add(g_WritePathCache, WRITE_PATH_CACHE_SIZE, writeKey);
                 SandboxFlt_RecordRedirectPath((PC_UNICODE_STRING)&sandboxDest);
                 InterlockedIncrement(&g_Sandbox.TotalRedirects);
+                SetInfo_LogRenameDiag("copy-dest-exists",
+                    Pid,
+                    Data->Iopb->Parameters.SetFileInformation.FileInformationClass,
+                    status,
+                    (PC_UNICODE_STRING)&sandboxSource,
+                    (PC_UNICODE_STRING)&sandboxDest);
                 status = STATUS_SUCCESS;
             }
         }
@@ -2718,10 +3045,8 @@ Cleanup:
     }
     if (renameInfo)
         ExFreePoolWithTag(renameInfo, SANDBOX_POOL_TAG);
-    if (sourceFileObject)
-        ObDereferenceObject(sourceFileObject);
-    if (sourceHandle)
-        FltClose(sourceHandle);
+    File_CloseKernelHandle(sourceHandle, sourceFileObject,
+        sourceOpenedWithZw);
     if (sandboxSourceAllocated && sandboxSource.Buffer)
         ExFreePoolWithTag(sandboxSource.Buffer, SANDBOX_POOL_TAG);
     if (sandboxDestAllocated && sandboxDest.Buffer)
@@ -2972,6 +3297,12 @@ SandboxFlt_PreSetInformation(
 
         if (sourceInSandbox) {
             if (SetInfo_ShouldCopyFallbackRename(status)) {
+                SetInfo_LogRenameDiag("noop-after-fail",
+                    pid,
+                    infoClass,
+                    status,
+                    (PC_UNICODE_STRING)&sourceInfo->Name,
+                    NULL);
                 InterlockedIncrement(&g_Sandbox.TotalRedirects);
                 FltReleaseFileNameInformation(sourceInfo);
                 return SetInfo_CompleteNoOp(Data);
