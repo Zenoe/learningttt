@@ -1457,6 +1457,14 @@ SetInfo_IsBasic(_In_ FILE_INFORMATION_CLASS InfoClass)
 }
 
 static BOOLEAN
+SetInfo_ShouldCopyFallbackRename(_In_ NTSTATUS Status)
+{
+    return (BOOLEAN)(Status == STATUS_NOT_SAME_DEVICE ||
+        Status == STATUS_NO_SUCH_DEVICE ||
+        Status == STATUS_ACCESS_DENIED);
+}
+
+static BOOLEAN
 QueryInfo_IsOverlayClass(_In_ FILE_INFORMATION_CLASS InfoClass)
 {
     return (BOOLEAN)(InfoClass == FileNameInformation ||
@@ -2453,14 +2461,14 @@ SetInfo_RenameSandboxSourceToRedirectTarget(
         FLT_FILE_NAME_OPENED | FLT_FILE_NAME_QUERY_DEFAULT,
         &destInfo);
     if (!NT_SUCCESS(status)) {
-        DbgPrint("[SandboxFlt] RenameSandboxSource FltGetDestination failed: %08x source=%wZ rootDir=%p len=%lu first=%04x\n",
-            status,
-            SourcePath,
-            oldInfo->RootDirectory,
-            oldInfo->FileNameLength,
-            oldInfo->FileNameLength >= sizeof(WCHAR) ? oldInfo->FileName[0] : 0);
         if (oldInfo->FileNameLength == 0 ||
             oldInfo->FileName[0] != L'\\') {
+            DbgPrint("[SandboxFlt] RenameSandboxSource FltGetDestination failed: %08x source=%wZ rootDir=%p len=%lu first=%04x\n",
+                status,
+                SourcePath,
+                oldInfo->RootDirectory,
+                oldInfo->FileNameLength,
+                oldInfo->FileNameLength >= sizeof(WCHAR) ? oldInfo->FileName[0] : 0);
             goto Cleanup;
         }
 
@@ -2484,9 +2492,6 @@ SetInfo_RenameSandboxSourceToRedirectTarget(
             normalizedRawDestAllocated = TRUE;
             destPath = (PC_UNICODE_STRING)&normalizedRawDest;
         }
-        DbgPrint("[SandboxFlt] RenameSandboxSource raw dest fallback raw=%wZ normalized=%wZ\n",
-            &rawDest,
-            destPath);
         status = STATUS_SUCCESS;
     }
 
@@ -2497,19 +2502,9 @@ SetInfo_RenameSandboxSourceToRedirectTarget(
         destPath = (PC_UNICODE_STRING)&destInfo->Name;
     }
 
-    DbgPrint("[SandboxFlt] RenameSandboxSource enter class=%u source=%wZ dest=%wZ rootDir=%p len=%lu flags=%08x\n",
-        Data->Iopb->Parameters.SetFileInformation.FileInformationClass,
-        SourcePath,
-        destPath,
-        oldInfo->RootDirectory,
-        oldInfo->FileNameLength,
-        oldInfo->Flags);
-
     if (Path_FinalComponentStartsWithCi(destPath,
         L"~WRL")) {
         WordSave_TrackTarget(Pid, SourcePath);
-        DbgPrint("[SandboxFlt] Word-safe-save target tracked: %wZ via %wZ\n",
-            SourcePath, destPath);
     }
 
     if (!Path_GetVolumeRelative(destPath, &relDest)) {
@@ -2560,15 +2555,6 @@ SetInfo_RenameSandboxSourceToRedirectTarget(
         sandboxDestAllocated = TRUE;
     }
 
-    DbgPrint("[SandboxFlt] RenameSandboxSource paths class=%u source=%wZ dest=%wZ destInSandbox=%u sandboxSource=%wZ sandboxDest=%wZ sourceInst=%p\n",
-        Data->Iopb->Parameters.SetFileInformation.FileInformationClass,
-        SourcePath,
-        destPath,
-        destInSandbox,
-        &sandboxSource,
-        &sandboxDest,
-        sourceInstance);
-
     parentKey = Path_ParentCacheKey((PC_UNICODE_STRING)&sandboxDest, Box);
     if (!Cache_Contains(g_DirPathCache, DIR_PATH_CACHE_SIZE, parentKey)) {
         if (Path_EnsureParentDir(FltObjects->Instance,
@@ -2596,14 +2582,25 @@ SetInfo_RenameSandboxSourceToRedirectTarget(
         0,
         IO_IGNORE_SHARE_ACCESS_CHECK);
 
-    DbgPrint("[SandboxFlt] RenameSandboxSource open source status=%08x sandboxSource=%wZ sourceInst=%p\n",
-        status,
-        &sandboxSource,
-        sourceInstance);
-
     if (status == STATUS_OBJECT_NAME_NOT_FOUND ||
         status == STATUS_OBJECT_PATH_NOT_FOUND ||
-        status == STATUS_NOT_FOUND) {
+        status == STATUS_NOT_FOUND ||
+        (SourceAlreadyInSandbox &&
+            (status == STATUS_NO_SUCH_DEVICE ||
+             status == STATUS_ACCESS_DENIED))) {
+        if (SourceAlreadyInSandbox) {
+            if (Path_SandboxFileExists(FltObjects,
+                Box,
+                (PC_UNICODE_STRING)&sandboxDest)) {
+                writeKey = Path_WriteCacheKey(destPath, Box);
+                Cache_Add(g_WritePathCache, WRITE_PATH_CACHE_SIZE, writeKey);
+                SandboxFlt_RecordRedirectPath((PC_UNICODE_STRING)&sandboxDest);
+                InterlockedIncrement(&g_Sandbox.TotalRedirects);
+                status = STATUS_SUCCESS;
+            }
+            goto Cleanup;
+        }
+
         DbgPrint("[SandboxFlt] RenameSandboxSource source missing, migrating host source=%wZ -> %wZ\n",
             SourcePath,
             &sandboxSource);
@@ -2633,9 +2630,6 @@ SetInfo_RenameSandboxSourceToRedirectTarget(
             NULL,
             0,
             IO_IGNORE_SHARE_ACCESS_CHECK);
-        DbgPrint("[SandboxFlt] RenameSandboxSource reopen after migrate status=%08x sandboxSource=%wZ\n",
-            status,
-            &sandboxSource);
     }
     if (!NT_SUCCESS(status))
         goto Cleanup;
@@ -2668,21 +2662,17 @@ SetInfo_RenameSandboxSourceToRedirectTarget(
         renameInfo,
         renameLength,
         Data->Iopb->Parameters.SetFileInformation.FileInformationClass);
-    DbgPrint("[SandboxFlt] RenameSandboxSource ZwSetInformationFile status=%08x class=%u sandboxSource=%wZ sandboxDest=%wZ\n",
-        status,
-        Data->Iopb->Parameters.SetFileInformation.FileInformationClass,
-        &sandboxSource,
-        &sandboxDest);
     if (NT_SUCCESS(status)) {
         writeKey = Path_WriteCacheKey(destPath, Box);
         Cache_Add(g_WritePathCache, WRITE_PATH_CACHE_SIZE, writeKey);
         SandboxFlt_RecordRedirectPath((PC_UNICODE_STRING)&sandboxDest);
         InterlockedIncrement(&g_Sandbox.TotalRedirects);
-        DbgPrint("[SandboxFlt] Word-safe-save sandbox-source rename: %wZ -> %wZ\n",
+    }
+    else if (SetInfo_ShouldCopyFallbackRename(status)) {
+        DbgPrint("[SandboxFlt] Word-safe-save rename fallback copy after status=%08x source=%wZ dest=%wZ\n",
+            status,
             &sandboxSource,
             &sandboxDest);
-    }
-    else if (status == STATUS_NOT_SAME_DEVICE) {
         status = WordSave_CopyFileContents(FltObjects,
             (PC_UNICODE_STRING)&sandboxSource,
             (PC_UNICODE_STRING)&sandboxDest);
@@ -2700,6 +2690,15 @@ SetInfo_RenameSandboxSourceToRedirectTarget(
                 status,
                 &sandboxSource,
                 &sandboxDest);
+            if (Path_SandboxFileExists(FltObjects,
+                Box,
+                (PC_UNICODE_STRING)&sandboxDest)) {
+                writeKey = Path_WriteCacheKey(destPath, Box);
+                Cache_Add(g_WritePathCache, WRITE_PATH_CACHE_SIZE, writeKey);
+                SandboxFlt_RecordRedirectPath((PC_UNICODE_STRING)&sandboxDest);
+                InterlockedIncrement(&g_Sandbox.TotalRedirects);
+                status = STATUS_SUCCESS;
+            }
         }
     }
     else {
@@ -2901,17 +2900,6 @@ SandboxFlt_PreSetInformation(
             (PC_UNICODE_STRING)&box->SandboxRootNt);
     }
 
-    if (SetInfo_IsRenameOrLink(infoClass) ||
-        SetInfo_IsDisposition(infoClass)) {
-        DbgPrint("[SandboxFlt] PreSetInfo class=%u source=%wZ sourceInSandbox=%u sourceExcluded=%u boxRoot=%wZ len=%lu\n",
-            infoClass,
-            &sourceInfo->Name,
-            sourceInSandbox,
-            sourceExcluded,
-            &box->SandboxRootNt,
-            Data->Iopb->Parameters.SetFileInformation.Length);
-    }
-
     if (SetInfo_IsBasic(infoClass)) {
         if (sourceInSandbox || sourceExcluded) {
             FltReleaseFileNameInformation(sourceInfo);
@@ -2982,12 +2970,18 @@ SandboxFlt_PreSetInformation(
             return SetInfo_CompleteNoOp(Data);
         }
 
-        DbgPrint("[SandboxFlt] Word-safe-save sandbox-source rename unavailable: %08x source=%wZ class=%u sourceInSandbox=%u\n",
-            status,
-            &sourceInfo->Name,
-            infoClass,
-            sourceInSandbox);
         if (sourceInSandbox) {
+            if (SetInfo_ShouldCopyFallbackRename(status)) {
+                InterlockedIncrement(&g_Sandbox.TotalRedirects);
+                FltReleaseFileNameInformation(sourceInfo);
+                return SetInfo_CompleteNoOp(Data);
+            }
+
+            DbgPrint("[SandboxFlt] Word-safe-save sandbox-source rename unavailable: %08x source=%wZ class=%u sourceInSandbox=%u\n",
+                status,
+                &sourceInfo->Name,
+                infoClass,
+                sourceInSandbox);
             Data->IoStatus.Status = status;
             Data->IoStatus.Information = 0;
             InterlockedIncrement(&g_Sandbox.TotalBlocked);
@@ -2995,6 +2989,11 @@ SandboxFlt_PreSetInformation(
             return FLT_PREOP_COMPLETE;
         }
 
+        DbgPrint("[SandboxFlt] Word-safe-save sandbox-source rename unavailable: %08x source=%wZ class=%u sourceInSandbox=%u\n",
+            status,
+            &sourceInfo->Name,
+            infoClass,
+            sourceInSandbox);
         DbgPrint("[SandboxFlt] Word-safe-save host rename virtualized: %wZ class=%u\n",
             &sourceInfo->Name,
             infoClass);
