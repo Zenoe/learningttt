@@ -1028,8 +1028,8 @@ DWORD WINAPI hookedGetTempPathW(DWORD bufferLength, LPWSTR buffer)
     if (g_boxRoot.empty())
         return g_originalGetTempPathW(bufferLength, buffer);
 
-    const std::wstring temp = joinPath(joinPath(g_boxRoot, L"Redirected"),
-                                       L"Temp");
+    const std::wstring temp = joinPath(
+        joinPath(g_boxRoot, L"drive\\Profile\\AppData\\Local"), L"Temp");
     createDirectoryTree(temp);
     return copyPathToCaller(temp, bufferLength, buffer);
 }
@@ -1041,8 +1041,8 @@ DWORD WINAPI hookedGetTempPath2W(DWORD bufferLength, LPWSTR buffer)
             ? g_originalGetTempPath2W(bufferLength, buffer)
             : g_originalGetTempPathW(bufferLength, buffer);
 
-    const std::wstring temp = joinPath(joinPath(g_boxRoot, L"Redirected"),
-                                       L"Temp");
+    const std::wstring temp = joinPath(
+        joinPath(g_boxRoot, L"drive\\Profile\\AppData\\Local"), L"Temp");
     createDirectoryTree(temp);
     return copyPathToCaller(temp, bufferLength, buffer);
 }

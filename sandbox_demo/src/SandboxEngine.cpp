@@ -69,8 +69,7 @@ static std::wstring sandboxHookProfileForPath(const std::wstring& path)
 
 static bool usesIsolatedUserProfile(const std::wstring& hookProfile)
 {
-    return hookProfile == L"wps" || hookProfile == L"word" ||
-           hookProfile == L"powerpoint" || hookProfile == L"foxmail";
+    return hookProfile == L"wps";
 }
 
 static std::wstring environmentVariable(const wchar_t* name)
