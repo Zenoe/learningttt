@@ -1280,6 +1280,8 @@ BOOL WINAPI hookedCreateProcessW(
         const bool injected = injectHookDllIntoProcess(processInfo->hProcess);
         hooklog::write(L"[child] HookDll injection pid=%lu -> %d",
                        processInfo->dwProcessId, injected ? 1 : 0);
+        if (injected)
+            Sleep(50);
         if (!callerSuspended && processInfo->hThread)
             ResumeThread(processInfo->hThread);
     } else if (result && skipChildHook && processInfo) {
@@ -1581,7 +1583,7 @@ bool install()
                                 !g_boxName.empty();
     configureIsolationProfile();
     g_childHookPropagation = envFlag(L"SANDBOX_ENABLE_CHILD_HOOK") &&
-                             !g_boxName.empty() && g_hookProfile != L"wps";
+                             !g_boxName.empty();
     g_enableObjectHooks = envFlag(L"SANDBOX_ENABLE_OBJECT_HOOK");
     g_enableFileHooks = envFlag(L"SANDBOX_ENABLE_FILE_HOOK");
     g_enableRegistryHooks = envFlag(L"SANDBOX_ENABLE_REGISTRY_HOOK");

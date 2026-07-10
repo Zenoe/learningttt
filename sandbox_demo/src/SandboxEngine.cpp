@@ -67,6 +67,12 @@ static std::wstring sandboxHookProfileForPath(const std::wstring& path)
     return {};
 }
 
+static bool usesIsolatedUserProfile(const std::wstring& hookProfile)
+{
+    return hookProfile == L"wps" || hookProfile == L"word" ||
+           hookProfile == L"powerpoint" || hookProfile == L"foxmail";
+}
+
 static std::wstring environmentVariable(const wchar_t* name)
 {
     DWORD needed = GetEnvironmentVariableW(name, nullptr, 0);
@@ -91,6 +97,25 @@ static void appendEnvVar(std::wstring& block, const std::wstring& name,
 static void appendEnvFlag(std::wstring& block, const std::wstring& name)
 {
     appendEnvVar(block, name, L"1");
+}
+
+static bool isOverriddenProfileEnvironment(const std::wstring& entry)
+{
+    static constexpr const wchar_t* kNames[] = {
+        L"USERPROFILE=",
+        L"APPDATA=",
+        L"LOCALAPPDATA=",
+        L"TEMP=",
+        L"TMP=",
+        L"HOMEDRIVE=",
+        L"HOMEPATH=",
+    };
+
+    for (const wchar_t* name : kNames) {
+        if (entry.rfind(name, 0) == 0)
+            return true;
+    }
+    return false;
 }
 
 static bool is32BitBinary(const std::wstring& path)
@@ -248,6 +273,32 @@ static DWORD makeSandboxPathWritable(const std::wstring& path)
     DWORD err = ok ? ERROR_SUCCESS : GetLastError();
     LocalFree(sd);
     return err;
+}
+
+static void ensureSandboxProfileLayout(const std::wstring& profileRoot)
+{
+    std::error_code ec;
+    for (const auto& dir : {
+        profileRoot,
+        profileRoot + L"\\AppData",
+        profileRoot + L"\\AppData\\Roaming",
+        profileRoot + L"\\AppData\\Roaming\\Kingsoft",
+        profileRoot + L"\\AppData\\Roaming\\Kingsoft\\Office6",
+        profileRoot + L"\\AppData\\Roaming\\Microsoft",
+        profileRoot + L"\\AppData\\Roaming\\Microsoft\\Office",
+        profileRoot + L"\\AppData\\Roaming\\Microsoft\\Templates",
+        profileRoot + L"\\AppData\\Local",
+        profileRoot + L"\\AppData\\Local\\Kingsoft",
+        profileRoot + L"\\AppData\\Local\\Kingsoft\\Office6",
+        profileRoot + L"\\AppData\\Local\\Microsoft",
+        profileRoot + L"\\AppData\\Local\\Microsoft\\Office",
+        profileRoot + L"\\AppData\\Local\\Temp",
+        profileRoot + L"\\Documents",
+        profileRoot + L"\\Desktop"
+    }) {
+        fs::create_directories(fs::path(dir), ec);
+        makeSandboxPathWritable(dir);
+    }
 }
 
 // ------------------------------------------------------------
@@ -694,19 +745,31 @@ bool SandboxEngine::spawnInJob(const SandboxConfig& cfg,
     {
         const std::wstring hookProfile =
             sandboxHookProfileForPath(cfg.executablePath);
+        const bool isolateUserProfile = usesIsolatedUserProfile(hookProfile);
+        const std::wstring sandboxProfile = out.fsRoot + L"\\drive\\Profile";
+        const std::wstring sandboxRoaming =
+            sandboxProfile + L"\\AppData\\Roaming";
+        const std::wstring sandboxLocal =
+            sandboxProfile + L"\\AppData\\Local";
+        const std::wstring sandboxTemp = sandboxLocal + L"\\Temp";
         const bool target32Bit = is32BitBinary(cfg.executablePath);
         const std::wstring hookDllForProcess =
             (!cfg.borderDllPath.empty() && target32Bit)
                 ? siblingPath(cfg.borderDllPath, L"HookDll32.dll")
                 : cfg.borderDllPath;
+        if (isolateUserProfile)
+            ensureSandboxProfileLayout(sandboxProfile);
         // Copy current environment
         LPWCH curEnv = GetEnvironmentStringsW();
         if (curEnv) {
             for (LPWCH p = curEnv; *p; ) {
                 std::wstring entry(p);
                 // Never inherit stale sandbox identity into a new launch.
-                if (entry.rfind(L"SANDBOX_", 0) != 0)
+                if (entry.rfind(L"SANDBOX_", 0) != 0 &&
+                    !(isolateUserProfile &&
+                      isOverriddenProfileEnvironment(entry))) {
                     envBlock += entry + L'\0';
+                }
                 p += entry.size() + 1;
             }
             FreeEnvironmentStringsW(curEnv);
@@ -726,6 +789,19 @@ bool SandboxEngine::spawnInJob(const SandboxConfig& cfg,
                      environmentVariable(L"USERPROFILE") + L"\\Documents");
         appendEnvVar(envBlock, L"SANDBOX_PROGRAM_DIR",
                      fs::path(cfg.executablePath).parent_path().wstring());
+        if (isolateUserProfile) {
+            appendEnvVar(envBlock, L"USERPROFILE", sandboxProfile);
+            appendEnvVar(envBlock, L"APPDATA", sandboxRoaming);
+            appendEnvVar(envBlock, L"LOCALAPPDATA", sandboxLocal);
+            appendEnvVar(envBlock, L"TEMP", sandboxTemp);
+            appendEnvVar(envBlock, L"TMP", sandboxTemp);
+            if (sandboxProfile.size() >= 2 && sandboxProfile[1] == L':') {
+                appendEnvVar(envBlock, L"HOMEDRIVE",
+                             sandboxProfile.substr(0, 2));
+                appendEnvVar(envBlock, L"HOMEPATH",
+                             sandboxProfile.substr(2));
+            }
+        }
         if (!hookDllForProcess.empty()) {
             appendEnvFlag(envBlock, L"SANDBOX_BORDER_ACTIVE");
             appendEnvVar(envBlock, L"SANDBOX_HOOK_DLL", hookDllForProcess);
@@ -741,6 +817,8 @@ bool SandboxEngine::spawnInJob(const SandboxConfig& cfg,
                 }
                 if (hookProfile == L"powerpoint")
                     appendEnvFlag(envBlock, L"SANDBOX_REWRITE_WINDOW_CLASS");
+                if (hookProfile == L"wps")
+                    appendEnvFlag(envBlock, L"SANDBOX_ENABLE_CHILD_HOOK");
             } else {
                 appendEnvFlag(envBlock, L"SANDBOX_ENABLE_SHELL_BROKER");
                 if (cfg.isolateClipboard)
@@ -820,6 +898,7 @@ bool SandboxEngine::spawnInJob(const SandboxConfig& cfg,
                 return false;
             }
             log(L"[+] 32-bit HookDll injected into suspended process");
+            Sleep(50);
         }
         if (!ok) {
             log(L"[!] CreateProcessW for 32-bit target failed: " +
