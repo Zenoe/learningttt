@@ -1,0 +1,19 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "vs2022-win32",
+      "displayName": "VS2022 Win32",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "Win32",
+      "binaryDir": "${sourceDir}/../out/build/hook32"
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "vs2022-win32-debug",
+      "configurePreset": "vs2022-win32",
+      "configuration": "Debug"
+    }
+  ]
+}

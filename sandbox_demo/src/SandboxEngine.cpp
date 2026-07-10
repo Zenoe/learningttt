@@ -49,6 +49,127 @@ static std::wstring chromiumProfileDirName(const std::wstring& path)
     return L"chrome";
 }
 
+static std::wstring sandboxHookProfileForPath(const std::wstring& path)
+{
+    std::wstring name = fs::path(path).filename().wstring();
+    std::transform(name.begin(), name.end(), name.begin(), ::towlower);
+
+    if (name == L"winword.exe")
+        return L"word";
+    if (name == L"powerpnt.exe")
+        return L"powerpoint";
+    if (name == L"wps.exe" || name == L"ksolaunch.exe" ||
+        name == L"wpp.exe" || name == L"et.exe") {
+        return L"wps";
+    }
+    if (name == L"foxmail.exe")
+        return L"foxmail";
+    return {};
+}
+
+static std::wstring environmentVariable(const wchar_t* name)
+{
+    DWORD needed = GetEnvironmentVariableW(name, nullptr, 0);
+    if (needed == 0)
+        return {};
+
+    std::wstring value(needed, L'\0');
+    DWORD written = GetEnvironmentVariableW(name, value.data(), needed);
+    value.resize(written);
+    return value;
+}
+
+static void appendEnvVar(std::wstring& block, const std::wstring& name,
+                         const std::wstring& value)
+{
+    block += name;
+    block += L'=';
+    block += value;
+    block += L'\0';
+}
+
+static void appendEnvFlag(std::wstring& block, const std::wstring& name)
+{
+    appendEnvVar(block, name, L"1");
+}
+
+static bool is32BitBinary(const std::wstring& path)
+{
+    DWORD binaryType = 0;
+    return GetBinaryTypeW(path.c_str(), &binaryType) &&
+           binaryType == SCS_32BIT_BINARY;
+}
+
+static std::wstring siblingPath(const std::wstring& path,
+                                const std::wstring& fileName)
+{
+    return (fs::path(path).parent_path() / fileName).wstring();
+}
+
+static std::wstring quoteWindowsArgument(const std::wstring& argument)
+{
+    if (!argument.empty() &&
+        argument.find_first_of(L" \t\"") == std::wstring::npos) {
+        return argument;
+    }
+
+    std::wstring quoted = L"\"";
+    size_t backslashes = 0;
+    for (wchar_t ch : argument) {
+        if (ch == L'\\') {
+            ++backslashes;
+        } else if (ch == L'"') {
+            quoted.append(backslashes * 2 + 1, L'\\');
+            quoted.push_back(ch);
+            backslashes = 0;
+        } else {
+            quoted.append(backslashes, L'\\');
+            backslashes = 0;
+            quoted.push_back(ch);
+        }
+    }
+    quoted.append(backslashes * 2, L'\\');
+    quoted.push_back(L'"');
+    return quoted;
+}
+
+static bool injectDllWithHelper32(DWORD processId,
+                                  const std::wstring& injectorPath,
+                                  const std::wstring& dllPath,
+                                  DWORD* exitCode)
+{
+    if (exitCode)
+        *exitCode = ERROR_SUCCESS;
+
+    std::wstring commandLine = quoteWindowsArgument(injectorPath) + L" " +
+        std::to_wstring(processId) + L" " + quoteWindowsArgument(dllPath);
+
+    STARTUPINFOW startupInfo{};
+    startupInfo.cb = sizeof(startupInfo);
+    PROCESS_INFORMATION processInfo{};
+
+    std::wstring workingDirectory =
+        fs::path(injectorPath).parent_path().wstring();
+    const BOOL created = CreateProcessW(
+        injectorPath.c_str(), commandLine.data(), nullptr, nullptr, FALSE, 0,
+        nullptr, workingDirectory.empty() ? nullptr : workingDirectory.c_str(),
+        &startupInfo, &processInfo);
+    if (!created) {
+        if (exitCode)
+            *exitCode = GetLastError();
+        return false;
+    }
+
+    WaitForSingleObject(processInfo.hProcess, 10000);
+    DWORD code = 1;
+    GetExitCodeProcess(processInfo.hProcess, &code);
+    CloseHandle(processInfo.hThread);
+    CloseHandle(processInfo.hProcess);
+    if (exitCode)
+        *exitCode = code;
+    return code == 0;
+}
+
 static std::string utf8FromWide(const std::wstring& text)
 {
     if (text.empty()) return {};
@@ -571,28 +692,60 @@ bool SandboxEngine::spawnInJob(const SandboxConfig& cfg,
     // (demonstrates the FS redirection intent)
     std::wstring envBlock;
     {
+        const std::wstring hookProfile =
+            sandboxHookProfileForPath(cfg.executablePath);
+        const bool target32Bit = is32BitBinary(cfg.executablePath);
+        const std::wstring hookDllForProcess =
+            (!cfg.borderDllPath.empty() && target32Bit)
+                ? siblingPath(cfg.borderDllPath, L"HookDll32.dll")
+                : cfg.borderDllPath;
         // Copy current environment
         LPWCH curEnv = GetEnvironmentStringsW();
         if (curEnv) {
             for (LPWCH p = curEnv; *p; ) {
                 std::wstring entry(p);
                 // Never inherit stale sandbox identity into a new launch.
-                if (entry.find(L"SANDBOX_ROOT=") != 0 &&
-                    entry.find(L"SANDBOX_BOX=") != 0 &&
-                    entry.find(L"SANDBOX_BORDER_ACTIVE=") != 0)
+                if (entry.rfind(L"SANDBOX_", 0) != 0)
                     envBlock += entry + L'\0';
                 p += entry.size() + 1;
             }
             FreeEnvironmentStringsW(curEnv);
         }
         // Inject sandbox variables
-        envBlock += L"SANDBOX_ROOT=" + out.fsRoot + L'\0';
-        envBlock += L"SANDBOX_BOX=" + cfg.boxName + L'\0';
-        envBlock += L"SANDBOX_DOWNLOADS=" + out.fsRoot +
-                    L"\\drive\\Downloads" + L'\0';
-        if (!cfg.borderDllPath.empty()) {
-            envBlock += L"SANDBOX_BORDER_ACTIVE=1\0";
-            envBlock += L"SANDBOX_HOOK_DLL=" + cfg.borderDllPath + L'\0';
+        appendEnvVar(envBlock, L"SANDBOX_ROOT", out.fsRoot);
+        appendEnvVar(envBlock, L"SANDBOX_BOX", cfg.boxName);
+        appendEnvVar(envBlock, L"SANDBOX_DOWNLOADS",
+                     out.fsRoot + L"\\drive\\Downloads");
+        appendEnvVar(envBlock, L"SANDBOX_HOST_USERPROFILE",
+                     environmentVariable(L"USERPROFILE"));
+        appendEnvVar(envBlock, L"SANDBOX_HOST_APPDATA",
+                     environmentVariable(L"APPDATA"));
+        appendEnvVar(envBlock, L"SANDBOX_HOST_LOCALAPPDATA",
+                     environmentVariable(L"LOCALAPPDATA"));
+        appendEnvVar(envBlock, L"SANDBOX_HOST_DOCUMENTS",
+                     environmentVariable(L"USERPROFILE") + L"\\Documents");
+        appendEnvVar(envBlock, L"SANDBOX_PROGRAM_DIR",
+                     fs::path(cfg.executablePath).parent_path().wstring());
+        if (!hookDllForProcess.empty()) {
+            appendEnvFlag(envBlock, L"SANDBOX_BORDER_ACTIVE");
+            appendEnvVar(envBlock, L"SANDBOX_HOOK_DLL", hookDllForProcess);
+            if (!hookProfile.empty()) {
+                appendEnvVar(envBlock, L"SANDBOX_HOOK_PROFILE", hookProfile);
+                appendEnvFlag(envBlock, L"SANDBOX_ENABLE_OBJECT_HOOK");
+                appendEnvFlag(envBlock, L"SANDBOX_ENABLE_FILE_HOOK");
+                appendEnvFlag(envBlock, L"SANDBOX_ENABLE_REGISTRY_HOOK");
+                appendEnvFlag(envBlock, L"SANDBOX_HIDE_WINDOW_LOOKUP");
+                appendEnvFlag(envBlock, L"SANDBOX_REGISTRY_READ_ISOLATED");
+                if (hookProfile == L"powerpoint" || hookProfile == L"foxmail") {
+                    appendEnvFlag(envBlock, L"SANDBOX_ENABLE_WINDOW_HOOK");
+                }
+                if (hookProfile == L"powerpoint")
+                    appendEnvFlag(envBlock, L"SANDBOX_REWRITE_WINDOW_CLASS");
+            } else {
+                appendEnvFlag(envBlock, L"SANDBOX_ENABLE_SHELL_BROKER");
+                if (cfg.isolateClipboard)
+                    appendEnvFlag(envBlock, L"SANDBOX_ENABLE_CLIPBOARD_HOOK");
+            }
         }
         envBlock += L'\0';  // double-null terminator
     }
@@ -622,7 +775,58 @@ bool SandboxEngine::spawnInJob(const SandboxConfig& cfg,
         | CREATE_UNICODE_ENVIRONMENT;// envBlock is wide chars
 
     BOOL ok = FALSE;
-    if (!cfg.borderDllPath.empty()) {
+    const bool target32Bit = is32BitBinary(cfg.executablePath);
+    const std::wstring hookDllForProcess =
+        (!cfg.borderDllPath.empty() && target32Bit)
+            ? siblingPath(cfg.borderDllPath, L"HookDll32.dll")
+            : cfg.borderDllPath;
+    const std::wstring injector32Path =
+        cfg.borderDllPath.empty()
+            ? std::wstring()
+            : siblingPath(cfg.borderDllPath, L"HookDllInjector32.exe");
+
+    if (!cfg.borderDllPath.empty() && target32Bit) {
+        if (GetFileAttributesW(hookDllForProcess.c_str()) ==
+                INVALID_FILE_ATTRIBUTES ||
+            GetFileAttributesW(injector32Path.c_str()) ==
+                INVALID_FILE_ATTRIBUTES) {
+            log(L"[!] 32-bit HookDll support missing: dll=" +
+                hookDllForProcess + L" injector=" + injector32Path);
+            return false;
+        }
+
+        ok = CreateProcessW(
+            cfg.executablePath.c_str(),
+            cmdLine.data(),
+            nullptr,              // process SA
+            nullptr,              // thread SA
+            FALSE,                // inherit handles = no
+            flags,
+            envBlock.data(),      // our modified environment
+            nullptr,              // current directory (inherit)
+            &si,
+            &pi
+        );
+        if (ok) {
+            DWORD injectExit = 0;
+            if (!injectDllWithHelper32(pi.dwProcessId, injector32Path,
+                                       hookDllForProcess, &injectExit)) {
+                log(L"[!] 32-bit HookDll injection failed: exit=" +
+                    std::to_wstring(injectExit) + L" dll=" +
+                    hookDllForProcess);
+                TerminateProcess(pi.hProcess, 1);
+                CloseHandle(pi.hProcess);
+                CloseHandle(pi.hThread);
+                return false;
+            }
+            log(L"[+] 32-bit HookDll injected into suspended process");
+        }
+        if (!ok) {
+            log(L"[!] CreateProcessW for 32-bit target failed: " +
+                std::to_wstring(GetLastError()) + L" cmd=" + cmdLine);
+        }
+    }
+    else if (!cfg.borderDllPath.empty()) {
         std::string dllPathA = acpFromWide(cfg.borderDllPath);
         if (dllPathA.empty() ||
             GetFileAttributesA(dllPathA.c_str()) == INVALID_FILE_ATTRIBUTES) {

@@ -24,6 +24,7 @@
 
 #include <cwctype>
 #include <cstring>
+#include <algorithm>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -40,6 +41,43 @@ using CreateProcessWFn = BOOL (WINAPI*)(LPCWSTR, LPWSTR,
                                          LPSECURITY_ATTRIBUTES, BOOL, DWORD,
                                          LPVOID, LPCWSTR, LPSTARTUPINFOW,
                                          LPPROCESS_INFORMATION);
+using CreateFileWFn = HANDLE (WINAPI*)(LPCWSTR, DWORD, DWORD,
+                                        LPSECURITY_ATTRIBUTES, DWORD, DWORD,
+                                        HANDLE);
+using CreateMutexWFn = HANDLE (WINAPI*)(LPSECURITY_ATTRIBUTES, BOOL, LPCWSTR);
+using CreateMutexExWFn = HANDLE (WINAPI*)(LPSECURITY_ATTRIBUTES, LPCWSTR,
+                                           DWORD, DWORD);
+using OpenMutexWFn = HANDLE (WINAPI*)(DWORD, BOOL, LPCWSTR);
+using CreateEventWFn = HANDLE (WINAPI*)(LPSECURITY_ATTRIBUTES, BOOL, BOOL,
+                                         LPCWSTR);
+using CreateEventExWFn = HANDLE (WINAPI*)(LPSECURITY_ATTRIBUTES, LPCWSTR,
+                                           DWORD, DWORD);
+using OpenEventWFn = HANDLE (WINAPI*)(DWORD, BOOL, LPCWSTR);
+using CreateSemaphoreWFn = HANDLE (WINAPI*)(LPSECURITY_ATTRIBUTES, LONG, LONG,
+                                             LPCWSTR);
+using CreateSemaphoreExWFn = HANDLE (WINAPI*)(LPSECURITY_ATTRIBUTES, LONG, LONG,
+                                               LPCWSTR, DWORD, DWORD);
+using OpenSemaphoreWFn = HANDLE (WINAPI*)(DWORD, BOOL, LPCWSTR);
+using CreateFileMappingWFn = HANDLE (WINAPI*)(HANDLE, LPSECURITY_ATTRIBUTES,
+                                               DWORD, DWORD, DWORD, LPCWSTR);
+using OpenFileMappingWFn = HANDLE (WINAPI*)(DWORD, BOOL, LPCWSTR);
+using GetTempPathWFn = DWORD (WINAPI*)(DWORD, LPWSTR);
+using GetTempPath2WFn = DWORD (WINAPI*)(DWORD, LPWSTR);
+using RegCreateKeyExWFn = LSTATUS (WINAPI*)(HKEY, LPCWSTR, DWORD, LPWSTR,
+                                             DWORD, REGSAM,
+                                             LPSECURITY_ATTRIBUTES, PHKEY,
+                                             LPDWORD);
+using RegOpenKeyExWFn = LSTATUS (WINAPI*)(HKEY, LPCWSTR, DWORD, REGSAM, PHKEY);
+using RegisterClassWFn = ATOM (WINAPI*)(const WNDCLASSW*);
+using RegisterClassExWFn = ATOM (WINAPI*)(const WNDCLASSEXW*);
+using UnregisterClassWFn = BOOL (WINAPI*)(LPCWSTR, HINSTANCE);
+using CreateWindowExWFn = HWND (WINAPI*)(DWORD, LPCWSTR, LPCWSTR, DWORD, int,
+                                          int, int, int, HWND, HMENU,
+                                          HINSTANCE, LPVOID);
+using FindWindowWFn = HWND (WINAPI*)(LPCWSTR, LPCWSTR);
+using FindWindowExWFn = HWND (WINAPI*)(HWND, HWND, LPCWSTR, LPCWSTR);
+using GetClassInfoWFn = BOOL (WINAPI*)(HINSTANCE, LPCWSTR, LPWNDCLASSW);
+using GetClassInfoExWFn = BOOL (WINAPI*)(HINSTANCE, LPCWSTR, LPWNDCLASSEXW);
 using OpenClipboardFn = BOOL (WINAPI*)(HWND);
 using CloseClipboardFn = BOOL (WINAPI*)();
 using EmptyClipboardFn = BOOL (WINAPI*)();
@@ -55,6 +93,30 @@ SHOpenFn g_originalSHOpen = nullptr;
 ShellExecuteWFn g_originalShellExecuteW = nullptr;
 ShellExecuteExWFn g_originalShellExecuteExW = nullptr;
 CreateProcessWFn g_originalCreateProcessW = nullptr;
+CreateFileWFn g_originalCreateFileW = nullptr;
+CreateMutexWFn g_originalCreateMutexW = nullptr;
+CreateMutexExWFn g_originalCreateMutexExW = nullptr;
+OpenMutexWFn g_originalOpenMutexW = nullptr;
+CreateEventWFn g_originalCreateEventW = nullptr;
+CreateEventExWFn g_originalCreateEventExW = nullptr;
+OpenEventWFn g_originalOpenEventW = nullptr;
+CreateSemaphoreWFn g_originalCreateSemaphoreW = nullptr;
+CreateSemaphoreExWFn g_originalCreateSemaphoreExW = nullptr;
+OpenSemaphoreWFn g_originalOpenSemaphoreW = nullptr;
+CreateFileMappingWFn g_originalCreateFileMappingW = nullptr;
+OpenFileMappingWFn g_originalOpenFileMappingW = nullptr;
+GetTempPathWFn g_originalGetTempPathW = nullptr;
+GetTempPath2WFn g_originalGetTempPath2W = nullptr;
+RegCreateKeyExWFn g_originalRegCreateKeyExW = nullptr;
+RegOpenKeyExWFn g_originalRegOpenKeyExW = nullptr;
+RegisterClassWFn g_originalRegisterClassW = nullptr;
+RegisterClassExWFn g_originalRegisterClassExW = nullptr;
+UnregisterClassWFn g_originalUnregisterClassW = nullptr;
+CreateWindowExWFn g_originalCreateWindowExW = nullptr;
+FindWindowWFn g_originalFindWindowW = nullptr;
+FindWindowExWFn g_originalFindWindowExW = nullptr;
+GetClassInfoWFn g_originalGetClassInfoW = nullptr;
+GetClassInfoExWFn g_originalGetClassInfoExW = nullptr;
 OpenClipboardFn g_originalOpenClipboard = nullptr;
 CloseClipboardFn g_originalCloseClipboard = nullptr;
 EmptyClipboardFn g_originalEmptyClipboard = nullptr;
@@ -68,13 +130,32 @@ OleSetClipboardFn g_originalOleSetClipboard = nullptr;
 bool g_installed = false;
 std::wstring g_downloadsLower;
 std::wstring g_boxName;
+std::wstring g_boxRoot;
 std::wstring g_hookDllPath;
+std::wstring g_programDir;
+std::wstring g_hookProfile;
+std::vector<std::wstring> g_objectMarkers;
+std::vector<std::wstring> g_filePathMarkers;
+std::vector<std::wstring> g_registryRoots;
+std::vector<std::wstring> g_windowMarkers;
 bool g_clipboardVirtualization = false;
+bool g_shellBrokerHooks = false;
+bool g_childHookPropagation = false;
+bool g_redirectAllObjects = false;
+bool g_verboseIsolationLogging = false;
+bool g_enableObjectHooks = false;
+bool g_enableFileHooks = false;
+bool g_enableRegistryHooks = false;
+bool g_enableWindowHooks = false;
+bool g_hideWindowLookup = false;
+bool g_isolateRegistryReads = false;
+bool g_rewriteWindowClasses = false;
 std::mutex g_fakeClipboardHandlesMutex;
 std::vector<HGLOBAL> g_fakeClipboardHandles;
 
 thread_local int g_hookDepth = 0;
 thread_local bool g_showMessageSent = false;
+thread_local int g_isolationDepth = 0;
 
 struct HookScope {
     HookScope()
@@ -84,6 +165,11 @@ struct HookScope {
         ++g_hookDepth;
     }
     ~HookScope() { --g_hookDepth; }
+};
+
+struct IsolationScope {
+    IsolationScope() { ++g_isolationDepth; }
+    ~IsolationScope() { --g_isolationDepth; }
 };
 
 const wchar_t* safe(LPCWSTR value)
@@ -105,6 +191,122 @@ std::wstring environmentString(const wchar_t* name)
     if (count == 0 || count >= _countof(buffer))
         return {};
     return buffer;
+}
+
+bool envFlag(const wchar_t* name)
+{
+    const std::wstring value = environmentString(name);
+    return value == L"1" || _wcsicmp(value.c_str(), L"true") == 0 ||
+           _wcsicmp(value.c_str(), L"yes") == 0;
+}
+
+bool startsWithI(const std::wstring& value, const std::wstring& prefix)
+{
+    return value.size() >= prefix.size() &&
+           _wcsnicmp(value.c_str(), prefix.c_str(), prefix.size()) == 0;
+}
+
+bool hasBoundary(const std::wstring& value, size_t prefixLength)
+{
+    return value.size() == prefixLength || value[prefixLength] == L'\\' ||
+           value[prefixLength] == L'/';
+}
+
+std::wstring joinPath(const std::wstring& left, const std::wstring& right)
+{
+    if (left.empty())
+        return right;
+    if (right.empty())
+        return left;
+    if (left.back() == L'\\' || left.back() == L'/')
+        return left + right;
+    return left + L"\\" + right;
+}
+
+std::wstring sanitizeName(const std::wstring& value)
+{
+    std::wstring result;
+    result.reserve(value.size());
+    for (wchar_t ch : value) {
+        if ((ch >= L'a' && ch <= L'z') || (ch >= L'A' && ch <= L'Z') ||
+            (ch >= L'0' && ch <= L'9') || ch == L'_' || ch == L'-' ||
+            ch == L'.') {
+            result.push_back(ch);
+        } else {
+            result.push_back(L'_');
+        }
+    }
+    return result.empty() ? L"Box" : result;
+}
+
+void addUniqueMarker(std::vector<std::wstring>* markers, std::wstring marker)
+{
+    marker = lower(std::move(marker));
+    if (marker.empty())
+        return;
+    if (std::find(markers->begin(), markers->end(), marker) == markers->end())
+        markers->push_back(std::move(marker));
+}
+
+void addDelimitedMarkers(std::vector<std::wstring>* markers,
+                         const std::wstring& value)
+{
+    size_t start = 0;
+    while (start <= value.size()) {
+        const size_t end = value.find_first_of(L";,", start);
+        addUniqueMarker(markers, value.substr(
+            start, end == std::wstring::npos ? std::wstring::npos :
+                                               end - start));
+        if (end == std::wstring::npos)
+            break;
+        start = end + 1;
+    }
+}
+
+bool containsAnyMarker(const std::wstring& value,
+                       const std::vector<std::wstring>& markers)
+{
+    const std::wstring lowered = lower(value);
+    for (const std::wstring& marker : markers) {
+        if (!marker.empty() && lowered.find(marker) != std::wstring::npos)
+            return true;
+    }
+    return false;
+}
+
+void createDirectoryTree(const std::wstring& dir)
+{
+    if (dir.empty())
+        return;
+
+    std::wstring normalized = dir;
+    std::replace(normalized.begin(), normalized.end(), L'/', L'\\');
+
+    size_t pos = 0;
+    if (normalized.rfind(L"\\\\", 0) == 0) {
+        pos = normalized.find(L'\\', 2);
+        if (pos != std::wstring::npos)
+            pos = normalized.find(L'\\', pos + 1);
+    } else if (normalized.size() >= 3 && normalized[1] == L':' &&
+               normalized[2] == L'\\') {
+        pos = 3;
+    }
+
+    while (pos != std::wstring::npos) {
+        pos = normalized.find(L'\\', pos + 1);
+        const std::wstring part = pos == std::wstring::npos
+            ? normalized
+            : normalized.substr(0, pos);
+        if (!part.empty())
+            CreateDirectoryW(part.c_str(), nullptr);
+    }
+}
+
+void createParentDirectory(const std::wstring& path)
+{
+    const size_t slash = path.find_last_of(L"\\/");
+    if (slash != std::wstring::npos)
+        createDirectoryTree(path.substr(0, slash));
 }
 
 bool textClipboardFormat(UINT format)
@@ -456,6 +658,517 @@ bool signalShowInFolder(const std::wstring& path)
     return sent;
 }
 
+std::wstring redirectUnder(const wchar_t* category, const std::wstring& relative)
+{
+    std::wstring trimmed = relative;
+    while (!trimmed.empty() &&
+           (trimmed.front() == L'\\' || trimmed.front() == L'/')) {
+        trimmed.erase(trimmed.begin());
+    }
+    return joinPath(joinPath(g_boxRoot, L"Redirected"),
+                    joinPath(category, trimmed));
+}
+
+std::wstring rewriteObjectName(LPCWSTR original)
+{
+    if (!original || !*original || g_boxName.empty())
+        return {};
+
+    std::wstring name(original);
+    if (startsWithI(name, L"Local\\Iso_"))
+        return {};
+
+    std::wstring rest = name;
+    if (startsWithI(rest, L"Global\\"))
+        rest.erase(0, 7);
+    else if (startsWithI(rest, L"Local\\"))
+        rest.erase(0, 6);
+
+    if (!g_redirectAllObjects && !containsAnyMarker(rest, g_objectMarkers))
+        return {};
+
+    return L"Local\\Iso_" + sanitizeName(g_boxName) + L"_" +
+           sanitizeName(rest);
+}
+
+std::wstring rewritePipeName(const std::wstring& path)
+{
+    constexpr wchar_t pipePrefix[] = L"\\\\.\\pipe\\";
+    if (!startsWithI(path, pipePrefix))
+        return {};
+    if (startsWithI(path, hookipc::kPipeName))
+        return {};
+
+    const std::wstring rest = path.substr(wcslen(pipePrefix));
+    if (!g_redirectAllObjects && !containsAnyMarker(rest, g_objectMarkers))
+        return {};
+
+    return std::wstring(pipePrefix) + L"Iso_" + sanitizeName(g_boxName) +
+           L"_" + sanitizeName(rest);
+}
+
+std::wstring rewriteMarkedUserDataPath(const std::wstring& path)
+{
+    if (g_filePathMarkers.empty() ||
+        !containsAnyMarker(path, g_filePathMarkers)) {
+        return {};
+    }
+    if (!g_programDir.empty() && startsWithI(path, g_programDir) &&
+        hasBoundary(path, g_programDir.size())) {
+        return {};
+    }
+
+    struct Rule {
+        std::wstring prefix;
+        const wchar_t* category;
+    };
+    const Rule rules[] = {
+        {environmentString(L"SANDBOX_HOST_APPDATA"), L"HostRoaming"},
+        {environmentString(L"SANDBOX_HOST_LOCALAPPDATA"), L"HostLocal"},
+        {environmentString(L"SANDBOX_HOST_DOCUMENTS"), L"HostDocuments"},
+        {environmentString(L"SANDBOX_HOST_USERPROFILE"), L"HostProfile"},
+    };
+
+    for (const Rule& rule : rules) {
+        if (!rule.prefix.empty() && startsWithI(path, rule.prefix) &&
+            hasBoundary(path, rule.prefix.size())) {
+            return redirectUnder(rule.category, path.substr(rule.prefix.size()));
+        }
+    }
+    return {};
+}
+
+std::wstring rewriteFilePath(LPCWSTR original)
+{
+    if (!original || !*original || g_boxRoot.empty())
+        return {};
+
+    const std::wstring path(original);
+    const std::wstring pipe = rewritePipeName(path);
+    if (!pipe.empty())
+        return pipe;
+
+    struct Rule {
+        std::wstring prefix;
+        const wchar_t* category;
+    };
+    const std::wstring appData = environmentString(L"APPDATA");
+    const std::wstring localAppData = environmentString(L"LOCALAPPDATA");
+    const std::wstring temp = environmentString(L"TEMP");
+    const std::wstring tmp = environmentString(L"TMP");
+    const Rule rules[] = {
+        {joinPath(appData, L"Microsoft\\Office"), L"Roaming"},
+        {joinPath(appData, L"Microsoft\\PowerPoint"), L"Roaming"},
+        {joinPath(localAppData, L"Microsoft\\Office"), L"Local"},
+        {joinPath(localAppData, L"Microsoft\\PowerPoint"), L"Local"},
+        {temp, L"Temp"},
+        {tmp, L"Temp"},
+    };
+
+    for (const Rule& rule : rules) {
+        if (!rule.prefix.empty() && startsWithI(path, rule.prefix) &&
+            hasBoundary(path, rule.prefix.size())) {
+            return redirectUnder(rule.category, path.substr(rule.prefix.size()));
+        }
+    }
+
+    return rewriteMarkedUserDataPath(path);
+}
+
+DWORD copyPathToCaller(const std::wstring& path, DWORD bufferLength,
+                       LPWSTR buffer)
+{
+    std::wstring withSlash = path;
+    if (!withSlash.empty() && withSlash.back() != L'\\' &&
+        withSlash.back() != L'/') {
+        withSlash.push_back(L'\\');
+    }
+
+    const DWORD required = static_cast<DWORD>(withSlash.size());
+    if (bufferLength == 0 || !buffer || bufferLength <= required)
+        return required + 1;
+
+    wcscpy_s(buffer, bufferLength, withSlash.c_str());
+    return required;
+}
+
+bool isRedirectedRegistryPath(HKEY root, LPCWSTR subKey)
+{
+    if (root != HKEY_CURRENT_USER || !subKey || g_boxName.empty())
+        return false;
+
+    const std::wstring path(subKey);
+    for (const std::wstring& registryRoot : g_registryRoots) {
+        if (startsWithI(path, registryRoot) &&
+            hasBoundary(path, registryRoot.size())) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::wstring rewriteRegistryPath(LPCWSTR subKey)
+{
+    return L"Software\\SandboxDemo\\Boxes\\" + sanitizeName(g_boxName) +
+           L"\\Registry\\" + std::wstring(subKey);
+}
+
+bool wantsRegistryWrite(REGSAM samDesired)
+{
+    constexpr REGSAM writeBits = KEY_SET_VALUE | KEY_CREATE_SUB_KEY |
+        KEY_WRITE | KEY_ALL_ACCESS | DELETE | WRITE_DAC | WRITE_OWNER;
+    return (samDesired & writeBits) != 0;
+}
+
+std::wstring rewriteWindowClassName(LPCWSTR original)
+{
+    if (!g_rewriteWindowClasses || !original || IS_INTRESOURCE(original) ||
+        !*original || g_boxName.empty()) {
+        return {};
+    }
+
+    std::wstring name(original);
+    if (startsWithI(name, L"Iso_"))
+        return {};
+    if (!containsAnyMarker(name, g_windowMarkers))
+        return {};
+
+    return L"Iso_" + sanitizeName(g_boxName) + L"_" + sanitizeName(name);
+}
+
+bool windowLookupMatchesMarker(LPCWSTR className, LPCWSTR windowName)
+{
+    if (!g_hideWindowLookup)
+        return false;
+    if (className && !IS_INTRESOURCE(className) &&
+        containsAnyMarker(className, g_windowMarkers)) {
+        return true;
+    }
+    if (windowName && containsAnyMarker(windowName, g_windowMarkers))
+        return true;
+    return false;
+}
+
+HANDLE WINAPI hookedCreateFileW(LPCWSTR fileName, DWORD desiredAccess,
+                                DWORD shareMode,
+                                LPSECURITY_ATTRIBUTES securityAttributes,
+                                DWORD creationDisposition,
+                                DWORD flagsAndAttributes,
+                                HANDLE templateFile)
+{
+    if (g_isolationDepth > 0) {
+        return g_originalCreateFileW(fileName, desiredAccess, shareMode,
+                                     securityAttributes, creationDisposition,
+                                     flagsAndAttributes, templateFile);
+    }
+    IsolationScope isolationScope;
+    const std::wstring rewritten = rewriteFilePath(fileName);
+    if (!rewritten.empty()) {
+        createParentDirectory(rewritten);
+        if (g_verboseIsolationLogging) {
+            hooklog::write(L"[isolation] CreateFileW redirected %s -> %s",
+                           safe(fileName), rewritten.c_str());
+        }
+        return g_originalCreateFileW(
+            rewritten.c_str(), desiredAccess, shareMode, securityAttributes,
+            creationDisposition, flagsAndAttributes, templateFile);
+    }
+    return g_originalCreateFileW(fileName, desiredAccess, shareMode,
+                                 securityAttributes, creationDisposition,
+                                 flagsAndAttributes, templateFile);
+}
+
+HANDLE WINAPI hookedCreateMutexW(LPSECURITY_ATTRIBUTES attributes,
+                                 BOOL initialOwner, LPCWSTR name)
+{
+    if (g_isolationDepth > 0)
+        return g_originalCreateMutexW(attributes, initialOwner, name);
+    IsolationScope isolationScope;
+    const std::wstring redirected = rewriteObjectName(name);
+    return g_originalCreateMutexW(attributes, initialOwner,
+                                  redirected.empty() ? name :
+                                                       redirected.c_str());
+}
+
+HANDLE WINAPI hookedCreateMutexExW(LPSECURITY_ATTRIBUTES attributes,
+                                   LPCWSTR name, DWORD flags,
+                                   DWORD desiredAccess)
+{
+    if (g_isolationDepth > 0)
+        return g_originalCreateMutexExW(attributes, name, flags, desiredAccess);
+    IsolationScope isolationScope;
+    const std::wstring redirected = rewriteObjectName(name);
+    return g_originalCreateMutexExW(attributes,
+                                    redirected.empty() ? name :
+                                                         redirected.c_str(),
+                                    flags, desiredAccess);
+}
+
+HANDLE WINAPI hookedOpenMutexW(DWORD desiredAccess, BOOL inheritHandle,
+                               LPCWSTR name)
+{
+    if (g_isolationDepth > 0)
+        return g_originalOpenMutexW(desiredAccess, inheritHandle, name);
+    IsolationScope isolationScope;
+    const std::wstring redirected = rewriteObjectName(name);
+    return g_originalOpenMutexW(desiredAccess, inheritHandle,
+                                redirected.empty() ? name : redirected.c_str());
+}
+
+HANDLE WINAPI hookedCreateEventW(LPSECURITY_ATTRIBUTES attributes,
+                                 BOOL manualReset, BOOL initialState,
+                                 LPCWSTR name)
+{
+    if (g_isolationDepth > 0)
+        return g_originalCreateEventW(attributes, manualReset, initialState,
+                                      name);
+    IsolationScope isolationScope;
+    const std::wstring redirected = rewriteObjectName(name);
+    return g_originalCreateEventW(attributes, manualReset, initialState,
+                                  redirected.empty() ? name :
+                                                       redirected.c_str());
+}
+
+HANDLE WINAPI hookedCreateEventExW(LPSECURITY_ATTRIBUTES attributes,
+                                   LPCWSTR name, DWORD flags,
+                                   DWORD desiredAccess)
+{
+    if (g_isolationDepth > 0)
+        return g_originalCreateEventExW(attributes, name, flags,
+                                        desiredAccess);
+    IsolationScope isolationScope;
+    const std::wstring redirected = rewriteObjectName(name);
+    return g_originalCreateEventExW(attributes,
+                                    redirected.empty() ? name :
+                                                         redirected.c_str(),
+                                    flags, desiredAccess);
+}
+
+HANDLE WINAPI hookedOpenEventW(DWORD desiredAccess, BOOL inheritHandle,
+                               LPCWSTR name)
+{
+    if (g_isolationDepth > 0)
+        return g_originalOpenEventW(desiredAccess, inheritHandle, name);
+    IsolationScope isolationScope;
+    const std::wstring redirected = rewriteObjectName(name);
+    return g_originalOpenEventW(desiredAccess, inheritHandle,
+                                redirected.empty() ? name : redirected.c_str());
+}
+
+HANDLE WINAPI hookedCreateSemaphoreW(LPSECURITY_ATTRIBUTES attributes,
+                                     LONG initialCount, LONG maximumCount,
+                                     LPCWSTR name)
+{
+    if (g_isolationDepth > 0)
+        return g_originalCreateSemaphoreW(attributes, initialCount,
+                                          maximumCount, name);
+    IsolationScope isolationScope;
+    const std::wstring redirected = rewriteObjectName(name);
+    return g_originalCreateSemaphoreW(
+        attributes, initialCount, maximumCount,
+        redirected.empty() ? name : redirected.c_str());
+}
+
+HANDLE WINAPI hookedCreateSemaphoreExW(LPSECURITY_ATTRIBUTES attributes,
+                                       LONG initialCount, LONG maximumCount,
+                                       LPCWSTR name, DWORD flags,
+                                       DWORD desiredAccess)
+{
+    if (g_isolationDepth > 0)
+        return g_originalCreateSemaphoreExW(
+            attributes, initialCount, maximumCount, name, flags, desiredAccess);
+    IsolationScope isolationScope;
+    const std::wstring redirected = rewriteObjectName(name);
+    return g_originalCreateSemaphoreExW(
+        attributes, initialCount, maximumCount,
+        redirected.empty() ? name : redirected.c_str(), flags, desiredAccess);
+}
+
+HANDLE WINAPI hookedOpenSemaphoreW(DWORD desiredAccess, BOOL inheritHandle,
+                                   LPCWSTR name)
+{
+    if (g_isolationDepth > 0)
+        return g_originalOpenSemaphoreW(desiredAccess, inheritHandle, name);
+    IsolationScope isolationScope;
+    const std::wstring redirected = rewriteObjectName(name);
+    return g_originalOpenSemaphoreW(desiredAccess, inheritHandle,
+                                    redirected.empty() ? name :
+                                                         redirected.c_str());
+}
+
+HANDLE WINAPI hookedCreateFileMappingW(HANDLE file,
+                                       LPSECURITY_ATTRIBUTES attributes,
+                                       DWORD protect, DWORD maximumSizeHigh,
+                                       DWORD maximumSizeLow, LPCWSTR name)
+{
+    if (g_isolationDepth > 0)
+        return g_originalCreateFileMappingW(
+            file, attributes, protect, maximumSizeHigh, maximumSizeLow, name);
+    IsolationScope isolationScope;
+    const std::wstring redirected = rewriteObjectName(name);
+    return g_originalCreateFileMappingW(
+        file, attributes, protect, maximumSizeHigh, maximumSizeLow,
+        redirected.empty() ? name : redirected.c_str());
+}
+
+HANDLE WINAPI hookedOpenFileMappingW(DWORD desiredAccess, BOOL inheritHandle,
+                                     LPCWSTR name)
+{
+    if (g_isolationDepth > 0)
+        return g_originalOpenFileMappingW(desiredAccess, inheritHandle, name);
+    IsolationScope isolationScope;
+    const std::wstring redirected = rewriteObjectName(name);
+    return g_originalOpenFileMappingW(desiredAccess, inheritHandle,
+                                      redirected.empty() ? name :
+                                                           redirected.c_str());
+}
+
+DWORD WINAPI hookedGetTempPathW(DWORD bufferLength, LPWSTR buffer)
+{
+    if (g_boxRoot.empty())
+        return g_originalGetTempPathW(bufferLength, buffer);
+
+    const std::wstring temp = joinPath(joinPath(g_boxRoot, L"Redirected"),
+                                       L"Temp");
+    createDirectoryTree(temp);
+    return copyPathToCaller(temp, bufferLength, buffer);
+}
+
+DWORD WINAPI hookedGetTempPath2W(DWORD bufferLength, LPWSTR buffer)
+{
+    if (g_boxRoot.empty())
+        return g_originalGetTempPath2W
+            ? g_originalGetTempPath2W(bufferLength, buffer)
+            : g_originalGetTempPathW(bufferLength, buffer);
+
+    const std::wstring temp = joinPath(joinPath(g_boxRoot, L"Redirected"),
+                                       L"Temp");
+    createDirectoryTree(temp);
+    return copyPathToCaller(temp, bufferLength, buffer);
+}
+
+LSTATUS WINAPI hookedRegCreateKeyExW(HKEY key, LPCWSTR subKey, DWORD reserved,
+                                     LPWSTR className, DWORD options,
+                                     REGSAM samDesired,
+                                     LPSECURITY_ATTRIBUTES securityAttributes,
+                                     PHKEY result, LPDWORD disposition)
+{
+    if (isRedirectedRegistryPath(key, subKey)) {
+        const std::wstring rewritten = rewriteRegistryPath(subKey);
+        return g_originalRegCreateKeyExW(
+            HKEY_CURRENT_USER, rewritten.c_str(), reserved, className, options,
+            samDesired, securityAttributes, result, disposition);
+    }
+    return g_originalRegCreateKeyExW(key, subKey, reserved, className, options,
+                                     samDesired, securityAttributes, result,
+                                     disposition);
+}
+
+LSTATUS WINAPI hookedRegOpenKeyExW(HKEY key, LPCWSTR subKey, DWORD options,
+                                   REGSAM samDesired, PHKEY result)
+{
+    if (isRedirectedRegistryPath(key, subKey) &&
+        (wantsRegistryWrite(samDesired) || g_isolateRegistryReads)) {
+        const std::wstring rewritten = rewriteRegistryPath(subKey);
+        if (wantsRegistryWrite(samDesired)) {
+            DWORD disposition = 0;
+            return g_originalRegCreateKeyExW(
+                HKEY_CURRENT_USER, rewritten.c_str(), 0, nullptr,
+                REG_OPTION_NON_VOLATILE, samDesired, nullptr, result,
+                &disposition);
+        }
+        return g_originalRegOpenKeyExW(HKEY_CURRENT_USER, rewritten.c_str(),
+                                       options, samDesired, result);
+    }
+    return g_originalRegOpenKeyExW(key, subKey, options, samDesired, result);
+}
+
+ATOM WINAPI hookedRegisterClassW(const WNDCLASSW* windowClass)
+{
+    if (!windowClass)
+        return g_originalRegisterClassW(windowClass);
+    const std::wstring rewritten =
+        rewriteWindowClassName(windowClass->lpszClassName);
+    if (rewritten.empty())
+        return g_originalRegisterClassW(windowClass);
+
+    WNDCLASSW copy = *windowClass;
+    copy.lpszClassName = rewritten.c_str();
+    return g_originalRegisterClassW(&copy);
+}
+
+ATOM WINAPI hookedRegisterClassExW(const WNDCLASSEXW* windowClass)
+{
+    if (!windowClass)
+        return g_originalRegisterClassExW(windowClass);
+    const std::wstring rewritten =
+        rewriteWindowClassName(windowClass->lpszClassName);
+    if (rewritten.empty())
+        return g_originalRegisterClassExW(windowClass);
+
+    WNDCLASSEXW copy = *windowClass;
+    copy.lpszClassName = rewritten.c_str();
+    return g_originalRegisterClassExW(&copy);
+}
+
+BOOL WINAPI hookedUnregisterClassW(LPCWSTR className, HINSTANCE instance)
+{
+    const std::wstring rewritten = rewriteWindowClassName(className);
+    return g_originalUnregisterClassW(
+        rewritten.empty() ? className : rewritten.c_str(), instance);
+}
+
+HWND WINAPI hookedCreateWindowExW(DWORD exStyle, LPCWSTR className,
+                                  LPCWSTR windowName, DWORD style, int x,
+                                  int y, int width, int height, HWND parent,
+                                  HMENU menu, HINSTANCE instance, LPVOID param)
+{
+    const std::wstring rewritten = rewriteWindowClassName(className);
+    return g_originalCreateWindowExW(
+        exStyle, rewritten.empty() ? className : rewritten.c_str(), windowName,
+        style, x, y, width, height, parent, menu, instance, param);
+}
+
+HWND WINAPI hookedFindWindowW(LPCWSTR className, LPCWSTR windowName)
+{
+    const std::wstring rewritten = rewriteWindowClassName(className);
+    if (!rewritten.empty())
+        return g_originalFindWindowW(rewritten.c_str(), windowName);
+    if (windowLookupMatchesMarker(className, windowName))
+        return nullptr;
+    return g_originalFindWindowW(className, windowName);
+}
+
+HWND WINAPI hookedFindWindowExW(HWND parent, HWND childAfter,
+                                LPCWSTR className, LPCWSTR windowName)
+{
+    const std::wstring rewritten = rewriteWindowClassName(className);
+    if (!rewritten.empty())
+        return g_originalFindWindowExW(parent, childAfter, rewritten.c_str(),
+                                       windowName);
+    if (windowLookupMatchesMarker(className, windowName))
+        return nullptr;
+    return g_originalFindWindowExW(parent, childAfter, className, windowName);
+}
+
+BOOL WINAPI hookedGetClassInfoW(HINSTANCE instance, LPCWSTR className,
+                                LPWNDCLASSW windowClass)
+{
+    const std::wstring rewritten = rewriteWindowClassName(className);
+    return g_originalGetClassInfoW(
+        instance, rewritten.empty() ? className : rewritten.c_str(),
+        windowClass);
+}
+
+BOOL WINAPI hookedGetClassInfoExW(HINSTANCE instance, LPCWSTR className,
+                                  LPWNDCLASSEXW windowClass)
+{
+    const std::wstring rewritten = rewriteWindowClassName(className);
+    return g_originalGetClassInfoExW(
+        instance, rewritten.empty() ? className : rewritten.c_str(),
+        windowClass);
+}
+
 HRESULT WINAPI hookedSHOpenFolderAndSelectItems(
     PCIDLIST_ABSOLUTE folder, UINT itemCount,
     PCUITEMID_CHILD_ARRAY items, DWORD flags)
@@ -549,7 +1262,7 @@ BOOL WINAPI hookedCreateProcessW(
 
     const bool skipChildHook = shouldSkipChildHookInjection(application,
                                                            commandLine);
-    const bool propagateHook = g_clipboardVirtualization &&
+    const bool propagateHook = g_childHookPropagation &&
                                !g_hookDllPath.empty() &&
                                !skipChildHook;
     const bool callerSuspended = (creationFlags & CREATE_SUSPENDED) != 0;
@@ -792,6 +1505,55 @@ void detach(Function& original, Function detour, const wchar_t* label)
     hooklog::write(L"[setup] DetourDetach(%s) -> %ld", label, result);
 }
 
+void configureIsolationProfile()
+{
+    addDelimitedMarkers(&g_objectMarkers,
+                        environmentString(L"SANDBOX_OBJECT_MARKERS"));
+    addDelimitedMarkers(&g_filePathMarkers,
+                        environmentString(L"SANDBOX_FILE_PATH_MARKERS"));
+    addDelimitedMarkers(&g_windowMarkers,
+                        environmentString(L"SANDBOX_WINDOW_CLASS_MARKERS"));
+    addDelimitedMarkers(&g_registryRoots,
+                        environmentString(L"SANDBOX_REGISTRY_ROOTS"));
+
+    g_hookProfile = lower(environmentString(L"SANDBOX_HOOK_PROFILE"));
+    if (g_hookProfile == L"wps") {
+        for (const wchar_t* marker :
+             {L"wps", L"kingsoft", L"kso", L"ksolaunch", L"office6",
+              L"\x91d1\x5c71"}) {
+            addUniqueMarker(&g_objectMarkers, marker);
+        }
+    }
+
+    if (g_hookProfile == L"word") {
+        for (const wchar_t* marker :
+             {L"word", L"winword", L"office", L"mso", L"dde"}) {
+            addUniqueMarker(&g_objectMarkers, marker);
+            addUniqueMarker(&g_windowMarkers, marker);
+        }
+        addUniqueMarker(&g_registryRoots, L"Software\\Microsoft\\Office");
+    }
+
+    if (g_hookProfile == L"powerpoint" || g_hookProfile == L"ppt") {
+        for (const wchar_t* marker :
+             {L"powerp", L"powerpoint", L"office", L"mso", L"ppt", L"dde"}) {
+            addUniqueMarker(&g_objectMarkers, marker);
+            addUniqueMarker(&g_windowMarkers, marker);
+        }
+        addUniqueMarker(&g_registryRoots, L"Software\\Microsoft\\Office");
+        addUniqueMarker(&g_registryRoots, L"Software\\Microsoft\\PowerPoint");
+    }
+
+    if (g_hookProfile == L"foxmail") {
+        for (const wchar_t* marker : {L"foxmail", L"foxmail7"}) {
+            addUniqueMarker(&g_objectMarkers, marker);
+            addUniqueMarker(&g_filePathMarkers, marker);
+            addUniqueMarker(&g_windowMarkers, marker);
+        }
+        addUniqueMarker(&g_registryRoots, L"Software\\Foxmail7");
+    }
+}
+
 } // namespace
 
 namespace hooks {
@@ -800,7 +1562,9 @@ bool install()
 {
     hooklog::write(L"[lifecycle] hooks::install begin");
     g_boxName = environmentString(L"SANDBOX_BOX");
+    g_boxRoot = environmentString(L"SANDBOX_ROOT");
     g_hookDllPath = environmentString(L"SANDBOX_HOOK_DLL");
+    g_programDir = environmentString(L"SANDBOX_PROGRAM_DIR");
     if (g_hookDllPath.empty()) {
         wchar_t modulePath[MAX_PATH]{};
         HMODULE module = nullptr;
@@ -812,10 +1576,34 @@ bool install()
             g_hookDllPath = modulePath;
         }
     }
-    g_clipboardVirtualization = !g_boxName.empty();
-    hooklog::write(L"[setup] box=%s clipboardVirtualization=%d",
+    g_shellBrokerHooks = envFlag(L"SANDBOX_ENABLE_SHELL_BROKER");
+    g_clipboardVirtualization = envFlag(L"SANDBOX_ENABLE_CLIPBOARD_HOOK") &&
+                                !g_boxName.empty();
+    configureIsolationProfile();
+    g_childHookPropagation = envFlag(L"SANDBOX_ENABLE_CHILD_HOOK") &&
+                             !g_boxName.empty() && g_hookProfile != L"wps";
+    g_enableObjectHooks = envFlag(L"SANDBOX_ENABLE_OBJECT_HOOK");
+    g_enableFileHooks = envFlag(L"SANDBOX_ENABLE_FILE_HOOK");
+    g_enableRegistryHooks = envFlag(L"SANDBOX_ENABLE_REGISTRY_HOOK");
+    g_enableWindowHooks = envFlag(L"SANDBOX_ENABLE_WINDOW_HOOK");
+    g_hideWindowLookup = envFlag(L"SANDBOX_HIDE_WINDOW_LOOKUP");
+    g_isolateRegistryReads = envFlag(L"SANDBOX_REGISTRY_READ_ISOLATED");
+    g_rewriteWindowClasses = envFlag(L"SANDBOX_REWRITE_WINDOW_CLASS");
+    g_redirectAllObjects = envFlag(L"SANDBOX_REDIRECT_ALL_OBJECTS") &&
+                           g_hookProfile != L"wps";
+    g_verboseIsolationLogging = envFlag(L"SANDBOX_VERBOSE_ISOLATION_LOG");
+
+    hooklog::write(L"[setup] box=%s root=%s shellBroker=%d clipboard=%d "
+                   L"child=%d iso(object=%d file=%d registry=%d window=%d)",
                    g_boxName.empty() ? L"<none>" : g_boxName.c_str(),
-                   g_clipboardVirtualization ? 1 : 0);
+                   g_boxRoot.empty() ? L"<none>" : g_boxRoot.c_str(),
+                   g_shellBrokerHooks ? 1 : 0,
+                   g_clipboardVirtualization ? 1 : 0,
+                   g_childHookPropagation ? 1 : 0,
+                   g_enableObjectHooks ? 1 : 0,
+                   g_enableFileHooks ? 1 : 0,
+                   g_enableRegistryHooks ? 1 : 0,
+                   g_enableWindowHooks ? 1 : 0);
     hooklog::write(L"[setup] hookDllPath=%s",
                    g_hookDllPath.empty() ? L"<unset>" : g_hookDllPath.c_str());
 
@@ -838,6 +1626,54 @@ bool install()
             L"ShellExecuteExW");
     resolve(L"kernel32.dll", "CreateProcessW", g_originalCreateProcessW,
             L"CreateProcessW");
+    resolve(L"kernel32.dll", "CreateFileW", g_originalCreateFileW,
+            L"CreateFileW");
+    resolve(L"kernel32.dll", "CreateMutexW", g_originalCreateMutexW,
+            L"CreateMutexW");
+    resolve(L"kernel32.dll", "CreateMutexExW", g_originalCreateMutexExW,
+            L"CreateMutexExW");
+    resolve(L"kernel32.dll", "OpenMutexW", g_originalOpenMutexW,
+            L"OpenMutexW");
+    resolve(L"kernel32.dll", "CreateEventW", g_originalCreateEventW,
+            L"CreateEventW");
+    resolve(L"kernel32.dll", "CreateEventExW", g_originalCreateEventExW,
+            L"CreateEventExW");
+    resolve(L"kernel32.dll", "OpenEventW", g_originalOpenEventW,
+            L"OpenEventW");
+    resolve(L"kernel32.dll", "CreateSemaphoreW", g_originalCreateSemaphoreW,
+            L"CreateSemaphoreW");
+    resolve(L"kernel32.dll", "CreateSemaphoreExW",
+            g_originalCreateSemaphoreExW, L"CreateSemaphoreExW");
+    resolve(L"kernel32.dll", "OpenSemaphoreW", g_originalOpenSemaphoreW,
+            L"OpenSemaphoreW");
+    resolve(L"kernel32.dll", "CreateFileMappingW",
+            g_originalCreateFileMappingW, L"CreateFileMappingW");
+    resolve(L"kernel32.dll", "OpenFileMappingW",
+            g_originalOpenFileMappingW, L"OpenFileMappingW");
+    resolve(L"kernel32.dll", "GetTempPathW", g_originalGetTempPathW,
+            L"GetTempPathW");
+    resolve(L"kernel32.dll", "GetTempPath2W", g_originalGetTempPath2W,
+            L"GetTempPath2W");
+    resolve(L"advapi32.dll", "RegCreateKeyExW", g_originalRegCreateKeyExW,
+            L"RegCreateKeyExW");
+    resolve(L"advapi32.dll", "RegOpenKeyExW", g_originalRegOpenKeyExW,
+            L"RegOpenKeyExW");
+    resolve(L"user32.dll", "RegisterClassW", g_originalRegisterClassW,
+            L"RegisterClassW");
+    resolve(L"user32.dll", "RegisterClassExW", g_originalRegisterClassExW,
+            L"RegisterClassExW");
+    resolve(L"user32.dll", "UnregisterClassW", g_originalUnregisterClassW,
+            L"UnregisterClassW");
+    resolve(L"user32.dll", "CreateWindowExW", g_originalCreateWindowExW,
+            L"CreateWindowExW");
+    resolve(L"user32.dll", "FindWindowW", g_originalFindWindowW,
+            L"FindWindowW");
+    resolve(L"user32.dll", "FindWindowExW", g_originalFindWindowExW,
+            L"FindWindowExW");
+    resolve(L"user32.dll", "GetClassInfoW", g_originalGetClassInfoW,
+            L"GetClassInfoW");
+    resolve(L"user32.dll", "GetClassInfoExW", g_originalGetClassInfoExW,
+            L"GetClassInfoExW");
     resolve(L"user32.dll", "OpenClipboard", g_originalOpenClipboard,
             L"OpenClipboard");
     resolve(L"user32.dll", "CloseClipboard", g_originalCloseClipboard,
@@ -869,31 +1705,84 @@ bool install()
         return false;
     DetourUpdateThread(GetCurrentThread());
 
-    const bool primary = attach(g_originalSHOpen,
-                                hookedSHOpenFolderAndSelectItems,
-                                L"SHOpenFolderAndSelectItems");
-    attach(g_originalShellExecuteW, hookedShellExecuteW, L"ShellExecuteW");
-    attach(g_originalShellExecuteExW, hookedShellExecuteExW, L"ShellExecuteExW");
+    if (g_shellBrokerHooks) {
+        attach(g_originalSHOpen, hookedSHOpenFolderAndSelectItems,
+               L"SHOpenFolderAndSelectItems");
+        attach(g_originalShellExecuteW, hookedShellExecuteW, L"ShellExecuteW");
+        attach(g_originalShellExecuteExW, hookedShellExecuteExW,
+               L"ShellExecuteExW");
+    }
     attach(g_originalCreateProcessW, hookedCreateProcessW, L"CreateProcessW");
-    attach(g_originalOpenClipboard, hookedOpenClipboard, L"OpenClipboard");
-    attach(g_originalCloseClipboard, hookedCloseClipboard, L"CloseClipboard");
-    attach(g_originalEmptyClipboard, hookedEmptyClipboard, L"EmptyClipboard");
-    attach(g_originalSetClipboardData, hookedSetClipboardData, L"SetClipboardData");
-    attach(g_originalGetClipboardData, hookedGetClipboardData, L"GetClipboardData");
-    attach(g_originalIsClipboardFormatAvailable, hookedIsClipboardFormatAvailable,
-           L"IsClipboardFormatAvailable");
-    attach(g_originalGetPriorityClipboardFormat, hookedGetPriorityClipboardFormat,
-           L"GetPriorityClipboardFormat");
-    attach(g_originalCountClipboardFormats, hookedCountClipboardFormats,
-           L"CountClipboardFormats");
-    attach(g_originalEnumClipboardFormats, hookedEnumClipboardFormats,
-           L"EnumClipboardFormats");
-    attach(g_originalOleSetClipboard, hookedOleSetClipboard,
-           L"OleSetClipboard");
+    if (g_enableFileHooks) {
+        attach(g_originalCreateFileW, hookedCreateFileW, L"CreateFileW");
+        attach(g_originalGetTempPathW, hookedGetTempPathW, L"GetTempPathW");
+        attach(g_originalGetTempPath2W, hookedGetTempPath2W, L"GetTempPath2W");
+    }
+    if (g_enableObjectHooks) {
+        attach(g_originalCreateMutexW, hookedCreateMutexW, L"CreateMutexW");
+        attach(g_originalCreateMutexExW, hookedCreateMutexExW,
+               L"CreateMutexExW");
+        attach(g_originalOpenMutexW, hookedOpenMutexW, L"OpenMutexW");
+        attach(g_originalCreateEventW, hookedCreateEventW, L"CreateEventW");
+        attach(g_originalCreateEventExW, hookedCreateEventExW,
+               L"CreateEventExW");
+        attach(g_originalOpenEventW, hookedOpenEventW, L"OpenEventW");
+        attach(g_originalCreateSemaphoreW, hookedCreateSemaphoreW,
+               L"CreateSemaphoreW");
+        attach(g_originalCreateSemaphoreExW, hookedCreateSemaphoreExW,
+               L"CreateSemaphoreExW");
+        attach(g_originalOpenSemaphoreW, hookedOpenSemaphoreW,
+               L"OpenSemaphoreW");
+        attach(g_originalCreateFileMappingW, hookedCreateFileMappingW,
+               L"CreateFileMappingW");
+        attach(g_originalOpenFileMappingW, hookedOpenFileMappingW,
+               L"OpenFileMappingW");
+    }
+    if (g_enableRegistryHooks) {
+        attach(g_originalRegCreateKeyExW, hookedRegCreateKeyExW,
+               L"RegCreateKeyExW");
+        attach(g_originalRegOpenKeyExW, hookedRegOpenKeyExW, L"RegOpenKeyExW");
+    }
+    if (g_enableWindowHooks) {
+        attach(g_originalRegisterClassW, hookedRegisterClassW,
+               L"RegisterClassW");
+        attach(g_originalRegisterClassExW, hookedRegisterClassExW,
+               L"RegisterClassExW");
+        attach(g_originalUnregisterClassW, hookedUnregisterClassW,
+               L"UnregisterClassW");
+        attach(g_originalCreateWindowExW, hookedCreateWindowExW,
+               L"CreateWindowExW");
+        attach(g_originalFindWindowW, hookedFindWindowW, L"FindWindowW");
+        attach(g_originalFindWindowExW, hookedFindWindowExW, L"FindWindowExW");
+        attach(g_originalGetClassInfoW, hookedGetClassInfoW, L"GetClassInfoW");
+        attach(g_originalGetClassInfoExW, hookedGetClassInfoExW,
+               L"GetClassInfoExW");
+    }
+    if (g_clipboardVirtualization) {
+        attach(g_originalOpenClipboard, hookedOpenClipboard, L"OpenClipboard");
+        attach(g_originalCloseClipboard, hookedCloseClipboard, L"CloseClipboard");
+        attach(g_originalEmptyClipboard, hookedEmptyClipboard, L"EmptyClipboard");
+        attach(g_originalSetClipboardData, hookedSetClipboardData,
+               L"SetClipboardData");
+        attach(g_originalGetClipboardData, hookedGetClipboardData,
+               L"GetClipboardData");
+        attach(g_originalIsClipboardFormatAvailable,
+               hookedIsClipboardFormatAvailable,
+               L"IsClipboardFormatAvailable");
+        attach(g_originalGetPriorityClipboardFormat,
+               hookedGetPriorityClipboardFormat,
+               L"GetPriorityClipboardFormat");
+        attach(g_originalCountClipboardFormats, hookedCountClipboardFormats,
+               L"CountClipboardFormats");
+        attach(g_originalEnumClipboardFormats, hookedEnumClipboardFormats,
+               L"EnumClipboardFormats");
+        attach(g_originalOleSetClipboard, hookedOleSetClipboard,
+               L"OleSetClipboard");
+    }
 
     result = DetourTransactionCommit();
     hooklog::write(L"[setup] DetourTransactionCommit -> %ld", result);
-    g_installed = primary && result == NO_ERROR;
+    g_installed = result == NO_ERROR;
     hooklog::write(L"[lifecycle] hooks::install end installed=%d",
                    g_installed ? 1 : 0);
     return g_installed;
@@ -908,26 +1797,81 @@ void remove()
 
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
-    detach(g_originalSHOpen, hookedSHOpenFolderAndSelectItems,
-           L"SHOpenFolderAndSelectItems");
-    detach(g_originalShellExecuteW, hookedShellExecuteW, L"ShellExecuteW");
-    detach(g_originalShellExecuteExW, hookedShellExecuteExW, L"ShellExecuteExW");
+    if (g_shellBrokerHooks) {
+        detach(g_originalSHOpen, hookedSHOpenFolderAndSelectItems,
+               L"SHOpenFolderAndSelectItems");
+        detach(g_originalShellExecuteW, hookedShellExecuteW, L"ShellExecuteW");
+        detach(g_originalShellExecuteExW, hookedShellExecuteExW,
+               L"ShellExecuteExW");
+    }
     detach(g_originalCreateProcessW, hookedCreateProcessW, L"CreateProcessW");
-    detach(g_originalOpenClipboard, hookedOpenClipboard, L"OpenClipboard");
-    detach(g_originalCloseClipboard, hookedCloseClipboard, L"CloseClipboard");
-    detach(g_originalEmptyClipboard, hookedEmptyClipboard, L"EmptyClipboard");
-    detach(g_originalSetClipboardData, hookedSetClipboardData, L"SetClipboardData");
-    detach(g_originalGetClipboardData, hookedGetClipboardData, L"GetClipboardData");
-    detach(g_originalIsClipboardFormatAvailable, hookedIsClipboardFormatAvailable,
-           L"IsClipboardFormatAvailable");
-    detach(g_originalGetPriorityClipboardFormat, hookedGetPriorityClipboardFormat,
-           L"GetPriorityClipboardFormat");
-    detach(g_originalCountClipboardFormats, hookedCountClipboardFormats,
-           L"CountClipboardFormats");
-    detach(g_originalEnumClipboardFormats, hookedEnumClipboardFormats,
-           L"EnumClipboardFormats");
-    detach(g_originalOleSetClipboard, hookedOleSetClipboard,
-           L"OleSetClipboard");
+    if (g_enableFileHooks) {
+        detach(g_originalCreateFileW, hookedCreateFileW, L"CreateFileW");
+        detach(g_originalGetTempPathW, hookedGetTempPathW, L"GetTempPathW");
+        detach(g_originalGetTempPath2W, hookedGetTempPath2W, L"GetTempPath2W");
+    }
+    if (g_enableObjectHooks) {
+        detach(g_originalCreateMutexW, hookedCreateMutexW, L"CreateMutexW");
+        detach(g_originalCreateMutexExW, hookedCreateMutexExW,
+               L"CreateMutexExW");
+        detach(g_originalOpenMutexW, hookedOpenMutexW, L"OpenMutexW");
+        detach(g_originalCreateEventW, hookedCreateEventW, L"CreateEventW");
+        detach(g_originalCreateEventExW, hookedCreateEventExW,
+               L"CreateEventExW");
+        detach(g_originalOpenEventW, hookedOpenEventW, L"OpenEventW");
+        detach(g_originalCreateSemaphoreW, hookedCreateSemaphoreW,
+               L"CreateSemaphoreW");
+        detach(g_originalCreateSemaphoreExW, hookedCreateSemaphoreExW,
+               L"CreateSemaphoreExW");
+        detach(g_originalOpenSemaphoreW, hookedOpenSemaphoreW,
+               L"OpenSemaphoreW");
+        detach(g_originalCreateFileMappingW, hookedCreateFileMappingW,
+               L"CreateFileMappingW");
+        detach(g_originalOpenFileMappingW, hookedOpenFileMappingW,
+               L"OpenFileMappingW");
+    }
+    if (g_enableRegistryHooks) {
+        detach(g_originalRegCreateKeyExW, hookedRegCreateKeyExW,
+               L"RegCreateKeyExW");
+        detach(g_originalRegOpenKeyExW, hookedRegOpenKeyExW,
+               L"RegOpenKeyExW");
+    }
+    if (g_enableWindowHooks) {
+        detach(g_originalRegisterClassW, hookedRegisterClassW,
+               L"RegisterClassW");
+        detach(g_originalRegisterClassExW, hookedRegisterClassExW,
+               L"RegisterClassExW");
+        detach(g_originalUnregisterClassW, hookedUnregisterClassW,
+               L"UnregisterClassW");
+        detach(g_originalCreateWindowExW, hookedCreateWindowExW,
+               L"CreateWindowExW");
+        detach(g_originalFindWindowW, hookedFindWindowW, L"FindWindowW");
+        detach(g_originalFindWindowExW, hookedFindWindowExW, L"FindWindowExW");
+        detach(g_originalGetClassInfoW, hookedGetClassInfoW, L"GetClassInfoW");
+        detach(g_originalGetClassInfoExW, hookedGetClassInfoExW,
+               L"GetClassInfoExW");
+    }
+    if (g_clipboardVirtualization) {
+        detach(g_originalOpenClipboard, hookedOpenClipboard, L"OpenClipboard");
+        detach(g_originalCloseClipboard, hookedCloseClipboard, L"CloseClipboard");
+        detach(g_originalEmptyClipboard, hookedEmptyClipboard, L"EmptyClipboard");
+        detach(g_originalSetClipboardData, hookedSetClipboardData,
+               L"SetClipboardData");
+        detach(g_originalGetClipboardData, hookedGetClipboardData,
+               L"GetClipboardData");
+        detach(g_originalIsClipboardFormatAvailable,
+               hookedIsClipboardFormatAvailable,
+               L"IsClipboardFormatAvailable");
+        detach(g_originalGetPriorityClipboardFormat,
+               hookedGetPriorityClipboardFormat,
+               L"GetPriorityClipboardFormat");
+        detach(g_originalCountClipboardFormats, hookedCountClipboardFormats,
+               L"CountClipboardFormats");
+        detach(g_originalEnumClipboardFormats, hookedEnumClipboardFormats,
+               L"EnumClipboardFormats");
+        detach(g_originalOleSetClipboard, hookedOleSetClipboard,
+               L"OleSetClipboard");
+    }
     const LONG result = DetourTransactionCommit();
     g_installed = false;
     freeFakeClipboardHandles();

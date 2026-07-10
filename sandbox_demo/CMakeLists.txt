@@ -61,6 +61,7 @@ target_link_libraries(HookDll PRIVATE
     shell32
     ole32
     user32
+    advapi32
 )
 
 target_compile_options(HookDll PRIVATE /W3 /wd4996)
